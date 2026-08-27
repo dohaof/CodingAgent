@@ -201,10 +201,26 @@ def _build_invocation(command: str) -> tuple[list[str] | str, bool]:
 
 
 def _child_environment() -> dict[str, str]:
-    """The parent environment minus anything that looks like a credential."""
-    return {
+    """The environment child processes get.
+
+    Two changes from the parent's. Anything whose name looks like a credential
+    is withheld, because the model can run ``env`` and whatever it prints lands
+    in the transcript and the trace file.
+
+    ``PYTHONDONTWRITEBYTECODE`` is set because this agent's feedback loop is
+    "edit, then re-run to verify", and Python decides a cached ``.pyc`` is still
+    current from the source's mtime *in whole seconds* plus its size. An edit
+    that changes ``a - b`` to ``a + b`` alters neither, so a test re-run within
+    the same second can execute the old bytecode and report the bug as
+    unfixed — sending the agent off to "fix" code that is already correct.
+    Not writing bytecode costs a little import time and makes the verification
+    step trustworthy.
+    """
+    environment = {
         name: value for name, value in os.environ.items() if not _SECRET_PATTERN.search(name)
     }
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    return environment
 
 
 def _kill_tree(process: subprocess.Popen[str]) -> None:
