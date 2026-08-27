@@ -5,8 +5,8 @@ trace from a previous run. All three build the same :class:`~cagent.agent.Agent`
 and differ only in what drives it and what renders it.
 
 Credentials are deliberately not accepted as a flag. A key on the command line
-lands in shell history and in the process list, so it comes from the environment
-or an untracked config file, and the failure message says so.
+lands in shell history and in the process list, so it comes from an untracked
+config file, and the failure message says so.
 """
 
 from __future__ import annotations
@@ -46,9 +46,9 @@ def build_parser() -> argparse.ArgumentParser:
         prog="cagent",
         description="A coding agent that reads, edits, and runs code to finish a task.",
         epilog=(
-            "An endpoint is three settings: CAGENT_BASE_URL, CAGENT_MODEL, and "
-            "CAGENT_API_KEY. The key is never taken from a flag, because a flag "
-            "lands in shell history and the process list."
+            "An endpoint is three settings — base_url, model, and api_key — set "
+            "in .cagent.toml (or ~/.cagent.toml). The key is never taken from a "
+            "flag, because a flag lands in shell history and the process list."
         ),
     )
     parser.add_argument(
@@ -121,7 +121,7 @@ def _overrides(args: argparse.Namespace) -> dict[str, object]:
     """Map parsed flags onto config field names.
 
     ``None`` entries are dropped by the loader, so an unspecified flag leaves
-    the file and environment layers in charge.
+    the config files in charge.
     """
     approval = "full-auto" if args.yes else args.approval
     values: dict[str, object] = {
@@ -179,11 +179,13 @@ def main(argv: list[str] | None = None) -> int:
         # shape of a complete configuration.
         console.print(f"[red]Configuration error:[/red] {exc}")
         console.print(
-            "[dim]A complete endpoint needs three things:\n"
-            "  export CAGENT_BASE_URL=https://api.example.com/v1\n"
-            "  export CAGENT_MODEL=<a model that endpoint serves>\n"
-            "  export CAGENT_API_KEY=<your key>\n"
-            "Add CAGENT_WIRE=anthropic for the Messages API, or --no-key for a "
+            "[dim]A complete endpoint needs three things, in .cagent.toml:\n"
+            # Escaped: rich would read an unknown [cagent] tag as markup.
+            "  \\[cagent]\n"
+            '  base_url = "https://api.example.com/v1"\n'
+            '  model = "<a model that endpoint serves>"\n'
+            '  api_key = "<your key>"\n'
+            'Add wire = "anthropic" for the Messages API, or --no-key for a '
             "local server. Run 'cagent --show-config' to see what resolved.[/dim]"
         )
         return 2
@@ -355,11 +357,11 @@ def _show_config(console: Console, config: AgentConfig) -> int:
     elif not config.requires_key:
         key_state = "not needed (--no-key)"
     else:
-        key_state = "[red]not set[/red] (CAGENT_API_KEY)"
+        key_state = "[red]not set[/red] (api_key in .cagent.toml)"
 
     rows = {
-        "base_url": config.base_url or "[red]not set[/red] (CAGENT_BASE_URL)",
-        "model": config.model or "[red]not set[/red] (CAGENT_MODEL)",
+        "base_url": config.base_url or "[red]not set[/red] (base_url in .cagent.toml)",
+        "model": config.model or "[red]not set[/red] (model in .cagent.toml)",
         "wire": config.wire,
         "api key": key_state,
         "workspace": str(config.workspace),

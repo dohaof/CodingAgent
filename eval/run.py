@@ -37,7 +37,7 @@ from cagent.cli.pricing import Price, estimate_cost, parse_prices
 from cagent.cli.render import ConsoleRenderer
 from cagent.config import AgentConfig, load_config
 from cagent.errors import CagentError, ConfigError
-from cagent.tools.shell import kill_process_tree
+from cagent.tools.shell import decode_subprocess_output, kill_process_tree
 from cagent.types import Usage
 
 from .tasks import TASKS, Task, task_by_id
@@ -129,7 +129,14 @@ def verify(task: Task, root: Path) -> tuple[bool, str]:
     a stale ``.pyc`` can make a fixed file still report the old failure, which
     would show up here as a spurious loss.
     """
-    environment = os.environ | {"PYTHONDONTWRITEBYTECODE": "1"}
+    environment = os.environ | {
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONUTF8": "1",
+        "PYTHONIOENCODING": "utf-8",
+    }
+    environment["PATH"] = (
+        str(Path(sys.executable).parent) + os.pathsep + environment.get("PATH", "")
+    )
 
     try:
         process = subprocess.Popen(  # noqa: S602  # the command comes from the task table
@@ -139,9 +146,6 @@ def verify(task: Task, root: Path) -> tuple[bool, str]:
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
             env=environment,
             # Its own process group, so the timeout below can kill the tree.
             # Ignored on Windows, where taskkill /T does the same job.
@@ -151,16 +155,18 @@ def verify(task: Task, root: Path) -> tuple[bool, str]:
         return False, f"could not run verification: {exc}"
 
     try:
-        output, _ = process.communicate(timeout=VERIFY_TIMEOUT)
+        output_bytes, _ = process.communicate(timeout=VERIFY_TIMEOUT)
     except subprocess.TimeoutExpired:
         kill_process_tree(process)
         try:
-            output, _ = process.communicate(timeout=10)
+            output_bytes, _ = process.communicate(timeout=10)
         except (subprocess.TimeoutExpired, OSError, ValueError):
-            output = ""
+            output_bytes = b""
+        output = decode_subprocess_output(output_bytes)
         tail = f"\n{output.strip()}" if output.strip() else ""
         return False, f"verification timed out after {VERIFY_TIMEOUT:g}s{tail}"
 
+    output = decode_subprocess_output(output_bytes)
     return process.returncode == 0, output.strip()
 
 
@@ -330,8 +336,8 @@ def main(argv: list[str] | None = None) -> int:
     except ConfigError as exc:
         print(f"Configuration error: {exc}", file=sys.stderr)
         print(
-            "The benchmark needs a real endpoint: set CAGENT_BASE_URL, "
-            "CAGENT_MODEL, and CAGENT_API_KEY, then try again.",
+            "The benchmark needs a real endpoint: set base_url, model, and "
+            "api_key in .cagent.toml, then try again.",
             file=sys.stderr,
         )
         return 2

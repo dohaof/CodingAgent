@@ -239,6 +239,34 @@ class TestGrading:
         passed, _ = verify(broken, tmp_path)
         assert not passed
 
+    def test_verification_preserves_unicode_output(self, tmp_path: Path) -> None:
+        task = Task(
+            id="unicode",
+            prompt="x",
+            files={"unicode_output.py": "print('中文路径')\n"},
+            verify="python unicode_output.py",
+        )
+        materialise(task, tmp_path)
+        passed, output = verify(task, tmp_path)
+        assert passed and "中文路径" in output
+
+    def test_verification_uses_the_current_interpreter(self, tmp_path: Path) -> None:
+        task = Task(
+            id="interpreter",
+            prompt="x",
+            files={
+                "check_interpreter.py": (
+                    "import pathlib, sys\n"
+                    f"expected = {str(Path(sys.executable).parent)!r}\n"
+                    "assert pathlib.Path(sys.executable).parent == pathlib.Path(expected)\n"
+                )
+            },
+            verify="python check_interpreter.py",
+        )
+        materialise(task, tmp_path)
+        passed, output = verify(task, tmp_path)
+        assert passed, output
+
     def test_stale_bytecode_cannot_produce_a_false_failure(self, tmp_path: Path) -> None:
         # Same hazard the shell tool guards: a same-size fix inside one second
         # would otherwise be graded against the old bytecode.
@@ -354,16 +382,13 @@ class TestRunnerCli:
         assert main(["--task", "not-a-task"]) == 2
         assert "not-a-task" in capsys.readouterr().err
 
-    def test_an_incomplete_endpoint_explains_itself(self, capsys, monkeypatch) -> None:
-        from cagent.config import VENDOR_KEY_VARIABLES
-
-        for name in ("CAGENT_API_KEY", "CAGENT_BASE_URL", "CAGENT_MODEL"):
-            monkeypatch.delenv(name, raising=False)
-        for name in VENDOR_KEY_VARIABLES:
-            monkeypatch.delenv(name, raising=False)
+    def test_an_incomplete_endpoint_explains_itself(self, capsys) -> None:
+        # ``isolate_config`` points home and the working directory at an empty
+        # directory, so nothing is configured and nothing can be inherited.
         assert main(["--task", "sign-error"]) == 2
         err = capsys.readouterr().err
-        assert "CAGENT_BASE_URL" in err and "CAGENT_MODEL" in err
+        assert "base_url" in err and "model" in err
+        assert ".cagent.toml" in err
 
     def test_the_module_is_runnable(self) -> None:
         # `python -m eval.run --list` is the documented entry point.

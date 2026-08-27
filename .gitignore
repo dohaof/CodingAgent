@@ -19,10 +19,7 @@ htmlcov/
 .vscode/
 .DS_Store
 
-# Secrets: keep the templates, never the real thing
-.env
-.env.*
-!.env.example
+# Secrets: keep the template, never the real thing
 .cagent.toml
 # Any variant too: a ".bak" or ".local" copy of a config file holds the same
 # key the original does, and is exactly what gets committed by accident.

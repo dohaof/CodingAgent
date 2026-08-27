@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import io
 import json
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -105,18 +106,25 @@ class TestArgumentParsing:
 
 
 @pytest.fixture
-def clean_env(monkeypatch) -> None:
-    """No inherited endpoint settings.
+def write_config() -> Callable[..., Path]:
+    """Write a ``.cagent.toml`` where the loader will look for it.
 
-    Without this, a real CAGENT_* or vendor key in the developer's shell would
-    silently satisfy the very thing a test asserts is missing.
+    Configuration comes from a file and from flags, so a test that needs a
+    settled endpoint writes one. ``isolate_config`` has already pointed both
+    home and the working directory at an empty scratch directory, so this lands
+    there and never near the developer's own configuration.
     """
-    from cagent.config import VENDOR_KEY_VARIABLES
 
-    for name in ("CAGENT_API_KEY", "CAGENT_BASE_URL", "CAGENT_MODEL", "CAGENT_WIRE"):
-        monkeypatch.delenv(name, raising=False)
-    for name in VENDOR_KEY_VARIABLES:
-        monkeypatch.delenv(name, raising=False)
+    def write(**settings: object) -> Path:
+        lines = ["[cagent]"]
+        # JSON and TOML agree on strings, numbers, and booleans, which is all
+        # these tests set.
+        lines += [f"{key} = {json.dumps(value)}" for key, value in settings.items()]
+        path = Path.cwd() / ".cagent.toml"
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return path
+
+    return write
 
 
 class TestInformationalCommands:
@@ -133,36 +141,33 @@ class TestInformationalCommands:
         assert "path," in out or "path " in out  # required, unmarked
 
     def test_show_config_reports_the_resolved_endpoint(
-        self, capsys, monkeypatch, tmp_path, clean_env
+        self, capsys, tmp_path, write_config
     ) -> None:
-        monkeypatch.setenv("CAGENT_API_KEY", "sk-secret")
-        monkeypatch.setenv("CAGENT_BASE_URL", "https://api.example.com/v1")
-        monkeypatch.setenv("CAGENT_MODEL", "env-model")
+        write_config(
+            api_key="sk-secret",
+            base_url="https://api.example.com/v1",
+            model="file-model",
+        )
         assert main(["--show-config", "--workspace", str(tmp_path)]) == 0
         out = capsys.readouterr().out
         assert "https://api.example.com/v1" in out
-        assert "env-model" in out
+        assert "file-model" in out
         assert "set" in out
 
-    def test_show_config_never_prints_the_key(self, capsys, monkeypatch, tmp_path) -> None:
-        monkeypatch.setenv("CAGENT_API_KEY", "sk-do-not-print-me")
+    def test_show_config_never_prints_the_key(self, capsys, tmp_path, write_config) -> None:
+        write_config(api_key="sk-do-not-print-me")
         main(["--show-config", "--workspace", str(tmp_path)])
         assert "sk-do-not-print-me" not in capsys.readouterr().out
 
-    def test_show_config_works_when_nothing_is_configured(
-        self, capsys, tmp_path, clean_env
-    ) -> None:
+    def test_show_config_works_when_nothing_is_configured(self, capsys, tmp_path) -> None:
         # This command is most useful precisely when the configuration is
         # incomplete, so it reports gaps rather than raising.
         assert main(["--show-config", "--workspace", str(tmp_path)]) == 0
         out = capsys.readouterr().out
         assert "not set" in out
-        assert "CAGENT_BASE_URL" in out and "CAGENT_MODEL" in out
+        assert ".cagent.toml" in out
 
-    def test_show_config_names_the_full_request_url(
-        self, capsys, monkeypatch, tmp_path, clean_env
-    ) -> None:
-        monkeypatch.setenv("CAGENT_API_KEY", "sk-x")
+    def test_show_config_names_the_full_request_url(self, capsys, tmp_path) -> None:
         main(
             [
                 "--show-config",
@@ -173,10 +178,7 @@ class TestInformationalCommands:
         )
         assert "https://api.example.com/v1/chat/completions" in capsys.readouterr().out
 
-    def test_show_config_names_the_anthropic_path(
-        self, capsys, monkeypatch, tmp_path, clean_env
-    ) -> None:
-        monkeypatch.setenv("CAGENT_API_KEY", "sk-x")
+    def test_show_config_names_the_anthropic_path(self, capsys, tmp_path) -> None:
         main(
             [
                 "--show-config",
@@ -193,9 +195,9 @@ class TestEndpointConfiguration:
     """An endpoint is four settings: base_url, model, api_key, wire."""
 
     def test_base_url_model_and_key_are_sufficient(
-        self, capsys, monkeypatch, tmp_path, clean_env
+        self, capsys, tmp_path, write_config
     ) -> None:
-        monkeypatch.setenv("CAGENT_API_KEY", "sk-gateway")
+        write_config(api_key="sk-gateway")
         code = main(
             [
                 "--show-config",
@@ -209,20 +211,15 @@ class TestEndpointConfiguration:
         assert "https://gw.example.com/v1" in out
         assert "some-gateway-model" in out
 
-    def test_a_missing_endpoint_is_reported_before_any_request(
-        self, capsys, tmp_path, clean_env
-    ) -> None:
+    def test_a_missing_endpoint_is_reported_before_any_request(self, capsys, tmp_path) -> None:
         code = main(["--model", "m", "--workspace", str(tmp_path), "do a thing"])
         out = capsys.readouterr().out
         assert code == 2
-        assert "base_url" in out.lower() or "CAGENT_BASE_URL" in out
+        assert "base_url" in out.lower()
 
-    def test_a_missing_model_is_reported_rather_than_guessed(
-        self, capsys, monkeypatch, tmp_path, clean_env
-    ) -> None:
+    def test_a_missing_model_is_reported_rather_than_guessed(self, capsys, tmp_path) -> None:
         # There is deliberately no default model: a name frozen at release time
         # fails later as an unhelpful remote 404.
-        monkeypatch.setenv("CAGENT_API_KEY", "sk-x")
         code = main(
             [
                 "--base-url", "https://gw.example.com/v1",
@@ -234,7 +231,7 @@ class TestEndpointConfiguration:
         assert code == 2
         assert "model" in out.lower()
 
-    def test_a_missing_key_names_the_endpoint(self, capsys, tmp_path, clean_env) -> None:
+    def test_a_missing_key_names_the_endpoint(self, capsys, tmp_path) -> None:
         code = main(
             [
                 "--base-url", "https://gw.example.com/v1",
@@ -247,11 +244,10 @@ class TestEndpointConfiguration:
         assert code == 2
         assert "gw.example.com" in out
 
-    def test_no_vendor_variable_is_suggested_over_the_endpoint(
-        self, capsys, tmp_path, clean_env
-    ) -> None:
-        # Telling someone to set DEEPSEEK_API_KEY for their self-hosted gateway
-        # sends them looking in the wrong place.
+    def test_the_missing_key_message_points_at_the_config_file(self, capsys, tmp_path) -> None:
+        # The key has exactly one home now, so the message names it — and names
+        # the endpoint, rather than sending someone to a vendor variable that
+        # has nothing to do with their self-hosted gateway.
         main(
             [
                 "--base-url", "https://gw.example.com/v1",
@@ -262,17 +258,16 @@ class TestEndpointConfiguration:
         )
         out = capsys.readouterr().out
         assert "gw.example.com" in out
+        assert ".cagent.toml" in out
         assert "DEEPSEEK_API_KEY" not in out
 
-    def test_the_hint_shows_a_complete_configuration(
-        self, capsys, tmp_path, clean_env
-    ) -> None:
+    def test_the_hint_shows_a_complete_configuration(self, capsys, tmp_path) -> None:
         main(["--workspace", str(tmp_path), "do a thing"])
         out = capsys.readouterr().out
-        for expected in ("CAGENT_BASE_URL", "CAGENT_MODEL", "CAGENT_API_KEY"):
+        for expected in ("[cagent]", "base_url", "model", "api_key"):
             assert expected in out
 
-    def test_no_key_permits_a_local_server(self, capsys, tmp_path, clean_env) -> None:
+    def test_no_key_permits_a_local_server(self, capsys, tmp_path) -> None:
         code = main(
             [
                 "--show-config",
@@ -286,23 +281,22 @@ class TestEndpointConfiguration:
         assert code == 0
         assert "not needed" in out
 
-    def test_a_vendor_variable_is_still_picked_up(
-        self, capsys, monkeypatch, tmp_path, clean_env
+    def test_the_environment_is_not_a_configuration_layer(
+        self, capsys, monkeypatch, tmp_path, write_config
     ) -> None:
-        # A convenience: an already-exported key need not be duplicated into
-        # CAGENT_API_KEY. It says nothing about which endpoint is called.
+        # Every setting has one spelling, in the file. A CAGENT_* variable named
+        # after a field is not a second way to set it, and neither is a vendor
+        # key variable that happens to be exported.
+        monkeypatch.setenv("CAGENT_MODEL", "env-model")
+        monkeypatch.setenv("CAGENT_API_KEY", "sk-from-env")
         monkeypatch.setenv("OPENAI_API_KEY", "sk-from-vendor-var")
-        main(
-            [
-                "--show-config",
-                "--base-url", "https://gw.example.com/v1",
-                "--model", "m",
-                "--workspace", str(tmp_path),
-            ]
-        )
+        write_config(base_url="https://gw.example.com/v1", model="file-model")
+        code = main(["--show-config", "--workspace", str(tmp_path)])
         out = capsys.readouterr().out
-        assert "set" in out
-        assert "sk-from-vendor-var" not in out
+        assert code == 0
+        assert "file-model" in out
+        assert "env-model" not in out
+        assert "not set" in out  # the key, which only the file could have set
 
 
 class TestRendering:

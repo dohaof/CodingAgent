@@ -2,15 +2,15 @@
 #
 # One flat [cagent] table; every key is an AgentConfig field name. The loader
 # reads ~/.cagent.toml first, then this file from the working directory, then
-# CAGENT_* environment variables, then CLI flags. Unknown keys are an error, so
-# a typo fails loudly instead of being ignored.
+# CLI flags — there is no environment layer, so every setting has exactly one
+# spelling. Unknown keys are an error, so a typo fails loudly instead of being
+# ignored.
 
 [cagent]
 
 # --- endpoint (the only settings without usable defaults) -------------------
 #
-# There is no notion of a named "provider" here, on purpose. A vendor table
-# would have to carry vendor model names, and those go stale: a default of
+# A vendor table would have to carry vendor model names, and those go stale: a default of
 # "gpt-4o-mini" or "claude-3-5-sonnet" stops working within months and fails as
 # a remote 404 that explains nothing. Only you know what your endpoint serves.
 #
@@ -21,17 +21,22 @@
 # anthropic wire). Include the version segment your provider publishes, usually
 # ".../v1" — omitting it is the usual cause of a 404 on the first request. A
 # trailing slash is fine.
+
 base_url = "https://api.example.com/v1"
 
 # The model name your endpoint expects. Required.
+
 model = "the-model-your-endpoint-serves"
 
-# Prefer CAGENT_API_KEY in the environment over writing the key here; if you do
-# put it in this file, keep the file untracked (it is gitignored by default).
-# api_key = "your-key"
+# The key belongs here or in ~/.cagent.toml; there is deliberately no flag for
+# it, because a flag lands in shell history and the process list. Keep the file
+# untracked (it is gitignored by default).
+
+api_key = "your-key"
 
 # "openai" = Chat Completions (the default; almost everything emulates it).
 # "anthropic" = the Messages API.
+
 wire = "openai"
 
 # For a local server with no authentication, e.g. Ollama or llama.cpp:

@@ -1,18 +1,23 @@
 """Layered configuration.
 
 Precedence, lowest to highest: built-in defaults, ``~/.cagent.toml``,
-``.cagent.toml`` in the working directory, ``CAGENT_*`` environment variables,
-CLI overrides. Both config files use a single flat ``[cagent]`` table whose keys
-are :class:`AgentConfig` field names, so there is exactly one name to learn per
-setting no matter which layer sets it.
+``.cagent.toml`` in the working directory, CLI overrides. Both config files use
+a single flat ``[cagent]`` table whose keys are :class:`AgentConfig` field
+names, so there is exactly one name to learn per setting no matter which layer
+sets it.
 
-``env`` and ``cwd`` are injected rather than read from globals so the whole
-chain is unit-testable.
+There is deliberately no environment layer. It would restate every field under
+a second spelling — ``CAGENT_MAX_STEPS`` beside ``max_steps`` — and a setting
+with two spellings is a setting people have to check twice when the agent
+behaves unexpectedly. The file is the one place a setting lives; a flag
+overrides it for a single run.
+
+``cwd`` is injected rather than read from globals so the whole chain is
+unit-testable.
 """
 
 from __future__ import annotations
 
-import os
 import tomllib
 from collections.abc import Mapping
 from dataclasses import dataclass, field, fields
@@ -37,25 +42,6 @@ ApprovalMode = Literal["suggest", "auto-edit", "full-auto"]
 
 CONFIG_FILENAME = ".cagent.toml"
 CONFIG_TABLE = "cagent"
-ENV_PREFIX = "CAGENT_"
-
-VENDOR_KEY_VARIABLES: tuple[str, ...] = (
-    "OPENAI_API_KEY",
-    "ANTHROPIC_API_KEY",
-    "DEEPSEEK_API_KEY",
-    "MOONSHOT_API_KEY",
-    "DASHSCOPE_API_KEY",
-    "OPENROUTER_API_KEY",
-    "GROQ_API_KEY",
-    "TOGETHER_API_KEY",
-    "MISTRAL_API_KEY",
-)
-"""Conventional key variables, checked in order after ``CAGENT_API_KEY``.
-
-A convenience only, so an already-exported vendor key is picked up without
-being renamed. It carries no other meaning: nothing about which endpoint is
-called or which model is used is inferred from which of these was set.
-"""
 
 _TRUE = frozenset({"1", "true", "yes", "on"})
 _FALSE = frozenset({"0", "false", "no", "off"})
@@ -94,6 +80,10 @@ class AgentConfig:
     """The model name the endpoint expects. No default: see the class docstring."""
 
     api_key: str | None = None
+    """The endpoint's key. It comes from a config file only — ``.cagent.toml``
+    is untracked by default, and there is no flag, because a key on the command
+    line lands in shell history and in the process list."""
+
     wire: Wire = "openai"
     """Request format. ``openai`` (Chat Completions) suits almost everything;
     ``anthropic`` is for the Messages API."""
@@ -167,7 +157,7 @@ class AgentConfig:
         """
         if not self.base_url:
             raise ConfigError(
-                "No base_url configured. Set CAGENT_BASE_URL, or pass "
+                "No base_url configured. Set base_url in .cagent.toml, or pass "
                 "--base-url, to the endpoint you want to call "
                 "(for example https://api.example.com/v1)."
             )
@@ -185,8 +175,8 @@ class AgentConfig:
         """
         if not self.model:
             raise ConfigError(
-                "No model configured. Set CAGENT_MODEL, or pass --model, to a "
-                "model your endpoint serves."
+                "No model configured. Set model in .cagent.toml, or pass "
+                "--model, to a model your endpoint serves."
             )
         return self.model
 
@@ -224,9 +214,9 @@ class AgentConfig:
         if not self.api_key and self.requires_key:
             raise ConfigError(
                 f"No API key for the endpoint {self.resolved_base_url!r}. Set "
-                f"CAGENT_API_KEY (or one of {VENDOR_KEY_VARIABLES[0]}, "
-                f"{VENDOR_KEY_VARIABLES[1]}, …). For a local server that needs "
-                "no key, set requires_key = false."
+                "api_key in .cagent.toml (untracked by default) or in "
+                "~/.cagent.toml. For a local server that needs no key, pass "
+                "--no-key or set requires_key = false."
             )
 
         for name in ("compact_threshold", "fuzzy_threshold"):
@@ -283,7 +273,7 @@ def _hints() -> Mapping[str, object]:
 def _coerce(label: str, raw: object, hint: object) -> object:
     """Convert one layer's raw value to the field's annotated type.
 
-    ``label`` names the source (env var, file key, or flag) and appears verbatim
+    ``label`` names the source (a file key with its path, or a flag) and appears verbatim
     in any :class:`ConfigError`, so a bad value is traceable to where it was set.
     """
     origin = get_origin(hint)
@@ -358,33 +348,15 @@ def _read_config_file(path: Path) -> Mapping[str, object]:
     return table
 
 
-def _resolve_vendor_key(environ: Mapping[str, str]) -> str | None:
-    """First conventional vendor key variable that is set.
-
-    A convenience for people who already have such a variable exported, so they
-    need not duplicate it into ``CAGENT_API_KEY``. The order is fixed and means
-    nothing beyond "check these too"; with several set, use ``CAGENT_API_KEY``
-    to say which one you meant.
-    """
-    for name in VENDOR_KEY_VARIABLES:
-        value = environ.get(name)
-        if value:
-            return value
-    return None
-
-
 def load_config(
     cli_overrides: Mapping[str, object] | None = None,
     *,
     cwd: Path | None = None,
-    env: Mapping[str, str] | None = None,
 ) -> AgentConfig:
     """Merge every configuration layer into one :class:`AgentConfig`.
 
-    Later layers win: home file, then project file, then ``CAGENT_*`` env vars,
-    then ``cli_overrides`` (``None`` values there mean "flag not passed" and are
-    ignored). The API key is resolved last, from ``CAGENT_API_KEY`` and then any
-    conventional vendor variable, so an already-exported key is picked up.
+    Later layers win: home file, then project file, then ``cli_overrides``
+    (``None`` values there mean "flag not passed" and are ignored).
 
     The result is not validated; call :meth:`AgentConfig.validate` when the
     endpoint is actually about to be called.
@@ -392,7 +364,6 @@ def load_config(
     Raises:
         ConfigError: on an unknown setting name or an uninterpretable value.
     """
-    environ = os.environ if env is None else env
     base = Path.cwd() if cwd is None else Path(cwd)
     hints = _hints()
     known = {spec.name for spec in fields(AgentConfig)}
@@ -404,12 +375,6 @@ def load_config(
                 raise ConfigError(f"Unknown setting {key!r} in {path}.")
             values[key] = _coerce(f"{key} (in {path})", raw, hints[key])
 
-    for key in sorted(known):
-        name = f"{ENV_PREFIX}{key.upper()}"
-        raw_env = environ.get(name)
-        if raw_env is not None:
-            values[key] = _coerce(name, raw_env, hints[key])
-
     for key, raw in (cli_overrides or {}).items():
         if key not in known:
             raise ConfigError(f"Unknown setting {key!r} in CLI overrides.")
@@ -418,9 +383,6 @@ def load_config(
         values[key] = _coerce(f"--{key.replace('_', '-')}", raw, hints[key])
 
     values.setdefault("workspace", base)
-    config = AgentConfig(**values)  # type: ignore[arg-type]
-    if not config.api_key:
-        config.api_key = _resolve_vendor_key(environ)
-    return config
+    return AgentConfig(**values)  # type: ignore[arg-type]
 
 

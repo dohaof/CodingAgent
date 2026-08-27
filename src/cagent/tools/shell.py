@@ -17,6 +17,7 @@ stripped of anything that looks like a credential, because the model can run
 from __future__ import annotations
 
 import contextlib
+import locale
 import os
 import re
 import shutil
@@ -33,7 +34,12 @@ from .base import ApprovalRequest, BaseTool, ToolContext, ToolOutcome
 from .schema import Doc
 from .truncation import truncate_output
 
-__all__ = ["RunBashTool", "classify_command", "kill_process_tree"]
+__all__ = [
+    "RunBashTool",
+    "classify_command",
+    "decode_subprocess_output",
+    "kill_process_tree",
+]
 
 _POSIX = sys.platform != "win32"
 
@@ -181,15 +187,16 @@ def _classify_segment(segment: str) -> RiskLevel:
 def _build_invocation(command: str) -> tuple[list[str] | str, bool]:
     """Choose how to hand ``command`` to a shell.
 
-    Bash is preferred wherever it exists, including on Windows, so that a model
-    writing ordinary POSIX one-liners behaves the same on every machine. Only
-    when no bash is found does this fall back to the platform shell.
+    Bash is preferred where it can execute in the current OS environment. The
+    ``bash.exe`` in Windows System32 is a WSL launcher, not a Windows shell: it
+    cannot use the active Windows virtualenv or its paths. Skip that launcher
+    and fall back to the platform shell; a real Git Bash remains usable.
 
     Returns:
         The argv list (or command string) and whether ``shell=True`` is needed.
     """
     if sys.platform == "win32":
-        bash = shutil.which("bash")
+        bash = _windows_native_bash()
         if bash:
             return [bash, "-c", command], False
         return command, True
@@ -198,6 +205,36 @@ def _build_invocation(command: str) -> tuple[list[str] | str, bool]:
     if os.path.exists(bash):
         return [bash, "-c", command], False
     return command, True
+
+
+def _windows_native_bash() -> str | None:
+    """Find Git Bash or another native Bash without selecting WSL's launcher."""
+    bash = shutil.which("bash")
+    if bash and not _is_wsl_launcher(bash):
+        return bash
+
+    # Git for Windows may be installed outside PATH while git.exe itself is on
+    # PATH through its ``cmd`` directory. Its sibling ``bin`` contains Bash.
+    git = shutil.which("git")
+    if git:
+        root = os.path.dirname(os.path.dirname(os.path.abspath(git)))
+        for relative in (("bin", "bash.exe"), ("usr", "bin", "bash.exe")):
+            candidate = os.path.join(root, *relative)
+            if os.path.isfile(candidate):
+                return candidate
+    return None
+
+
+def _is_wsl_launcher(path: str) -> bool:
+    normalized = os.path.normcase(os.path.abspath(path))
+    system_root = os.environ.get("SYSTEMROOT")
+    if system_root:
+        launcher = os.path.normcase(
+            os.path.abspath(os.path.join(system_root, "System32", "bash.exe"))
+        )
+        if normalized == launcher:
+            return True
+    return "\\windowsapps\\bash.exe" in normalized
 
 
 def _child_environment() -> dict[str, str]:
@@ -220,10 +257,43 @@ def _child_environment() -> dict[str, str]:
         name: value for name, value in os.environ.items() if not _SECRET_PATTERN.search(name)
     }
     environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    # Python otherwise inherits the Windows ANSI code page (often GBK), while
+    # the same command emits UTF-8 on Unix. Make model-facing output portable.
+    environment["PYTHONUTF8"] = "1"
+    environment["PYTHONIOENCODING"] = "utf-8"
+    # Activation normally does this, but callers may invoke venv/Scripts/cagent
+    # directly. Commands run by the agent must still use the same interpreter.
+    executable_dir = os.path.dirname(sys.executable)
+    environment["PATH"] = executable_dir + os.pathsep + environment.get("PATH", "")
     return environment
 
 
-def kill_process_tree(process: subprocess.Popen[str]) -> None:
+def decode_subprocess_output(data: bytes | str | None) -> str:
+    """Decode captured command output without assuming the host code page.
+
+    Agent-launched Python is forced to UTF-8, and most modern tools already use
+    it. Native Windows programs may still write the active ANSI code page, so
+    use that as a fallback after a strict UTF-8 attempt.
+    """
+    if data is None:
+        return ""
+    if isinstance(data, str):
+        return data
+
+    encodings = ["utf-8"]
+    preferred = locale.getencoding()
+    if preferred.lower().replace("-", "") != "utf8":
+        encodings.append(preferred)
+
+    for encoding in encodings:
+        try:
+            return data.decode(encoding)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return data.decode(encodings[-1], errors="replace")
+
+
+def kill_process_tree(process: subprocess.Popen[bytes]) -> None:
     """Kill the command and every process it started.
 
     Killing only the shell would orphan its children, leaving a test runner or
@@ -312,9 +382,6 @@ class RunBashTool(BaseTool):
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
                 # A process group of its own, so a timeout can kill the whole
                 # tree. Ignored on Windows, where taskkill /T does the same job.
                 start_new_session=_POSIX,
@@ -327,13 +394,15 @@ class RunBashTool(BaseTool):
 
         timed_out = False
         try:
-            stdout, stderr = process.communicate(timeout=timeout)
+            stdout_bytes, stderr_bytes = process.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
             timed_out = True
             kill_process_tree(process)
-            stdout, stderr = self._drain(process)
+            stdout_bytes, stderr_bytes = self._drain(process)
         duration = time.perf_counter() - started
 
+        stdout = decode_subprocess_output(stdout_bytes)
+        stderr = decode_subprocess_output(stderr_bytes)
         exit_code = None if timed_out else process.returncode
         prefix = f"Command timed out after {timeout:g}s and was killed." if timed_out else ""
         body = _render(exit_code, stdout, stderr, prefix=prefix)
@@ -355,7 +424,7 @@ class RunBashTool(BaseTool):
         return factory(body, metadata=metadata, truncated=truncated)
 
     @staticmethod
-    def _drain(process: subprocess.Popen[str]) -> tuple[str, str]:
+    def _drain(process: subprocess.Popen[bytes]) -> tuple[bytes, bytes]:
         """Collect whatever a killed process had already written.
 
         Partial output is often the most useful part of a timeout — it shows how
@@ -364,7 +433,7 @@ class RunBashTool(BaseTool):
         try:
             return process.communicate(timeout=5)
         except (subprocess.TimeoutExpired, ValueError, OSError):
-            return "", ""
+            return b"", b""
 
     def approval_request(
         self, params: RunBashParams, ctx: ToolContext

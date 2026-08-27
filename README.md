@@ -55,28 +55,28 @@ add subtracted instead of adding (calc.py:2). Fixed and pytest passes.
 Requires Python 3.11+.
 
 ```bash
-pip install -e .            # or: pip install httpx rich
+pip install -e .
 ```
 
 ### Configuring an endpoint
 
-Three settings, and none of them are guessed:
+Three settings, and none of them are guessed. Copy `.cagent.example.toml` to
+`.cagent.toml` (gitignored) and fill in:
 
-```bash
-export CAGENT_BASE_URL=https://api.example.com/v1   # where to send requests
-export CAGENT_MODEL=the-model-your-endpoint-serves  # what to ask for
-export CAGENT_API_KEY=...                           # your key
+```toml
+[cagent]
+base_url = "https://api.example.com/v1"        # where to send requests
+model = "the-model-your-endpoint-serves"       # what to ask for
+api_key = "..."                                # your key
 ```
 
 Anything OpenAI-compatible works — a vendor API, a gateway, a proxy, or a local
-server. The same three can come from flags (`--base-url`, `--model`) or from
-`.cagent.toml`; later layers win, in the order file → environment → flags.
-
-There is deliberately **no named "provider"**. A vendor list would have to carry
-vendor model names, and model names go stale: a built-in default of
-`gpt-4o-mini` or `claude-3-5-sonnet` stops working within months, and the failure
-it produces is a remote 404 that explains nothing. Only the person holding the
-key knows what their endpoint serves, so the agent asks instead of guessing.
+server. Every key in that table is a field name, and flags of the same name
+(`--base-url`, `--model`) override it for one run: the layers are `~/.cagent.toml`
+→ `./.cagent.toml` → flags, later winning. There is no environment layer, on
+purpose — `CAGENT_MAX_STEPS` beside `max_steps` is one setting with two
+spellings, which is one place too many to look when the agent does something
+unexpected.
 
 Details worth knowing:
 
@@ -92,15 +92,17 @@ Details worth knowing:
   is just a URL.
 - **`--no-key` for a local server.** Ollama or llama.cpp then gets no
   `Authorization` header at all, rather than one containing the word `None`.
-- **An exported vendor key is picked up.** `OPENAI_API_KEY`,
-  `ANTHROPIC_API_KEY`, `DEEPSEEK_API_KEY` and a few others are checked after
-  `CAGENT_API_KEY`, purely so you need not copy a key you already have. Which
-  one is set says nothing about which endpoint is called.
+- **Unknown keys are an error.** A misspelled setting fails loudly at startup
+  instead of being silently ignored, which is the failure mode that costs an
+  afternoon.
 
-The key is never taken from a flag: a flag lands in shell history and the process
-list. `cagent --show-config` prints what resolved — endpoint, model, wire, the
-full request URL, and whether a key was found — with the key masked. It also
-works when the configuration is incomplete, which is when you need it.
+The key comes from a config file and nowhere else: never from a flag, because a
+flag lands in shell history and the process list. Keep `.cagent.toml` untracked
+(it is gitignored here), or put the key in `~/.cagent.toml` and leave the project
+file for everything else. `cagent --show-config` prints what resolved —
+endpoint, model, wire, the full request URL, and whether a key was found — with
+the key masked. It also works when the configuration is incomplete, which is
+when you need it.
 
 ### Using it
 
@@ -129,7 +131,7 @@ cached_input_per_m = 0.07   # optional
 ### Checking it
 
 ```bash
-pytest                       # 494 tests
+pytest                       # 498 tests
 ruff check src tests eval
 mypy src/cagent eval
 python -m eval.run           # the benchmark; needs a real endpoint

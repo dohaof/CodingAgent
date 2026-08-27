@@ -7,6 +7,7 @@ because the happy path is what the model already expects.
 
 from __future__ import annotations
 
+import os
 import shutil
 import sys
 import time
@@ -17,12 +18,20 @@ import pytest
 
 from cagent.errors import ToolNotFoundError
 from cagent.tools import search as search_module
+from cagent.tools import shell as shell_module
 from cagent.tools.base import ToolContext, ToolOutcome
 from cagent.tools.files import ListDirTool, ReadFileTool, WriteFileParams, WriteFileTool
 from cagent.tools.registry import ToolRegistry, default_registry, tool
 from cagent.tools.schema import Doc
 from cagent.tools.search import GlobFilesTool, GrepSearchTool
-from cagent.tools.shell import RunBashParams, RunBashTool, _build_invocation, classify_command
+from cagent.tools.shell import (
+    RunBashParams,
+    RunBashTool,
+    _build_invocation,
+    _child_environment,
+    classify_command,
+    decode_subprocess_output,
+)
 from cagent.tools.truncation import truncate_output
 from cagent.types import RiskLevel
 
@@ -448,6 +457,25 @@ class TestBuildInvocation:
         argv, use_shell = _build_invocation("dir")
         assert use_shell is True and argv == "dir"
 
+    def test_windows_wsl_launcher_is_not_used_as_native_bash(self, monkeypatch) -> None:
+        monkeypatch.setattr(sys, "platform", "win32")
+        monkeypatch.setenv("SYSTEMROOT", r"C:\Windows")
+        monkeypatch.setattr(shutil, "which", lambda name: r"C:\Windows\System32\bash.exe")
+        argv, use_shell = _build_invocation("python -V")
+        assert use_shell is True and argv == "python -V"
+
+    def test_windows_finds_bash_beside_git(self, monkeypatch) -> None:
+        monkeypatch.setattr(sys, "platform", "win32")
+        monkeypatch.setattr(
+            shutil,
+            "which",
+            lambda name: None if name == "bash" else r"D:\Git\cmd\git.exe",
+        )
+        monkeypatch.setattr(os.path, "isfile", lambda path: path == r"D:\Git\bin\bash.exe")
+        argv, use_shell = _build_invocation("echo hi")
+        assert use_shell is False
+        assert argv == [r"D:\Git\bin\bash.exe", "-c", "echo hi"]
+
 
 class TestRunBash:
     def test_stdout_is_returned_with_the_exit_code(self, make_ctx) -> None:
@@ -455,6 +483,28 @@ class TestRunBash:
         outcome = RunBashTool().invoke({"command": "echo hello-world"}, harness.ctx)
         assert not outcome.is_error, outcome.content
         assert "hello-world" in outcome.content and "exit code: 0" in outcome.content
+
+    def test_python_output_is_utf8_on_every_platform(self, make_ctx, tmp_path: Path) -> None:
+        harness = make_ctx()
+        (tmp_path / "unicode_output.py").write_text(
+            "print('中文路径')\n", encoding="utf-8"
+        )
+        outcome = RunBashTool().invoke({"command": "python unicode_output.py"}, harness.ctx)
+        assert not outcome.is_error, outcome.content
+        assert "中文路径" in outcome.content
+
+    def test_native_output_falls_back_to_the_platform_encoding(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            shell_module.locale, "getencoding", lambda: "gbk"
+        )
+        assert decode_subprocess_output("中文路径".encode("gbk")) == "中文路径"
+
+    def test_child_environment_forces_python_utf8(self, monkeypatch) -> None:
+        monkeypatch.setenv("PYTHONUTF8", "0")
+        environment = _child_environment()
+        assert environment["PYTHONUTF8"] == "1"
+        assert environment["PYTHONIOENCODING"] == "utf-8"
+        assert environment["PATH"].split(os.pathsep)[0] == str(Path(sys.executable).parent)
 
     def test_a_failing_command_returns_stderr_rather_than_raising(
         self, make_ctx, tmp_path: Path
