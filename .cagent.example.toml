@@ -1,0 +1,51 @@
+# Copy to .cagent.toml (which is gitignored) and edit.
+#
+# One flat [cagent] table; every key is an AgentConfig field name. The loader
+# reads ~/.cagent.toml first, then this file from the working directory, then
+# CAGENT_* environment variables, then CLI flags. Unknown keys are an error,
+# so a typo fails loudly instead of being ignored.
+#
+# All values below are the built-in defaults. Delete anything you do not change.
+
+[cagent]
+
+# --- provider ---
+provider = "deepseek"
+# model = "deepseek-chat"        # unset means the preset's default model
+# base_url = "https://api.deepseek.com/v1"
+# api_key = "your-api-key-here"  # prefer CAGENT_API_KEY or a vendor variable
+# wire = "openai"                # "openai" or "anthropic"; unset means the preset's
+temperature = 0.0
+max_output_tokens = 8192
+request_timeout = 120.0
+max_retries = 4
+
+# --- context ---
+context_window = 128000
+compact_threshold = 0.75         # compact once the prompt reaches this fraction
+keep_recent_turns = 6            # turns kept verbatim through a compaction
+tool_output_head_lines = 60
+tool_output_tail_lines = 40
+tool_output_max_chars = 20000
+
+# --- loop ---
+max_steps = 40
+# token_budget = 400000          # unset means no cumulative budget
+max_repeated_calls = 3           # identical calls in a row before the loop stops
+bash_timeout = 120.0
+
+# --- edit ---
+fuzzy_threshold = 0.86           # similarity floor for fuzzy edit matching
+
+# --- safety ---
+approval_mode = "auto-edit"      # "suggest" | "auto-edit" | "full-auto"
+# workspace = "."                # unset means the working directory
+allow_outside_workspace = false
+
+# --- repomap ---
+repo_map_enabled = true
+repo_map_token_budget = 1600
+
+# --- observability ---
+# trace_dir = "traces"           # unset disables trace files
+log_level = "INFO"

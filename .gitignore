@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyc
+.venv/
+venv/
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Editors and OS
+.idea/
+.vscode/
+.DS_Store
+
+# Secrets: keep the templates, never the real thing
+.env
+.env.*
+!.env.example
+.cagent.toml
+!.cagent.example.toml
+
+# Run artifacts
+.cagent/
+traces/
+*.log
+eval/runs/
