@@ -68,10 +68,55 @@ cagent --replay .cagent/traces/<id>.jsonl            # re-narrate a past run
 The key is read from the environment or an untracked `.cagent.toml`, never from a
 flag — a flag would put it in shell history and the process list.
 
-**Providers.** `--provider` selects a preset: `deepseek`, `openai`, `anthropic`,
-`moonshot`, `dashscope`, `openrouter`, `ollama`. Anything OpenAI-compatible works
-via `--base-url`. Two request formats are implemented (`openai` and `anthropic`);
-switching between them is a configuration change, not a code change.
+### Pointing it at any endpoint
+
+A preset is only a convenient default for three things: a base URL, a model, and
+a request format. Anything OpenAI-compatible works without one — supply the
+endpoint and the model directly:
+
+```bash
+cagent --base-url https://your-gateway.example.com/v1 \
+       --model whatever-that-gateway-serves \
+       "add a --json flag to the report command"
+```
+
+Equivalently, via the environment or `.cagent.toml`:
+
+```bash
+export CAGENT_BASE_URL=https://your-gateway.example.com/v1
+export CAGENT_MODEL=whatever-that-gateway-serves
+export CAGENT_API_KEY=...
+```
+
+```toml
+[cagent]
+base_url = "https://your-gateway.example.com/v1"
+model = "whatever-that-gateway-serves"
+```
+
+Three details worth knowing:
+
+- **`base_url` is used verbatim.** `/chat/completions` is appended (or
+  `/messages` on the Anthropic wire), so include whatever version segment your
+  provider publishes — usually `.../v1`. Nothing is guessed or inserted, because
+  a gateway that mounts its API somewhere unusual should still work. Omitting a
+  needed `/v1` is the usual cause of a 404 on the first request. A trailing slash
+  is handled either way.
+- **`--wire` picks the request format**, `openai` (the default) or `anthropic`.
+  Set it only if the endpoint speaks the Anthropic Messages API. This is the one
+  seam where a genuinely different protocol needs declaring; everything else is
+  just a URL.
+- **A local model needs no key.** `--provider ollama` sends no `Authorization`
+  header at all, rather than a header containing the word `None`.
+
+`cagent --show-config` prints exactly what got resolved — endpoint, model, wire,
+and whether a key was found — with the key itself masked. It is the fastest way
+to tell a configuration problem from a network one.
+
+**Presets.** `--provider` supplies those defaults for `deepseek`, `openai`,
+`anthropic`, `moonshot`, `dashscope`, `openrouter`, and `ollama`. A preset and an
+explicit `--base-url` compose: the flag overrides just the endpoint and leaves
+the preset's model and wire in place.
 
 **Supervision.** `--approval suggest` confirms every change; `auto-edit` (the
 default) lets file edits through and confirms shell commands; `full-auto`

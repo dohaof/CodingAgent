@@ -229,6 +229,30 @@ class AgentConfig:
         """Prompt size at which the context manager starts compacting."""
         return int(self.context_window * self.compact_threshold)
 
+    def _missing_key_message(self) -> str:
+        """Explain a missing key in terms of the endpoint actually configured.
+
+        Naming the preset's variable is only helpful when the preset is really
+        in use. With an explicit ``base_url`` the request goes somewhere else
+        entirely, and telling the user to set ``DEEPSEEK_API_KEY`` for a
+        self-hosted gateway sends them looking in the wrong place.
+        """
+        preset = self.preset
+        if self.base_url and (preset is None or self.base_url != preset.base_url):
+            return (
+                f"No API key for the endpoint {self.base_url!r}. "
+                "Set CAGENT_API_KEY in the environment."
+            )
+        if preset is not None:
+            return (
+                f"No API key for provider {self.provider!r}. "
+                f"Set CAGENT_API_KEY or {preset.env_key}."
+            )
+        return (
+            f"No API key for provider {self.provider!r}, which is not a known preset. "
+            "Set CAGENT_API_KEY, and CAGENT_BASE_URL for the endpoint to call."
+        )
+
     def validate(self) -> AgentConfig:
         """Check internal consistency, returning ``self`` so calls can chain.
 
@@ -238,8 +262,7 @@ class AgentConfig:
         """
         preset = self.preset
         if not self.api_key and (preset is None or preset.requires_key):
-            hint = f" Set CAGENT_API_KEY or {preset.env_key}." if preset else ""
-            raise ConfigError(f"No API key for provider {self.provider!r}.{hint}")
+            raise ConfigError(self._missing_key_message())
 
         for name in ("compact_threshold", "fuzzy_threshold"):
             value = float(getattr(self, name))

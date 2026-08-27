@@ -159,10 +159,12 @@ def main(argv: list[str] | None = None) -> int:
     try:
         config.validate()
     except ConfigError as exc:
+        # validate() already names what to set, including the endpoint when a
+        # custom base_url is in play, so this only points at the next step.
         console.print(f"[red]Configuration error:[/red] {exc}")
         console.print(
-            "[dim]Set the key in the environment, e.g. "
-            f"{_key_variable(config)}=… , or copy .cagent.example.toml to .cagent.toml.[/dim]"
+            "[dim]For a third-party or self-hosted endpoint, set CAGENT_BASE_URL and "
+            "CAGENT_MODEL too. Run 'cagent --show-config' to see what resolved.[/dim]"
         )
         return 2
 
@@ -329,8 +331,18 @@ def _show_config(console: Console, config: AgentConfig) -> int:
     table = Table(show_header=False, box=None, padding=(0, 2))
     table.add_column(style="dim")
     table.add_column()
+
+    preset = config.preset
+    provider = config.provider
+    if preset is None:
+        provider += "  (not a preset)"
+    elif config.base_url and config.base_url != preset.base_url:
+        # Saying just "deepseek" while talking to someone else's gateway reads
+        # as a bug in the tool; naming the override explains it.
+        provider += "  (preset defaults; endpoint overridden)"
+
     rows = {
-        "provider": config.provider,
+        "provider": provider,
         "model": config.resolved_model,
         "base_url": config.resolved_base_url,
         "wire": config.resolved_wire,

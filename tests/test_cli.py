@@ -129,6 +129,92 @@ class TestInformationalCommands:
         assert "DEEPSEEK_API_KEY" in out
 
 
+class TestThirdPartyEndpoints:
+    """Reaching a gateway that is not one of the built-in presets."""
+
+    def test_base_url_and_model_are_enough(self, capsys, monkeypatch, tmp_path) -> None:
+        monkeypatch.setenv("CAGENT_API_KEY", "sk-gateway")
+        code = main(
+            [
+                "--show-config",
+                "--base-url", "https://gw.example.com/v1",
+                "--model", "some-gateway-model",
+                "--workspace", str(tmp_path),
+            ]
+        )
+        out = capsys.readouterr().out
+        assert code == 0
+        assert "https://gw.example.com/v1" in out
+        assert "some-gateway-model" in out
+
+    def test_an_overridden_endpoint_is_labelled_as_such(
+        self, capsys, monkeypatch, tmp_path
+    ) -> None:
+        # Reporting the preset name unqualified while talking to someone else's
+        # gateway reads as a bug in the tool.
+        monkeypatch.setenv("CAGENT_API_KEY", "sk-x")
+        main(
+            [
+                "--show-config",
+                "--provider", "deepseek",
+                "--base-url", "https://proxy.example.com/v1",
+                "--workspace", str(tmp_path),
+            ]
+        )
+        out = capsys.readouterr().out
+        assert "overridden" in out
+        assert "https://proxy.example.com/v1" in out
+
+    def test_a_plain_preset_is_not_labelled(self, capsys, monkeypatch, tmp_path) -> None:
+        monkeypatch.setenv("CAGENT_API_KEY", "sk-x")
+        main(["--show-config", "--provider", "deepseek", "--workspace", str(tmp_path)])
+        assert "overridden" not in capsys.readouterr().out
+
+    def test_a_missing_key_names_the_endpoint_not_a_vendor_variable(
+        self, capsys, monkeypatch, tmp_path
+    ) -> None:
+        # Telling someone to set DEEPSEEK_API_KEY for their self-hosted gateway
+        # sends them looking in the wrong place.
+        for name in ("CAGENT_API_KEY", "DEEPSEEK_API_KEY"):
+            monkeypatch.delenv(name, raising=False)
+        code = main(
+            [
+                "--base-url", "https://gw.example.com/v1",
+                "--model", "m",
+                "--workspace", str(tmp_path),
+                "do a thing",
+            ]
+        )
+        out = capsys.readouterr().out
+        assert code == 2
+        assert "gw.example.com" in out
+        assert "DEEPSEEK_API_KEY" not in out
+
+    def test_the_hint_points_at_the_endpoint_variables(
+        self, capsys, monkeypatch, tmp_path
+    ) -> None:
+        for name in ("CAGENT_API_KEY", "DEEPSEEK_API_KEY"):
+            monkeypatch.delenv(name, raising=False)
+        main(["--workspace", str(tmp_path), "do a thing"])
+        out = capsys.readouterr().out
+        assert "CAGENT_BASE_URL" in out and "--show-config" in out
+
+    def test_the_wire_format_can_be_chosen_for_a_custom_endpoint(
+        self, capsys, monkeypatch, tmp_path
+    ) -> None:
+        monkeypatch.setenv("CAGENT_API_KEY", "sk-x")
+        main(
+            [
+                "--show-config",
+                "--base-url", "https://an.example.com/v1",
+                "--model", "m",
+                "--wire", "anthropic",
+                "--workspace", str(tmp_path),
+            ]
+        )
+        assert "anthropic" in capsys.readouterr().out
+
+
 class TestRendering:
     def test_the_header_names_the_model_and_workspace(self, config, captured) -> None:
         console, buffer = captured

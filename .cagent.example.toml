@@ -6,13 +6,30 @@
 # so a typo fails loudly instead of being ignored.
 #
 # All values below are the built-in defaults. Delete anything you do not change.
+#
+# --- Using a third-party or self-hosted endpoint ---------------------------
+# Any OpenAI-compatible gateway works; no matching preset is needed. Set
+# base_url, model, and the key, for example:
+#
+#   [cagent]
+#   base_url = "https://your-gateway.example.com/v1"
+#   model = "whatever-model-that-gateway-serves"
+#   # key via CAGENT_API_KEY in the environment, not in this file
+#
+# base_url is used verbatim, with "/chat/completions" appended (or "/messages"
+# on the Anthropic wire), so include the version segment your provider
+# publishes — usually ".../v1". Omitting it is the usual cause of a 404 on the
+# first request. A trailing slash is handled either way.
+#
+# Verify with: cagent --show-config   (prints the resolved URL, key masked)
+# ---------------------------------------------------------------------------
 
 [cagent]
 
 # --- provider ---
 provider = "deepseek"
 # model = "deepseek-chat"        # unset means the preset's default model
-# base_url = "https://api.deepseek.com/v1"
+# base_url = "https://api.deepseek.com/v1"   # overrides the preset's endpoint
 # api_key = "your-api-key-here"  # prefer CAGENT_API_KEY or a vendor variable
 # wire = "openai"                # "openai" or "anthropic"; unset means the preset's
 temperature = 0.0
