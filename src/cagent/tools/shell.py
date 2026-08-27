@@ -33,7 +33,7 @@ from .base import ApprovalRequest, BaseTool, ToolContext, ToolOutcome
 from .schema import Doc
 from .truncation import truncate_output
 
-__all__ = ["RunBashTool", "classify_command"]
+__all__ = ["RunBashTool", "classify_command", "kill_process_tree"]
 
 _POSIX = sys.platform != "win32"
 
@@ -223,11 +223,16 @@ def _child_environment() -> dict[str, str]:
     return environment
 
 
-def _kill_tree(process: subprocess.Popen[str]) -> None:
+def kill_process_tree(process: subprocess.Popen[str]) -> None:
     """Kill the command and every process it started.
 
     Killing only the shell would orphan its children, leaving a test runner or
-    dev server holding ports and CPU after the tool has returned.
+    dev server holding ports and CPU after the tool has returned — and, worse,
+    holding the output pipes, so a subsequent ``communicate()`` blocks forever
+    on a process nobody is waiting for.
+
+    Exported because anything that imposes a timeout on a shell command needs
+    exactly this, and a second copy would be a second chance to get it wrong.
     """
     if sys.platform == "win32":
         subprocess.run(
@@ -325,7 +330,7 @@ class RunBashTool(BaseTool):
             stdout, stderr = process.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
             timed_out = True
-            _kill_tree(process)
+            kill_process_tree(process)
             stdout, stderr = self._drain(process)
         duration = time.perf_counter() - started
 
