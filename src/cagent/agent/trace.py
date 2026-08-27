@@ -136,9 +136,9 @@ class TraceWriter:
             {
                 "type": "session",
                 "version": _TRACE_VERSION,
-                "provider": config.provider,
-                "model": config.resolved_model,
-                "wire": config.resolved_wire,
+                "model": config.model,
+                "endpoint": config.base_url,
+                "wire": config.wire,
                 "workspace": str(config.workspace),
                 "approval_mode": config.approval_mode,
                 "context_window": config.context_window,
@@ -178,7 +178,7 @@ class TraceWriter:
                     "type": "run_started",
                     "task": _clip(event.task),
                     "model": event.model,
-                    "provider": event.provider,
+                    "endpoint": event.endpoint,
                     "system_tokens": event.system_tokens,
                     "tools": list(event.tool_names),
                 }

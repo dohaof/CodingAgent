@@ -173,7 +173,7 @@ class Agent:
             RunStarted(
                 task=task,
                 model=self.config.resolved_model,
-                provider=self.config.provider,
+                endpoint=self.config.resolved_base_url,
                 system_tokens=self.context.system_tokens,
                 tool_names=tuple(sorted(self.registry.names())),
             )

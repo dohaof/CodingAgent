@@ -23,16 +23,14 @@ from typing import Literal, Union, get_args, get_origin, get_type_hints
 from .errors import ConfigError
 
 __all__ = [
-    "PRESETS",
     "AgentConfig",
     "ApprovalMode",
-    "ProviderPreset",
     "Wire",
     "load_config",
 ]
 
 Wire = Literal["openai", "anthropic"]
-"""Which request/response shape a provider speaks."""
+"""Which request/response shape an endpoint speaks."""
 
 ApprovalMode = Literal["suggest", "auto-edit", "full-auto"]
 """How much the agent may do without asking. See :class:`AgentConfig`."""
@@ -41,82 +39,40 @@ CONFIG_FILENAME = ".cagent.toml"
 CONFIG_TABLE = "cagent"
 ENV_PREFIX = "CAGENT_"
 
+VENDOR_KEY_VARIABLES: tuple[str, ...] = (
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "DEEPSEEK_API_KEY",
+    "MOONSHOT_API_KEY",
+    "DASHSCOPE_API_KEY",
+    "OPENROUTER_API_KEY",
+    "GROQ_API_KEY",
+    "TOGETHER_API_KEY",
+    "MISTRAL_API_KEY",
+)
+"""Conventional key variables, checked in order after ``CAGENT_API_KEY``.
+
+A convenience only, so an already-exported vendor key is picked up without
+being renamed. It carries no other meaning: nothing about which endpoint is
+called or which model is used is inferred from which of these was set.
+"""
+
 _TRUE = frozenset({"1", "true", "yes", "on"})
 _FALSE = frozenset({"0", "false", "no", "off"})
 
 
-@dataclass(frozen=True, slots=True)
-class ProviderPreset:
-    """Defaults for a known vendor endpoint.
-
-    ``env_key`` is that vendor's conventional key variable, checked after
-    ``CAGENT_API_KEY``. ``requires_key`` is false for local servers.
-    """
-
-    name: str
-    base_url: str
-    default_model: str
-    wire: Wire
-    env_key: str
-    requires_key: bool = True
-
-
-PRESETS: dict[str, ProviderPreset] = {
-    "deepseek": ProviderPreset(
-        name="deepseek",
-        base_url="https://api.deepseek.com/v1",
-        default_model="deepseek-chat",
-        wire="openai",
-        env_key="DEEPSEEK_API_KEY",
-    ),
-    "openai": ProviderPreset(
-        name="openai",
-        base_url="https://api.openai.com/v1",
-        default_model="gpt-4o-mini",
-        wire="openai",
-        env_key="OPENAI_API_KEY",
-    ),
-    "anthropic": ProviderPreset(
-        name="anthropic",
-        base_url="https://api.anthropic.com/v1",
-        default_model="claude-sonnet-4-20250514",
-        wire="anthropic",
-        env_key="ANTHROPIC_API_KEY",
-    ),
-    "moonshot": ProviderPreset(
-        name="moonshot",
-        base_url="https://api.moonshot.cn/v1",
-        default_model="kimi-k2-0905-preview",
-        wire="openai",
-        env_key="MOONSHOT_API_KEY",
-    ),
-    "dashscope": ProviderPreset(
-        name="dashscope",
-        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
-        default_model="qwen-plus",
-        wire="openai",
-        env_key="DASHSCOPE_API_KEY",
-    ),
-    "openrouter": ProviderPreset(
-        name="openrouter",
-        base_url="https://openrouter.ai/api/v1",
-        default_model="openai/gpt-4o-mini",
-        wire="openai",
-        env_key="OPENROUTER_API_KEY",
-    ),
-    "ollama": ProviderPreset(
-        name="ollama",
-        base_url="http://localhost:11434/v1",
-        default_model="qwen2.5-coder",
-        wire="openai",
-        env_key="OLLAMA_API_KEY",
-        requires_key=False,
-    ),
-}
-
 @dataclass
 class AgentConfig:
     """Every knob the agent reads, resolved into one object.
+
+    An endpoint is described by four things, and the agent asks for exactly
+    those: :attr:`base_url`, :attr:`model`, :attr:`api_key`, and :attr:`wire`.
+    There is deliberately no notion of a named "provider". Shipping a table of
+    vendors would mean shipping their model names, and model names go stale —
+    a default of ``gpt-4o-mini`` or ``claude-3-5-sonnet`` is wrong within
+    months and fails at the far end with an unhelpful 404. Only the person
+    holding the key knows what their endpoint serves today, so the model name
+    is required rather than guessed.
 
     Approval modes:
 
@@ -129,16 +85,32 @@ class AgentConfig:
     into a trace, or letting it surface in a traceback will not leak it.
     """
 
-    # provider
-    provider: str = "deepseek"
-    model: str | None = None
+    # endpoint
     base_url: str | None = None
+    """Where to send requests, e.g. ``https://api.example.com/v1``. Used
+    verbatim, with the wire's path appended."""
+
+    model: str | None = None
+    """The model name the endpoint expects. No default: see the class docstring."""
+
     api_key: str | None = None
-    wire: Wire | None = None
+    wire: Wire = "openai"
+    """Request format. ``openai`` (Chat Completions) suits almost everything;
+    ``anthropic`` is for the Messages API."""
+
+    requires_key: bool = True
+    """Set false for a local server such as Ollama or llama.cpp, which would
+    otherwise be rejected for having no key."""
+
     temperature: float = 0.0
     max_output_tokens: int = 8192
     request_timeout: float = 120.0
     max_retries: int = 4
+
+    prices: dict[str, object] = field(default_factory=dict)
+    """Optional per-model rates, for reporting session cost. No rates ship with
+    the project: a built-in table goes stale, and a stale price reports a
+    confidently wrong figure. See :mod:`cagent.cli.pricing`."""
 
     # context
     context_window: int = 128_000
@@ -185,84 +157,77 @@ class AgentConfig:
         return f"{type(self).__name__}({shown})"
 
     @property
-    def preset(self) -> ProviderPreset | None:
-        """The matching preset, or ``None`` for an unknown provider name."""
-        return PRESETS.get(self.provider)
-
-    @property
     def resolved_base_url(self) -> str:
-        """Explicit ``base_url`` if set, else the preset's."""
-        if self.base_url:
-            return self.base_url.rstrip("/")
-        preset = self.preset
-        if preset is None:
+        """The endpoint, without a trailing slash.
+
+        Raises:
+            ConfigError: If no ``base_url`` was configured. There is nothing
+                sensible to fall back to — guessing a vendor would be guessing
+                whose key the user holds.
+        """
+        if not self.base_url:
             raise ConfigError(
-                f"Unknown provider {self.provider!r} and no base_url given. "
-                f"Known providers: {', '.join(sorted(PRESETS))}."
+                "No base_url configured. Set CAGENT_BASE_URL, or pass "
+                "--base-url, to the endpoint you want to call "
+                "(for example https://api.example.com/v1)."
             )
-        return preset.base_url
+        return self.base_url.rstrip("/")
 
     @property
     def resolved_model(self) -> str:
-        """Explicit ``model`` if set, else the preset's default."""
-        if self.model:
-            return self.model
-        preset = self.preset
-        if preset is None:
+        """The model name to request.
+
+        Raises:
+            ConfigError: If no ``model`` was configured. A built-in default
+                would be a model name frozen at release time, and the failure
+                it produces once the vendor retires it is a remote 404 that
+                says nothing useful.
+        """
+        if not self.model:
             raise ConfigError(
-                f"Unknown provider {self.provider!r} and no model given. "
-                f"Known providers: {', '.join(sorted(PRESETS))}."
+                "No model configured. Set CAGENT_MODEL, or pass --model, to a "
+                "model your endpoint serves."
             )
-        return preset.default_model
+        return self.model
+
+    @property
+    def model_for_tokens(self) -> str:
+        """The model name for token estimation only, empty when unset.
+
+        Estimation uses the name solely to choose an encoder and already
+        degrades to a heuristic, so measuring context pressure must not require
+        a configured model — that would make a budgeting concern fail for a
+        reason that belongs to sending a request.
+        """
+        return self.model or ""
 
     @property
     def resolved_wire(self) -> Wire:
-        """Explicit ``wire`` if set, else the preset's; unknown providers
-        default to the OpenAI shape, which most vendors emulate."""
-        if self.wire:
-            return self.wire
-        preset = self.preset
-        return preset.wire if preset is not None else "openai"
+        """The request format. Defaults to the OpenAI shape."""
+        return self.wire
 
     @property
     def compact_at_tokens(self) -> int:
         """Prompt size at which the context manager starts compacting."""
         return int(self.context_window * self.compact_threshold)
 
-    def _missing_key_message(self) -> str:
-        """Explain a missing key in terms of the endpoint actually configured.
-
-        Naming the preset's variable is only helpful when the preset is really
-        in use. With an explicit ``base_url`` the request goes somewhere else
-        entirely, and telling the user to set ``DEEPSEEK_API_KEY`` for a
-        self-hosted gateway sends them looking in the wrong place.
-        """
-        preset = self.preset
-        if self.base_url and (preset is None or self.base_url != preset.base_url):
-            return (
-                f"No API key for the endpoint {self.base_url!r}. "
-                "Set CAGENT_API_KEY in the environment."
-            )
-        if preset is not None:
-            return (
-                f"No API key for provider {self.provider!r}. "
-                f"Set CAGENT_API_KEY or {preset.env_key}."
-            )
-        return (
-            f"No API key for provider {self.provider!r}, which is not a known preset. "
-            "Set CAGENT_API_KEY, and CAGENT_BASE_URL for the endpoint to call."
-        )
-
     def validate(self) -> AgentConfig:
         """Check internal consistency, returning ``self`` so calls can chain.
 
         Raises:
-            ConfigError: on a missing required key, an out-of-range threshold,
-                or a non-positive limit.
+            ConfigError: on a missing endpoint, model, or required key, an
+                out-of-range threshold, or a non-positive limit.
         """
-        preset = self.preset
-        if not self.api_key and (preset is None or preset.requires_key):
-            raise ConfigError(self._missing_key_message())
+        _ = self.resolved_base_url  # raises with its own message if unset
+        _ = self.resolved_model
+
+        if not self.api_key and self.requires_key:
+            raise ConfigError(
+                f"No API key for the endpoint {self.resolved_base_url!r}. Set "
+                f"CAGENT_API_KEY (or one of {VENDOR_KEY_VARIABLES[0]}, "
+                f"{VENDOR_KEY_VARIABLES[1]}, …). For a local server that needs "
+                "no key, set requires_key = false."
+            )
 
         for name in ("compact_threshold", "fuzzy_threshold"):
             value = float(getattr(self, name))
@@ -393,12 +358,19 @@ def _read_config_file(path: Path) -> Mapping[str, object]:
     return table
 
 
-def _resolve_vendor_key(provider: str, environ: Mapping[str, str]) -> str | None:
-    """Fall back to the preset's conventional key variable."""
-    preset = PRESETS.get(provider)
-    if preset is None:
-        return None
-    return environ.get(preset.env_key) or None
+def _resolve_vendor_key(environ: Mapping[str, str]) -> str | None:
+    """First conventional vendor key variable that is set.
+
+    A convenience for people who already have such a variable exported, so they
+    need not duplicate it into ``CAGENT_API_KEY``. The order is fixed and means
+    nothing beyond "check these too"; with several set, use ``CAGENT_API_KEY``
+    to say which one you meant.
+    """
+    for name in VENDOR_KEY_VARIABLES:
+        value = environ.get(name)
+        if value:
+            return value
+    return None
 
 
 def load_config(
@@ -411,12 +383,11 @@ def load_config(
 
     Later layers win: home file, then project file, then ``CAGENT_*`` env vars,
     then ``cli_overrides`` (``None`` values there mean "flag not passed" and are
-    ignored). The API key is resolved last, from ``CAGENT_API_KEY`` and then the
-    provider preset's own variable, because that lookup depends on the provider
-    every earlier layer just agreed on.
+    ignored). The API key is resolved last, from ``CAGENT_API_KEY`` and then any
+    conventional vendor variable, so an already-exported key is picked up.
 
-    The result is not validated; call :meth:`AgentConfig.validate` when a live
-    provider is actually needed.
+    The result is not validated; call :meth:`AgentConfig.validate` when the
+    endpoint is actually about to be called.
 
     Raises:
         ConfigError: on an unknown setting name or an uninterpretable value.
@@ -449,7 +420,7 @@ def load_config(
     values.setdefault("workspace", base)
     config = AgentConfig(**values)  # type: ignore[arg-type]
     if not config.api_key:
-        config.api_key = _resolve_vendor_key(config.provider, environ)
+        config.api_key = _resolve_vendor_key(environ)
     return config
 
 

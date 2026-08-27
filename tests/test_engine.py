@@ -87,7 +87,8 @@ def auto(project: Path, **kwargs: object) -> AgentConfig:
     return AgentConfig(
         workspace=project,
         api_key="k",
-        provider="openai",
+        base_url="https://api.test.invalid/v1",
+        model="test-model",
         approval_mode="full-auto",
         **kwargs,  # type: ignore[arg-type]
     )
@@ -250,7 +251,8 @@ class TestFailureHandling:
         self, project: Path
     ) -> None:
         config = AgentConfig(
-            workspace=project, api_key="k", provider="openai", approval_mode="suggest"
+            workspace=project, api_key="k", base_url="https://api.test.invalid/v1",
+            model="test-model", approval_mode="suggest"
         )
         policy = ApprovalPolicy(config, prompter=lambda request: Decision(approved=False))
         before = (project / "calc.py").read_bytes()
@@ -277,7 +279,8 @@ class TestFailureHandling:
 
     def test_the_approval_prompt_carries_the_real_diff(self, project: Path) -> None:
         config = AgentConfig(
-            workspace=project, api_key="k", provider="openai", approval_mode="suggest"
+            workspace=project, api_key="k", base_url="https://api.test.invalid/v1",
+            model="test-model", approval_mode="suggest"
         )
         policy = ApprovalPolicy(config, prompter=lambda request: Decision(approved=True))
         agent, sink, _ = make_agent(
@@ -299,7 +302,8 @@ class TestFailureHandling:
 
     def test_an_abort_from_the_prompt_stops_the_turn(self, project: Path) -> None:
         config = AgentConfig(
-            workspace=project, api_key="k", provider="openai", approval_mode="suggest"
+            workspace=project, api_key="k", base_url="https://api.test.invalid/v1",
+            model="test-model", approval_mode="suggest"
         )
         policy = ApprovalPolicy(
             config, prompter=lambda request: Decision(approved=False, abort=True)

@@ -28,7 +28,7 @@ from cagent.agent.events import (
     Warning,
 )
 from cagent.cli.app import _overrides, build_parser, main
-from cagent.cli.pricing import estimate_cost, price_for
+from cagent.cli.pricing import Price, estimate_cost, parse_prices, price_for
 from cagent.cli.render import ConsoleRenderer, prompt_for_approval
 from cagent.tools.base import ApprovalRequest, ToolOutcome
 from cagent.types import Message, RiskLevel, TextPart, ToolCallPart, Usage
@@ -51,10 +51,15 @@ class TestArgumentParsing:
 
     def test_flags_map_onto_config_fields(self) -> None:
         args = build_parser().parse_args(
-            ["--provider", "anthropic", "--model", "m", "--max-steps", "7", "task"]
+            [
+                "--base-url", "https://api.example.com/v1",
+                "--model", "m",
+                "--max-steps", "7",
+                "task",
+            ]
         )
         overrides = _overrides(args)
-        assert overrides["provider"] == "anthropic"
+        assert overrides["base_url"] == "https://api.example.com/v1"
         assert overrides["model"] == "m"
         assert overrides["max_steps"] == 7
 
@@ -62,7 +67,21 @@ class TestArgumentParsing:
         # The loader drops None, which is what lets a config file or environment
         # variable survive an unrelated flag being passed.
         overrides = _overrides(build_parser().parse_args(["task"]))
-        assert overrides["provider"] is None and overrides["model"] is None
+        assert overrides["base_url"] is None and overrides["model"] is None
+
+    def test_no_key_marks_the_endpoint_as_keyless(self) -> None:
+        overrides = _overrides(build_parser().parse_args(["--no-key", "task"]))
+        assert overrides["requires_key"] is False
+
+    def test_the_wire_can_be_selected(self) -> None:
+        args = build_parser().parse_args(["--wire", "anthropic", "task"])
+        assert _overrides(args)["wire"] == "anthropic"
+
+    def test_there_is_no_provider_flag(self) -> None:
+        # A named provider would mean a built-in table of vendor model names,
+        # and those go stale; the endpoint is described directly instead.
+        with pytest.raises(SystemExit):
+            build_parser().parse_args(["--provider", "openai", "task"])
 
     def test_yes_is_shorthand_for_full_auto(self) -> None:
         assert _overrides(build_parser().parse_args(["-y", "task"]))["approval_mode"] == "full-auto"
@@ -85,6 +104,21 @@ class TestArgumentParsing:
             build_parser().parse_args(["--approval", "yolo", "task"])
 
 
+@pytest.fixture
+def clean_env(monkeypatch) -> None:
+    """No inherited endpoint settings.
+
+    Without this, a real CAGENT_* or vendor key in the developer's shell would
+    silently satisfy the very thing a test asserts is missing.
+    """
+    from cagent.config import VENDOR_KEY_VARIABLES
+
+    for name in ("CAGENT_API_KEY", "CAGENT_BASE_URL", "CAGENT_MODEL", "CAGENT_WIRE"):
+        monkeypatch.delenv(name, raising=False)
+    for name in VENDOR_KEY_VARIABLES:
+        monkeypatch.delenv(name, raising=False)
+
+
 class TestInformationalCommands:
     def test_list_tools_prints_every_tool(self, capsys) -> None:
         assert main(["--list-tools"]) == 0
@@ -98,12 +132,16 @@ class TestInformationalCommands:
         assert "offset?" in out  # optional
         assert "path," in out or "path " in out  # required, unmarked
 
-    def test_show_config_resolves_the_layers(self, capsys, monkeypatch, tmp_path) -> None:
+    def test_show_config_reports_the_resolved_endpoint(
+        self, capsys, monkeypatch, tmp_path, clean_env
+    ) -> None:
         monkeypatch.setenv("CAGENT_API_KEY", "sk-secret")
-        monkeypatch.setenv("CAGENT_PROVIDER", "anthropic")
+        monkeypatch.setenv("CAGENT_BASE_URL", "https://api.example.com/v1")
+        monkeypatch.setenv("CAGENT_MODEL", "env-model")
         assert main(["--show-config", "--workspace", str(tmp_path)]) == 0
         out = capsys.readouterr().out
-        assert "anthropic" in out
+        assert "https://api.example.com/v1" in out
+        assert "env-model" in out
         assert "set" in out
 
     def test_show_config_never_prints_the_key(self, capsys, monkeypatch, tmp_path) -> None:
@@ -111,28 +149,52 @@ class TestInformationalCommands:
         main(["--show-config", "--workspace", str(tmp_path)])
         assert "sk-do-not-print-me" not in capsys.readouterr().out
 
-    def test_show_config_names_the_variable_when_the_key_is_missing(
-        self, capsys, monkeypatch, tmp_path
+    def test_show_config_works_when_nothing_is_configured(
+        self, capsys, tmp_path, clean_env
     ) -> None:
-        for name in ("CAGENT_API_KEY", "DEEPSEEK_API_KEY"):
-            monkeypatch.delenv(name, raising=False)
-        main(["--show-config", "--provider", "deepseek", "--workspace", str(tmp_path)])
+        # This command is most useful precisely when the configuration is
+        # incomplete, so it reports gaps rather than raising.
+        assert main(["--show-config", "--workspace", str(tmp_path)]) == 0
         out = capsys.readouterr().out
-        assert "missing" in out and "DEEPSEEK_API_KEY" in out
+        assert "not set" in out
+        assert "CAGENT_BASE_URL" in out and "CAGENT_MODEL" in out
 
-    def test_a_missing_key_fails_before_any_request(self, capsys, monkeypatch, tmp_path) -> None:
-        for name in ("CAGENT_API_KEY", "DEEPSEEK_API_KEY"):
-            monkeypatch.delenv(name, raising=False)
-        code = main(["--provider", "deepseek", "--workspace", str(tmp_path), "do a thing"])
-        out = capsys.readouterr().out
-        assert code == 2
-        assert "DEEPSEEK_API_KEY" in out
+    def test_show_config_names_the_full_request_url(
+        self, capsys, monkeypatch, tmp_path, clean_env
+    ) -> None:
+        monkeypatch.setenv("CAGENT_API_KEY", "sk-x")
+        main(
+            [
+                "--show-config",
+                "--base-url", "https://api.example.com/v1/",
+                "--model", "m",
+                "--workspace", str(tmp_path),
+            ]
+        )
+        assert "https://api.example.com/v1/chat/completions" in capsys.readouterr().out
+
+    def test_show_config_names_the_anthropic_path(
+        self, capsys, monkeypatch, tmp_path, clean_env
+    ) -> None:
+        monkeypatch.setenv("CAGENT_API_KEY", "sk-x")
+        main(
+            [
+                "--show-config",
+                "--base-url", "https://api.example.com/v1",
+                "--model", "m",
+                "--wire", "anthropic",
+                "--workspace", str(tmp_path),
+            ]
+        )
+        assert "/v1/messages" in capsys.readouterr().out
 
 
-class TestThirdPartyEndpoints:
-    """Reaching a gateway that is not one of the built-in presets."""
+class TestEndpointConfiguration:
+    """An endpoint is four settings: base_url, model, api_key, wire."""
 
-    def test_base_url_and_model_are_enough(self, capsys, monkeypatch, tmp_path) -> None:
+    def test_base_url_model_and_key_are_sufficient(
+        self, capsys, monkeypatch, tmp_path, clean_env
+    ) -> None:
         monkeypatch.setenv("CAGENT_API_KEY", "sk-gateway")
         code = main(
             [
@@ -147,36 +209,32 @@ class TestThirdPartyEndpoints:
         assert "https://gw.example.com/v1" in out
         assert "some-gateway-model" in out
 
-    def test_an_overridden_endpoint_is_labelled_as_such(
-        self, capsys, monkeypatch, tmp_path
+    def test_a_missing_endpoint_is_reported_before_any_request(
+        self, capsys, tmp_path, clean_env
     ) -> None:
-        # Reporting the preset name unqualified while talking to someone else's
-        # gateway reads as a bug in the tool.
+        code = main(["--model", "m", "--workspace", str(tmp_path), "do a thing"])
+        out = capsys.readouterr().out
+        assert code == 2
+        assert "base_url" in out.lower() or "CAGENT_BASE_URL" in out
+
+    def test_a_missing_model_is_reported_rather_than_guessed(
+        self, capsys, monkeypatch, tmp_path, clean_env
+    ) -> None:
+        # There is deliberately no default model: a name frozen at release time
+        # fails later as an unhelpful remote 404.
         monkeypatch.setenv("CAGENT_API_KEY", "sk-x")
-        main(
+        code = main(
             [
-                "--show-config",
-                "--provider", "deepseek",
-                "--base-url", "https://proxy.example.com/v1",
+                "--base-url", "https://gw.example.com/v1",
                 "--workspace", str(tmp_path),
+                "do a thing",
             ]
         )
         out = capsys.readouterr().out
-        assert "overridden" in out
-        assert "https://proxy.example.com/v1" in out
+        assert code == 2
+        assert "model" in out.lower()
 
-    def test_a_plain_preset_is_not_labelled(self, capsys, monkeypatch, tmp_path) -> None:
-        monkeypatch.setenv("CAGENT_API_KEY", "sk-x")
-        main(["--show-config", "--provider", "deepseek", "--workspace", str(tmp_path)])
-        assert "overridden" not in capsys.readouterr().out
-
-    def test_a_missing_key_names_the_endpoint_not_a_vendor_variable(
-        self, capsys, monkeypatch, tmp_path
-    ) -> None:
-        # Telling someone to set DEEPSEEK_API_KEY for their self-hosted gateway
-        # sends them looking in the wrong place.
-        for name in ("CAGENT_API_KEY", "DEEPSEEK_API_KEY"):
-            monkeypatch.delenv(name, raising=False)
+    def test_a_missing_key_names_the_endpoint(self, capsys, tmp_path, clean_env) -> None:
         code = main(
             [
                 "--base-url", "https://gw.example.com/v1",
@@ -188,48 +246,84 @@ class TestThirdPartyEndpoints:
         out = capsys.readouterr().out
         assert code == 2
         assert "gw.example.com" in out
-        assert "DEEPSEEK_API_KEY" not in out
 
-    def test_the_hint_points_at_the_endpoint_variables(
-        self, capsys, monkeypatch, tmp_path
+    def test_no_vendor_variable_is_suggested_over_the_endpoint(
+        self, capsys, tmp_path, clean_env
     ) -> None:
-        for name in ("CAGENT_API_KEY", "DEEPSEEK_API_KEY"):
-            monkeypatch.delenv(name, raising=False)
-        main(["--workspace", str(tmp_path), "do a thing"])
-        out = capsys.readouterr().out
-        assert "CAGENT_BASE_URL" in out and "--show-config" in out
-
-    def test_the_wire_format_can_be_chosen_for_a_custom_endpoint(
-        self, capsys, monkeypatch, tmp_path
-    ) -> None:
-        monkeypatch.setenv("CAGENT_API_KEY", "sk-x")
+        # Telling someone to set DEEPSEEK_API_KEY for their self-hosted gateway
+        # sends them looking in the wrong place.
         main(
             [
-                "--show-config",
-                "--base-url", "https://an.example.com/v1",
+                "--base-url", "https://gw.example.com/v1",
                 "--model", "m",
-                "--wire", "anthropic",
+                "--workspace", str(tmp_path),
+                "do a thing",
+            ]
+        )
+        out = capsys.readouterr().out
+        assert "gw.example.com" in out
+        assert "DEEPSEEK_API_KEY" not in out
+
+    def test_the_hint_shows_a_complete_configuration(
+        self, capsys, tmp_path, clean_env
+    ) -> None:
+        main(["--workspace", str(tmp_path), "do a thing"])
+        out = capsys.readouterr().out
+        for expected in ("CAGENT_BASE_URL", "CAGENT_MODEL", "CAGENT_API_KEY"):
+            assert expected in out
+
+    def test_no_key_permits_a_local_server(self, capsys, tmp_path, clean_env) -> None:
+        code = main(
+            [
+                "--show-config",
+                "--base-url", "http://localhost:11434/v1",
+                "--model", "some-local-model",
+                "--no-key",
                 "--workspace", str(tmp_path),
             ]
         )
-        assert "anthropic" in capsys.readouterr().out
+        out = capsys.readouterr().out
+        assert code == 0
+        assert "not needed" in out
+
+    def test_a_vendor_variable_is_still_picked_up(
+        self, capsys, monkeypatch, tmp_path, clean_env
+    ) -> None:
+        # A convenience: an already-exported key need not be duplicated into
+        # CAGENT_API_KEY. It says nothing about which endpoint is called.
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-from-vendor-var")
+        main(
+            [
+                "--show-config",
+                "--base-url", "https://gw.example.com/v1",
+                "--model", "m",
+                "--workspace", str(tmp_path),
+            ]
+        )
+        out = capsys.readouterr().out
+        assert "set" in out
+        assert "sk-from-vendor-var" not in out
 
 
 class TestRendering:
-    def test_the_header_names_the_model_and_workspace(self, config, captured) -> None:
+    def test_the_header_names_the_model_endpoint_and_tools(self, config, captured) -> None:
         console, buffer = captured
         renderer = ConsoleRenderer(config, console=console)
         renderer.handle(
             RunStarted(
                 task="fix it",
-                model="deepseek-chat",
-                provider="deepseek",
+                model="some-model",
+                endpoint="https://api.example.com/v1",
                 system_tokens=1200,
                 tool_names=("read_file", "edit_file"),
             )
         )
         out = buffer.getvalue()
-        assert "deepseek-chat" in out and "read_file" in out
+        # The endpoint matters as much as the model: the same name can be
+        # served by several of them.
+        assert "some-model" in out
+        assert "api.example.com" in out
+        assert "read_file" in out
 
     def test_a_tool_call_is_shown_with_its_arguments(self, config, captured) -> None:
         console, buffer = captured
@@ -345,7 +439,8 @@ class TestRendering:
 
     def test_the_summary_totals_tokens_and_cost(self, config, captured) -> None:
         console, buffer = captured
-        config.model = "deepseek-chat"
+        config.model = "some-model"
+        config.prices = {"some-model": {"input_per_m": 1.0, "output_per_m": 4.0}}
         renderer = ConsoleRenderer(config, console=console)
         renderer.handle(
             RunFinished(
@@ -362,14 +457,16 @@ class TestRendering:
         assert "$" in out
         assert "trace.jsonl" in out
 
-    def test_an_unpriced_model_says_so_instead_of_guessing(self, config, captured) -> None:
+    def test_no_configured_rate_says_so_instead_of_guessing(self, config, captured) -> None:
         console, buffer = captured
-        config.model = "some-local-llama"
+        config.model = "some-local-model"
         renderer = ConsoleRenderer(config, console=console)
         renderer.handle(
             RunFinished(reason="finished", steps=1, usage=Usage(10, 5), elapsed_s=1.0)
         )
-        assert "unpriced model" in buffer.getvalue()
+        out = buffer.getvalue()
+        assert "no rate set" in out
+        assert "$" not in out
 
     def test_the_summary_lists_files_that_changed(self, config, captured) -> None:
         console, buffer = captured
@@ -519,43 +616,106 @@ class TestApprovalPrompt:
 
 
 class TestPricing:
-    def test_a_known_model_is_priced_by_prefix(self) -> None:
-        assert price_for("deepseek-chat") is not None
-        assert price_for("gpt-4o-mini-2024-07-18") is not None
+    """Rates are supplied by the user; none ship with the project."""
 
-    def test_an_unknown_model_has_no_price(self) -> None:
-        assert price_for("my-finetune-v3") is None
+    RATES = {"some-model": Price(1.0, 4.0, 0.1), "some-model-mini": Price(0.1, 0.4)}
 
-    def test_a_more_specific_prefix_wins(self) -> None:
-        mini = price_for("gpt-4o-mini")
-        full = price_for("gpt-4o")
-        assert mini is not None and full is not None
-        assert mini.input_per_m < full.input_per_m
+    def test_no_rates_means_no_cost_reported(self) -> None:
+        # The whole point: a built-in table would go stale, and a stale price
+        # states a dollar figure that is simply wrong.
+        assert price_for("some-model") is None
+        assert estimate_cost("some-model", prompt_tokens=1000, completion_tokens=100) is None
+
+    def test_a_configured_rate_is_found(self) -> None:
+        assert price_for("some-model", self.RATES) is not None
+
+    def test_matching_is_by_prefix_so_dated_names_work(self) -> None:
+        # Deployment names carry suffixes like "-2024-07-18".
+        assert price_for("some-model-2099-01-01", self.RATES) is not None
+
+    def test_the_longest_prefix_wins(self) -> None:
+        specific = price_for("some-model-mini-latest", self.RATES)
+        general = price_for("some-model-latest", self.RATES)
+        assert specific is not None and general is not None
+        assert specific.input_per_m < general.input_per_m
+
+    def test_an_unlisted_model_has_no_rate(self) -> None:
+        assert price_for("something-else", self.RATES) is None
 
     def test_cost_grows_with_usage(self) -> None:
-        small = estimate_cost("deepseek-chat", prompt_tokens=1000, completion_tokens=100)
-        large = estimate_cost("deepseek-chat", prompt_tokens=100_000, completion_tokens=10_000)
+        small = estimate_cost(
+            "some-model", prompt_tokens=1000, completion_tokens=100, prices=self.RATES
+        )
+        large = estimate_cost(
+            "some-model", prompt_tokens=100_000, completion_tokens=10_000, prices=self.RATES
+        )
         assert small is not None and large is not None and large > small
 
     def test_cached_tokens_are_cheaper(self) -> None:
-        fresh = estimate_cost("deepseek-chat", prompt_tokens=10_000, completion_tokens=0)
+        fresh = estimate_cost(
+            "some-model", prompt_tokens=10_000, completion_tokens=0, prices=self.RATES
+        )
         cached = estimate_cost(
-            "deepseek-chat", prompt_tokens=10_000, completion_tokens=0, cached_tokens=10_000
+            "some-model",
+            prompt_tokens=10_000,
+            completion_tokens=0,
+            cached_tokens=10_000,
+            prices=self.RATES,
         )
         assert fresh is not None and cached is not None and cached < fresh
+
+    def test_a_rate_without_a_cached_price_bills_cached_as_fresh(self) -> None:
+        rates = {"some-model-mini": Price(0.1, 0.4)}
+        plain = estimate_cost(
+            "some-model-mini", prompt_tokens=1000, completion_tokens=0, prices=rates
+        )
+        cached = estimate_cost(
+            "some-model-mini",
+            prompt_tokens=1000,
+            completion_tokens=0,
+            cached_tokens=1000,
+            prices=rates,
+        )
+        assert plain == cached
 
     def test_cached_cannot_exceed_prompt_tokens(self) -> None:
         # Guards against a provider reporting inconsistent numbers.
         cost = estimate_cost(
-            "deepseek-chat", prompt_tokens=100, completion_tokens=0, cached_tokens=99_999
+            "some-model",
+            prompt_tokens=100,
+            completion_tokens=0,
+            cached_tokens=99_999,
+            prices=self.RATES,
         )
         assert cost is not None and cost >= 0
 
-    def test_an_unknown_model_reports_nothing_rather_than_guessing(self) -> None:
-        assert estimate_cost("mystery-model", prompt_tokens=1000, completion_tokens=100) is None
-
     def test_zero_usage_costs_nothing(self) -> None:
-        assert estimate_cost("deepseek-chat", prompt_tokens=0, completion_tokens=0) == 0.0
+        cost = estimate_cost(
+            "some-model", prompt_tokens=0, completion_tokens=0, prices=self.RATES
+        )
+        assert cost == 0.0
+
+    def test_rates_are_parsed_from_configuration(self) -> None:
+        table = parse_prices(
+            {
+                "My-Model": {"input_per_m": 0.5, "output_per_m": 2.0},
+                "other": {"input_per_m": 1, "output_per_m": 2, "cached_input_per_m": 0.25},
+            }
+        )
+        assert table["my-model"].output_per_m == 2.0  # names are lowercased
+        assert table["other"].cached_input_per_m == 0.25
+
+    def test_a_malformed_rate_is_skipped_not_fatal(self) -> None:
+        # A typo in a cosmetic setting must not stop the agent working.
+        table = parse_prices(
+            {
+                "good": {"input_per_m": 1.0, "output_per_m": 2.0},
+                "missing-output": {"input_per_m": 1.0},
+                "not-a-number": {"input_per_m": "cheap", "output_per_m": 2.0},
+                "not-a-table": 3.0,
+            }
+        )
+        assert set(table) == {"good"}
 
 
 class TestReplay:

@@ -131,11 +131,11 @@ class ContextManager:
         from ..llm.tokens import estimate_tools
 
         self.system_tokens = system_tokens
-        self.tool_tokens = estimate_tools(tools, model=self.config.resolved_model) if tools else 0
+        self.tool_tokens = estimate_tools(tools, model=self.config.model_for_tokens) if tools else 0
 
     def token_count(self) -> int:
         """Estimated tokens for the next request, overhead included."""
-        model = self.config.resolved_model
+        model = self.config.model_for_tokens
         return self.system_tokens + self.tool_tokens + estimate_messages(
             self.history, model=model
         )
@@ -291,7 +291,7 @@ class ContextManager:
 
         stale = [message for block in compactable for message in block.messages]
         original_tokens = sum(
-            estimate_message(message, model=self.config.resolved_model) for message in stale
+            estimate_message(message, model=self.config.model_for_tokens) for message in stale
         )
         try:
             summary = self.summarizer(stale)
@@ -301,7 +301,7 @@ class ContextManager:
             return False
 
         note = Message(role="user", parts=[TextPart(f"{_SUMMARY_HEADER}\n{summary.strip()}")])
-        if estimate_message(note, model=self.config.resolved_model) >= original_tokens:
+        if estimate_message(note, model=self.config.model_for_tokens) >= original_tokens:
             return False
 
         first, *recent = protected

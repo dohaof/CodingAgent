@@ -1,21 +1,28 @@
-"""Indicative token prices, for showing what a session cost.
+"""Reporting what a session cost, when the rates are known.
 
-Published rates, in US dollars per million tokens, recorded here so a run can
-report a figure rather than a token count nobody converts in their head. They
-are indicative only: vendors change prices, discount cached input, and bill
-differently per region, so an unknown model reports tokens and no dollar amount
-instead of guessing.
+No price table ships with this project, deliberately. Vendors change prices,
+rename models, and bill cached input differently, so a built-in table is wrong
+within months — and a stale *price* is worse than a missing one, because it
+reports a confident dollar figure that is simply false. Token counts, which the
+provider reports and which never go stale, are always shown.
 
-Matching is by prefix, because deployed model names carry dated suffixes
-(``deepseek-chat``, ``gpt-4o-mini-2024-07-18``) that would otherwise each need
-their own row.
+To see costs, state your own rates in ``.cagent.toml``. Prefix matching means a
+dated deployment name (``…-2024-07-18``) needs no separate row:
+
+    [cagent.prices."your-model"]
+    input_per_m = 0.27
+    output_per_m = 1.10
+    cached_input_per_m = 0.07   # optional
+
+Rates are US dollars per million tokens.
 """
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 
-__all__ = ["Price", "estimate_cost", "price_for"]
+__all__ = ["Price", "estimate_cost", "parse_prices", "price_for"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -28,33 +35,40 @@ class Price:
     """Rate for prompt tokens served from cache, when the vendor discounts them."""
 
 
-_PRICES: tuple[tuple[str, Price], ...] = (
-    # Longest prefixes first: the first match wins, so a specific variant must
-    # be listed before the family it belongs to.
-    ("deepseek-reasoner", Price(0.55, 2.19, 0.14)),
-    ("deepseek-chat", Price(0.27, 1.10, 0.07)),
-    ("gpt-4o-mini", Price(0.15, 0.60, 0.075)),
-    ("gpt-4o", Price(2.50, 10.00, 1.25)),
-    ("gpt-4.1-mini", Price(0.40, 1.60, 0.10)),
-    ("gpt-4.1", Price(2.00, 8.00, 0.50)),
-    ("claude-sonnet-4", Price(3.00, 15.00, 0.30)),
-    ("claude-opus-4", Price(15.00, 75.00, 1.50)),
-    ("claude-haiku-4", Price(1.00, 5.00, 0.10)),
-    ("claude-3-5-haiku", Price(0.80, 4.00, 0.08)),
-    ("claude-3-5-sonnet", Price(3.00, 15.00, 0.30)),
-    ("qwen-plus", Price(0.40, 1.20)),
-    ("qwen-turbo", Price(0.05, 0.20)),
-    ("kimi-k2", Price(0.60, 2.50)),
-    ("moonshot-v1", Price(0.20, 0.80)),
-)
+def parse_prices(raw: Mapping[str, object]) -> dict[str, Price]:
+    """Build a price table from configuration.
+
+    Malformed entries are skipped rather than fatal: a typo in an optional
+    cosmetic setting must not stop the agent from doing the user's work.
+    """
+    table: dict[str, Price] = {}
+    for name, entry in raw.items():
+        if not isinstance(entry, Mapping):
+            continue
+        try:
+            cached = entry.get("cached_input_per_m")
+            table[str(name).lower()] = Price(
+                input_per_m=float(entry["input_per_m"]),
+                output_per_m=float(entry["output_per_m"]),
+                cached_input_per_m=None if cached is None else float(cached),
+            )
+        except (KeyError, TypeError, ValueError):
+            continue
+    return table
 
 
-def price_for(model: str) -> Price | None:
-    """The price table entry for ``model``, or ``None`` when unlisted."""
+def price_for(model: str, prices: Mapping[str, Price] | None = None) -> Price | None:
+    """The rate configured for ``model``, or ``None`` when none is.
+
+    Matching is by prefix, longest first, so ``gpt-4o`` and ``gpt-4o-mini`` can
+    coexist and the more specific one wins.
+    """
+    if not prices:
+        return None
     lowered = model.lower()
-    for prefix, price in _PRICES:
+    for prefix in sorted(prices, key=len, reverse=True):
         if lowered.startswith(prefix):
-            return price
+            return prices[prefix]
     return None
 
 
@@ -64,14 +78,15 @@ def estimate_cost(
     prompt_tokens: int,
     completion_tokens: int,
     cached_tokens: int = 0,
+    prices: Mapping[str, Price] | None = None,
 ) -> float | None:
-    """Estimate a run's cost in dollars, or ``None`` for an unlisted model.
+    """A run's cost in dollars, or ``None`` when no rate is configured.
 
-    Cached prompt tokens are billed at the cached rate where one is known and
+    Cached prompt tokens are billed at the cached rate where one is given and
     are treated as a subset of ``prompt_tokens``, matching how both wires report
     them.
     """
-    price = price_for(model)
+    price = price_for(model, prices)
     if price is None:
         return None
 

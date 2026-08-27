@@ -33,7 +33,7 @@ from typing import TextIO
 from cagent.agent.approval import ApprovalPolicy
 from cagent.agent.engine import Agent
 from cagent.agent.events import CollectingSink, ToolFinished
-from cagent.cli.pricing import estimate_cost
+from cagent.cli.pricing import Price, estimate_cost, parse_prices
 from cagent.cli.render import ConsoleRenderer
 from cagent.config import AgentConfig, load_config
 from cagent.errors import CagentError, ConfigError
@@ -80,6 +80,8 @@ class Report:
 
     attempts: list[Attempt] = field(default_factory=list)
     model: str = ""
+    prices: dict[str, Price] = field(default_factory=dict)
+    """Rates from the user's config, if any; costs are omitted without them."""
 
     @property
     def passed(self) -> int:
@@ -284,6 +286,7 @@ def print_report(report: Report, *, out: TextIO | None = None) -> None:
         prompt_tokens=usage.prompt_tokens,
         completion_tokens=usage.completion_tokens,
         cached_tokens=usage.cached_tokens,
+        prices=report.prices,
     )
     if cost is not None:
         write(f"cost:   ${cost:.4f} total, ${cost / max(total, 1):.4f} per attempt")
@@ -302,8 +305,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--task", action="append", help="run only this task id (repeatable)")
     parser.add_argument("--repeat", type=int, default=1, help="attempts per task")
-    parser.add_argument("--provider", help="provider preset")
-    parser.add_argument("--model", help="model name")
+    parser.add_argument("--base-url", metavar="URL", help="the API endpoint")
+    parser.add_argument("--model", metavar="NAME", help="the model to benchmark")
     parser.add_argument("--verbose", action="store_true", help="stream each run")
     parser.add_argument("--json", type=Path, help="also write results here as JSON")
     parser.add_argument("--list", action="store_true", help="list the tasks and exit")
@@ -321,19 +324,22 @@ def main(argv: list[str] | None = None) -> int:
         print(exc, file=sys.stderr)
         return 2
 
-    overrides: dict[str, object] = {"provider": args.provider, "model": args.model}
+    overrides: dict[str, object] = {"base_url": args.base_url, "model": args.model}
     try:
         config = load_config(overrides).validate()
     except ConfigError as exc:
         print(f"Configuration error: {exc}", file=sys.stderr)
         print(
-            "The benchmark needs a real model. Set the provider's API key in the "
-            "environment and try again.",
+            "The benchmark needs a real endpoint: set CAGENT_BASE_URL, "
+            "CAGENT_MODEL, and CAGENT_API_KEY, then try again.",
             file=sys.stderr,
         )
         return 2
 
-    report = Report(model=config.resolved_model)
+    report = Report(
+        model=config.resolved_model,
+        prices=parse_prices(config.prices),
+    )
     total = len(selected) * max(args.repeat, 1)
     done = 0
 

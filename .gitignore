@@ -24,6 +24,9 @@ htmlcov/
 .env.*
 !.env.example
 .cagent.toml
+# Any variant too: a ".bak" or ".local" copy of a config file holds the same
+# key the original does, and is exactly what gets committed by accident.
+.cagent.toml.*
 !.cagent.example.toml
 
 # Run artifacts

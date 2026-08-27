@@ -14,6 +14,7 @@ from pathlib import Path
 
 import pytest
 
+from cagent.cli.pricing import Price
 from cagent.types import Usage
 from eval.run import Attempt, Report, main, materialise, print_report, verify
 from eval.tasks import TASKS, Task, task_by_id
@@ -288,7 +289,10 @@ class TestReporting:
         assert len(grouped["a"]) == 2 and len(grouped["b"]) == 1
 
     def test_the_printed_report_shows_results_and_totals(self, capsys) -> None:
-        report = Report(model="deepseek-chat")
+        report = Report(
+            model="some-model",
+            prices={"some-model": Price(1.0, 4.0)},
+        )
         report.attempts.append(
             Attempt(
                 task_id="sign-error",
@@ -320,8 +324,8 @@ class TestReporting:
         assert "sign-error" in out and "two-files" in out
         assert "MaxStepsExceeded" in out
         assert "retrieve" in out  # the failing check's last line
-        assert "$" in out  # priced model
-        assert "deepseek-chat" in out
+        assert "$" in out  # a rate was configured
+        assert "some-model" in out
 
     def test_an_attempt_serialises_for_the_json_report(self) -> None:
         attempt = Attempt(
@@ -350,11 +354,16 @@ class TestRunnerCli:
         assert main(["--task", "not-a-task"]) == 2
         assert "not-a-task" in capsys.readouterr().err
 
-    def test_a_missing_key_explains_itself(self, capsys, monkeypatch) -> None:
-        for name in ("CAGENT_API_KEY", "DEEPSEEK_API_KEY", "OPENAI_API_KEY"):
+    def test_an_incomplete_endpoint_explains_itself(self, capsys, monkeypatch) -> None:
+        from cagent.config import VENDOR_KEY_VARIABLES
+
+        for name in ("CAGENT_API_KEY", "CAGENT_BASE_URL", "CAGENT_MODEL"):
             monkeypatch.delenv(name, raising=False)
-        assert main(["--provider", "deepseek", "--task", "sign-error"]) == 2
-        assert "needs a real model" in capsys.readouterr().err
+        for name in VENDOR_KEY_VARIABLES:
+            monkeypatch.delenv(name, raising=False)
+        assert main(["--task", "sign-error"]) == 2
+        err = capsys.readouterr().err
+        assert "CAGENT_BASE_URL" in err and "CAGENT_MODEL" in err
 
     def test_the_module_is_runnable(self) -> None:
         # `python -m eval.run --list` is the documented entry point.

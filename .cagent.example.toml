@@ -2,42 +2,59 @@
 #
 # One flat [cagent] table; every key is an AgentConfig field name. The loader
 # reads ~/.cagent.toml first, then this file from the working directory, then
-# CAGENT_* environment variables, then CLI flags. Unknown keys are an error,
-# so a typo fails loudly instead of being ignored.
-#
-# All values below are the built-in defaults. Delete anything you do not change.
-#
-# --- Using a third-party or self-hosted endpoint ---------------------------
-# Any OpenAI-compatible gateway works; no matching preset is needed. Set
-# base_url, model, and the key, for example:
-#
-#   [cagent]
-#   base_url = "https://your-gateway.example.com/v1"
-#   model = "whatever-model-that-gateway-serves"
-#   # key via CAGENT_API_KEY in the environment, not in this file
-#
-# base_url is used verbatim, with "/chat/completions" appended (or "/messages"
-# on the Anthropic wire), so include the version segment your provider
-# publishes — usually ".../v1". Omitting it is the usual cause of a 404 on the
-# first request. A trailing slash is handled either way.
-#
-# Verify with: cagent --show-config   (prints the resolved URL, key masked)
-# ---------------------------------------------------------------------------
+# CAGENT_* environment variables, then CLI flags. Unknown keys are an error, so
+# a typo fails loudly instead of being ignored.
 
 [cagent]
 
-# --- provider ---
-provider = "deepseek"
-# model = "deepseek-chat"        # unset means the preset's default model
-# base_url = "https://api.deepseek.com/v1"   # overrides the preset's endpoint
-# api_key = "your-api-key-here"  # prefer CAGENT_API_KEY or a vendor variable
-# wire = "openai"                # "openai" or "anthropic"; unset means the preset's
+# --- endpoint (the only settings without usable defaults) -------------------
+#
+# There is no notion of a named "provider" here, on purpose. A vendor table
+# would have to carry vendor model names, and those go stale: a default of
+# "gpt-4o-mini" or "claude-3-5-sonnet" stops working within months and fails as
+# a remote 404 that explains nothing. Only you know what your endpoint serves.
+#
+# Anything OpenAI-compatible works — a vendor API, a gateway, a proxy, or a
+# local server.
+
+# Used verbatim, with "/chat/completions" appended ("/messages" on the
+# anthropic wire). Include the version segment your provider publishes, usually
+# ".../v1" — omitting it is the usual cause of a 404 on the first request. A
+# trailing slash is fine.
+base_url = "https://api.example.com/v1"
+
+# The model name your endpoint expects. Required.
+model = "the-model-your-endpoint-serves"
+
+# Prefer CAGENT_API_KEY in the environment over writing the key here; if you do
+# put it in this file, keep the file untracked (it is gitignored by default).
+# api_key = "your-key"
+
+# "openai" = Chat Completions (the default; almost everything emulates it).
+# "anthropic" = the Messages API.
+wire = "openai"
+
+# For a local server with no authentication, e.g. Ollama or llama.cpp:
+# requires_key = false
+
 temperature = 0.0
 max_output_tokens = 8192
 request_timeout = 120.0
 max_retries = 4
 
-# --- context ---
+# --- cost reporting (optional) ---------------------------------------------
+# No rates ship with this project: a built-in price table goes stale, and a
+# stale price prints a confident dollar figure that is wrong. Token counts are
+# always reported; add your own rates here to see money as well. Matching is by
+# prefix, so a dated deployment name needs no extra row. US dollars per million
+# tokens.
+#
+# [cagent.prices."the-model-your-endpoint-serves"]
+# input_per_m = 0.27
+# output_per_m = 1.10
+# cached_input_per_m = 0.07     # optional
+
+# --- context ---------------------------------------------------------------
 context_window = 128000
 compact_threshold = 0.75         # compact once the prompt reaches this fraction
 keep_recent_turns = 6            # turns kept verbatim through a compaction
@@ -45,24 +62,24 @@ tool_output_head_lines = 60
 tool_output_tail_lines = 40
 tool_output_max_chars = 20000
 
-# --- loop ---
+# --- loop ------------------------------------------------------------------
 max_steps = 40
 # token_budget = 400000          # unset means no cumulative budget
 max_repeated_calls = 3           # identical calls in a row before the loop stops
 bash_timeout = 120.0
 
-# --- edit ---
+# --- edit ------------------------------------------------------------------
 fuzzy_threshold = 0.86           # similarity floor for fuzzy edit matching
 
-# --- safety ---
+# --- safety ----------------------------------------------------------------
 approval_mode = "auto-edit"      # "suggest" | "auto-edit" | "full-auto"
 # workspace = "."                # unset means the working directory
 allow_outside_workspace = false
 
-# --- repomap ---
+# --- repomap ---------------------------------------------------------------
 repo_map_enabled = true
 repo_map_token_budget = 1600
 
-# --- observability ---
+# --- observability ---------------------------------------------------------
 # trace_dir = "traces"           # unset disables trace files
 log_level = "INFO"

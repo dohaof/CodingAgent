@@ -28,7 +28,7 @@ from ..agent.approval import ApprovalPolicy
 from ..agent.engine import Agent
 from ..agent.events import FanOutSink
 from ..agent.trace import TraceWriter, read_trace
-from ..config import PRESETS, AgentConfig, load_config
+from ..config import AgentConfig, load_config
 from ..errors import CagentError, ConfigError
 from ..tools.registry import default_registry
 from .render import ConsoleRenderer, prompt_for_approval
@@ -46,20 +46,35 @@ def build_parser() -> argparse.ArgumentParser:
         prog="cagent",
         description="A coding agent that reads, edits, and runs code to finish a task.",
         epilog=(
-            "The API key comes from CAGENT_API_KEY or the provider's own variable "
-            "(for example DEEPSEEK_API_KEY), never from a flag."
+            "An endpoint is three settings: CAGENT_BASE_URL, CAGENT_MODEL, and "
+            "CAGENT_API_KEY. The key is never taken from a flag, because a flag "
+            "lands in shell history and the process list."
         ),
     )
     parser.add_argument(
         "task", nargs="*", help="the task to perform; omit for an interactive session"
     )
 
-    model = parser.add_argument_group("model")
-    model.add_argument("--provider", choices=sorted(PRESETS), help="provider preset to use")
-    model.add_argument("--model", help="model name, overriding the preset default")
-    model.add_argument("--base-url", help="OpenAI-compatible endpoint, overriding the preset")
-    model.add_argument("--wire", choices=("openai", "anthropic"), help="request format to speak")
-    model.add_argument("--temperature", type=float, help="sampling temperature")
+    endpoint = parser.add_argument_group("endpoint")
+    endpoint.add_argument(
+        "--base-url",
+        metavar="URL",
+        help="the API endpoint, e.g. https://api.example.com/v1 (used verbatim)",
+    )
+    endpoint.add_argument(
+        "--model", metavar="NAME", help="the model name your endpoint serves"
+    )
+    endpoint.add_argument(
+        "--wire",
+        choices=("openai", "anthropic"),
+        help="request format: openai (Chat Completions, the default) or anthropic (Messages)",
+    )
+    endpoint.add_argument(
+        "--no-key",
+        action="store_true",
+        help="the endpoint needs no API key, e.g. a local Ollama or llama.cpp server",
+    )
+    endpoint.add_argument("--temperature", type=float, help="sampling temperature")
 
     limits = parser.add_argument_group("limits")
     limits.add_argument("--max-steps", type=int, help="model requests allowed per task")
@@ -110,7 +125,6 @@ def _overrides(args: argparse.Namespace) -> dict[str, object]:
     """
     approval = "full-auto" if args.yes else args.approval
     values: dict[str, object] = {
-        "provider": args.provider,
         "model": args.model,
         "base_url": args.base_url,
         "wire": args.wire,
@@ -122,6 +136,8 @@ def _overrides(args: argparse.Namespace) -> dict[str, object]:
         "approval_mode": approval,
         "workspace": args.workspace,
     }
+    if args.no_key:
+        values["requires_key"] = False
     if args.allow_outside_workspace:
         values["allow_outside_workspace"] = True
     if args.no_repo_map:
@@ -159,23 +175,21 @@ def main(argv: list[str] | None = None) -> int:
     try:
         config.validate()
     except ConfigError as exc:
-        # validate() already names what to set, including the endpoint when a
-        # custom base_url is in play, so this only points at the next step.
+        # validate() names the specific missing setting, so this only shows the
+        # shape of a complete configuration.
         console.print(f"[red]Configuration error:[/red] {exc}")
         console.print(
-            "[dim]For a third-party or self-hosted endpoint, set CAGENT_BASE_URL and "
-            "CAGENT_MODEL too. Run 'cagent --show-config' to see what resolved.[/dim]"
+            "[dim]A complete endpoint needs three things:\n"
+            "  export CAGENT_BASE_URL=https://api.example.com/v1\n"
+            "  export CAGENT_MODEL=<a model that endpoint serves>\n"
+            "  export CAGENT_API_KEY=<your key>\n"
+            "Add CAGENT_WIRE=anthropic for the Messages API, or --no-key for a "
+            "local server. Run 'cagent --show-config' to see what resolved.[/dim]"
         )
         return 2
 
     task = " ".join(args.task).strip()
     return _run_session(console, config, task, args)
-
-
-def _key_variable(config: AgentConfig) -> str:
-    """The environment variable this provider's key is read from."""
-    preset = config.preset
-    return preset.env_key if preset else "CAGENT_API_KEY"
 
 
 def _run_session(
@@ -327,26 +341,27 @@ def _command(console: Console, agent: Agent, config: AgentConfig, line: str) -> 
 
 
 def _show_config(console: Console, config: AgentConfig) -> int:
-    """Print the resolved configuration, with the key masked."""
+    """Print the resolved configuration, with the key masked.
+
+    Reports a missing endpoint or model as "not set" rather than raising: this
+    command is most useful precisely when the configuration is incomplete.
+    """
     table = Table(show_header=False, box=None, padding=(0, 2))
     table.add_column(style="dim")
     table.add_column()
 
-    preset = config.preset
-    provider = config.provider
-    if preset is None:
-        provider += "  (not a preset)"
-    elif config.base_url and config.base_url != preset.base_url:
-        # Saying just "deepseek" while talking to someone else's gateway reads
-        # as a bug in the tool; naming the override explains it.
-        provider += "  (preset defaults; endpoint overridden)"
+    if config.api_key:
+        key_state = "set"
+    elif not config.requires_key:
+        key_state = "not needed (--no-key)"
+    else:
+        key_state = "[red]not set[/red] (CAGENT_API_KEY)"
 
     rows = {
-        "provider": provider,
-        "model": config.resolved_model,
-        "base_url": config.resolved_base_url,
-        "wire": config.resolved_wire,
-        "api key": "set" if config.api_key else f"missing ({_key_variable(config)})",
+        "base_url": config.base_url or "[red]not set[/red] (CAGENT_BASE_URL)",
+        "model": config.model or "[red]not set[/red] (CAGENT_MODEL)",
+        "wire": config.wire,
+        "api key": key_state,
         "workspace": str(config.workspace),
         "approval mode": config.approval_mode,
         "context window": f"{config.context_window:,}",
@@ -361,6 +376,13 @@ def _show_config(console: Console, config: AgentConfig) -> int:
     for key, value in rows.items():
         table.add_row(key, value)
     console.print(Panel(table, title="resolved configuration", border_style="cyan", expand=False))
+
+    if config.base_url and config.model:
+        console.print(
+            f"[dim]requests go to "
+            f"{config.resolved_base_url}"
+            f"{'/messages' if config.wire == 'anthropic' else '/chat/completions'}[/dim]"
+        )
     return 0
 
 
@@ -406,9 +428,12 @@ def _replay(console: Console, path: Path) -> int:
         stamp = f"[dim]{record.get('t', 0):7.2f}s[/dim]"
         match kind:
             case "session":
+                # Older traces recorded a "provider" name; fall back to it so a
+                # trace written before that field was dropped still replays.
+                where = record.get("endpoint") or record.get("provider") or "unknown endpoint"
                 console.print(
                     Panel(
-                        f"{record.get('provider')}/{record.get('model')} · "
+                        f"{record.get('model')} @ {where} · "
                         f"{record.get('workspace')} · {record.get('approval_mode')}",
                         title="replay",
                         border_style="cyan",

@@ -31,10 +31,37 @@ from cagent.tools.base import ApprovalRequest, ToolContext
 from cagent.types import Message, ToolSpec, Usage
 
 
+@pytest.fixture(autouse=True)
+def isolate_config(monkeypatch, tmp_path_factory) -> None:
+    """Keep the developer's own configuration out of every test.
+
+    ``load_config`` reads ``~/.cagent.toml`` and ``./.cagent.toml`` by design,
+    which means a real file on the machine running the tests would silently
+    supply an endpoint, a model, or a key — and a test asserting that one is
+    *missing* would pass or fail depending on whose laptop it ran on. Pointing
+    home and the working directory at an empty directory removes that.
+
+    The directory is deliberately outside the test's own ``tmp_path``, which
+    many tests list or assert the contents of.
+    """
+    empty = tmp_path_factory.mktemp("no_config")
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: empty))
+    monkeypatch.chdir(empty)
+
+
 @pytest.fixture
 def config(tmp_path: Path) -> AgentConfig:
-    """A config rooted in a temporary workspace, with a placeholder key."""
-    return AgentConfig(workspace=tmp_path, api_key="test-key", provider="openai")
+    """A fully specified config rooted in a temporary workspace.
+
+    An endpoint is four settings and none of them have defaults, so every test
+    that talks to a provider states all of them.
+    """
+    return AgentConfig(
+        workspace=tmp_path,
+        base_url="https://api.test.invalid/v1",
+        model="test-model",
+        api_key="test-key",
+    )
 
 
 @dataclass

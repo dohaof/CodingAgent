@@ -48,7 +48,10 @@ class RunStarted:
 
     task: str
     model: str
-    provider: str
+    endpoint: str
+    """The base URL requests go to — the fact worth recording, since the same
+    model name can be served by several endpoints."""
+
     system_tokens: int
     tool_names: tuple[str, ...]
 

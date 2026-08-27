@@ -123,7 +123,7 @@ class PromptBuilder:
         text = "\n\n".join(section.strip() for section in sections if section.strip())
         return SystemPrompt(
             text=text,
-            tokens=estimate_text(text, model=self.config.resolved_model),
+            tokens=estimate_text(text, model=self.config.model_for_tokens),
             repo_map=repo_map,
         )
 
@@ -187,7 +187,7 @@ class PromptBuilder:
             self._cached_map = build_repo_map(
                 self.config.workspace,
                 token_budget=self.config.repo_map_token_budget,
-                model=self.config.resolved_model,
+                model=self.config.model_for_tokens,
             )
             self._map_built = True
         return self._cached_map

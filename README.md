@@ -37,15 +37,15 @@ $ cagent "the tests are failing, find out why and fix it"
 
 add subtracted instead of adding (calc.py:2). Fixed and pytest passes.
 
-┌───── session finished ─────┐
-│ steps                    5 │
-│ tools run                4 │
-│ elapsed               1.6s │
-│ prompt tokens        4,500 │
-│ completion tokens      225 │
-│ estimated cost     $0.0015 │
-│ files touched      calc.py │
-└────────────────────────────┘
+┌────────────── session finished ───────────────┐
+│ steps                                       5 │
+│ tools run                                   4 │
+│ elapsed                                  1.5s │
+│ prompt tokens                           4,500 │
+│ completion tokens                         225 │
+│ cost               no rate set for this model │
+│ files touched                         calc.py │
+└───────────────────────────────────────────────┘
 ```
 
 ---
@@ -55,78 +55,84 @@ add subtracted instead of adding (calc.py:2). Fixed and pytest passes.
 Requires Python 3.11+.
 
 ```bash
-pip install -e .                      # or: pip install httpx rich
-export DEEPSEEK_API_KEY=...           # or OPENAI_API_KEY, ANTHROPIC_API_KEY, …
-
-cagent "add a --json flag to the report command"     # one task
-cagent                                               # interactive session
-cagent --show-config                                 # what got resolved, key masked
-cagent --list-tools                                  # tools and their arguments
-cagent --replay .cagent/traces/<id>.jsonl            # re-narrate a past run
+pip install -e .            # or: pip install httpx rich
 ```
 
-The key is read from the environment or an untracked `.cagent.toml`, never from a
-flag — a flag would put it in shell history and the process list.
+### Configuring an endpoint
 
-### Pointing it at any endpoint
-
-A preset is only a convenient default for three things: a base URL, a model, and
-a request format. Anything OpenAI-compatible works without one — supply the
-endpoint and the model directly:
+Three settings, and none of them are guessed:
 
 ```bash
-cagent --base-url https://your-gateway.example.com/v1 \
-       --model whatever-that-gateway-serves \
-       "add a --json flag to the report command"
+export CAGENT_BASE_URL=https://api.example.com/v1   # where to send requests
+export CAGENT_MODEL=the-model-your-endpoint-serves  # what to ask for
+export CAGENT_API_KEY=...                           # your key
 ```
 
-Equivalently, via the environment or `.cagent.toml`:
+Anything OpenAI-compatible works — a vendor API, a gateway, a proxy, or a local
+server. The same three can come from flags (`--base-url`, `--model`) or from
+`.cagent.toml`; later layers win, in the order file → environment → flags.
 
-```bash
-export CAGENT_BASE_URL=https://your-gateway.example.com/v1
-export CAGENT_MODEL=whatever-that-gateway-serves
-export CAGENT_API_KEY=...
-```
+There is deliberately **no named "provider"**. A vendor list would have to carry
+vendor model names, and model names go stale: a built-in default of
+`gpt-4o-mini` or `claude-3-5-sonnet` stops working within months, and the failure
+it produces is a remote 404 that explains nothing. Only the person holding the
+key knows what their endpoint serves, so the agent asks instead of guessing.
 
-```toml
-[cagent]
-base_url = "https://your-gateway.example.com/v1"
-model = "whatever-that-gateway-serves"
-```
-
-Three details worth knowing:
+Details worth knowing:
 
 - **`base_url` is used verbatim.** `/chat/completions` is appended (or
   `/messages` on the Anthropic wire), so include whatever version segment your
-  provider publishes — usually `.../v1`. Nothing is guessed or inserted, because
-  a gateway that mounts its API somewhere unusual should still work. Omitting a
-  needed `/v1` is the usual cause of a 404 on the first request. A trailing slash
-  is handled either way.
-- **`--wire` picks the request format**, `openai` (the default) or `anthropic`.
-  Set it only if the endpoint speaks the Anthropic Messages API. This is the one
-  seam where a genuinely different protocol needs declaring; everything else is
-  just a URL.
-- **A local model needs no key.** `--provider ollama` sends no `Authorization`
-  header at all, rather than a header containing the word `None`.
+  provider publishes — usually `.../v1`. Nothing is inserted or guessed, so a
+  gateway that mounts its API somewhere unusual still works; omitting a needed
+  `/v1` is the usual cause of a 404 on the first request. A trailing slash is
+  handled either way.
+- **`--wire` picks the request format**, `openai` (the default, which almost
+  everything emulates) or `anthropic` for the Messages API. This is the only
+  seam where a genuinely different protocol has to be declared; everything else
+  is just a URL.
+- **`--no-key` for a local server.** Ollama or llama.cpp then gets no
+  `Authorization` header at all, rather than one containing the word `None`.
+- **An exported vendor key is picked up.** `OPENAI_API_KEY`,
+  `ANTHROPIC_API_KEY`, `DEEPSEEK_API_KEY` and a few others are checked after
+  `CAGENT_API_KEY`, purely so you need not copy a key you already have. Which
+  one is set says nothing about which endpoint is called.
 
-`cagent --show-config` prints exactly what got resolved — endpoint, model, wire,
-and whether a key was found — with the key itself masked. It is the fastest way
-to tell a configuration problem from a network one.
+The key is never taken from a flag: a flag lands in shell history and the process
+list. `cagent --show-config` prints what resolved — endpoint, model, wire, the
+full request URL, and whether a key was found — with the key masked. It also
+works when the configuration is incomplete, which is when you need it.
 
-**Presets.** `--provider` supplies those defaults for `deepseek`, `openai`,
-`anthropic`, `moonshot`, `dashscope`, `openrouter`, and `ollama`. A preset and an
-explicit `--base-url` compose: the flag overrides just the endpoint and leaves
-the preset's model and wire in place.
+### Using it
+
+```bash
+cagent "add a --json flag to the report command"     # one task
+cagent                                               # interactive session
+cagent --list-tools                                  # tools and their arguments
+cagent --replay .cagent/traces/<id>.jsonl            # re-narrate a past run
+```
 
 **Supervision.** `--approval suggest` confirms every change; `auto-edit` (the
 default) lets file edits through and confirms shell commands; `full-auto`
 confirms only destructive commands. Nothing auto-approves a destructive command.
 
+**Cost.** Token counts are always reported. Dollar figures require rates you
+supply, because a built-in price table goes stale and a stale price prints a
+confident number that is wrong:
+
+```toml
+[cagent.prices."the-model-your-endpoint-serves"]
+input_per_m = 0.27          # US dollars per million tokens
+output_per_m = 1.10
+cached_input_per_m = 0.07   # optional
+```
+
+### Checking it
+
 ```bash
-pytest                       # 482 tests
+pytest                       # 494 tests
 ruff check src tests eval
 mypy src/cagent eval
-python -m eval.run           # the benchmark; needs a real key
+python -m eval.run           # the benchmark; needs a real endpoint
 ```
 
 ---

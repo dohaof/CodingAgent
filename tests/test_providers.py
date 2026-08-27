@@ -238,7 +238,13 @@ class TestOpenAIWire:
             headers.append(request.headers)
             return httpx.Response(200, content=openai_stream())
 
-        config = AgentConfig(workspace=tmp_path, provider="ollama", api_key=None)
+        config = AgentConfig(
+            workspace=tmp_path,
+            base_url="http://localhost:11434/v1",
+            model="local-model",
+            api_key=None,
+            requires_key=False,
+        )
         provider = OpenAIProvider(config, client=transport(handler))
         provider.complete([Message.user("hi")], system="")
         assert "authorization" not in headers[0]
@@ -470,20 +476,33 @@ class TestAnthropicWire:
         assert result.finish_reason == expected
 
 
+def endpoint_config(tmp_path, **overrides: object) -> AgentConfig:
+    """A minimal complete endpoint: url, model, key, and a wire."""
+    settings: dict[str, object] = {
+        "workspace": tmp_path,
+        "base_url": "https://x.invalid/v1",
+        "model": "m",
+        "api_key": "k",
+    }
+    settings.update(overrides)
+    return AgentConfig(**settings)  # type: ignore[arg-type]
+
+
 class TestFactory:
     def test_both_wires_are_registered(self) -> None:
         assert set(WIRE_IMPLEMENTATIONS) == {"openai", "anthropic"}
 
-    def test_openai_preset_builds_the_openai_provider(self, tmp_path) -> None:
-        config = AgentConfig(workspace=tmp_path, provider="openai", api_key="k")
-        assert isinstance(build_provider(config), OpenAIProvider)
+    def test_the_default_wire_is_openai(self, tmp_path) -> None:
+        # Almost every endpoint emulates Chat Completions, so it is the default
+        # and the Anthropic shape is the thing you opt into.
+        assert isinstance(build_provider(endpoint_config(tmp_path)), OpenAIProvider)
 
-    def test_anthropic_preset_builds_the_anthropic_provider(self, tmp_path) -> None:
-        config = AgentConfig(workspace=tmp_path, provider="anthropic", api_key="k")
+    def test_the_anthropic_wire_can_be_selected(self, tmp_path) -> None:
+        config = endpoint_config(tmp_path, wire="anthropic")
         assert isinstance(build_provider(config), AnthropicProvider)
 
-    def test_unknown_wire_is_a_config_error(self, tmp_path) -> None:
-        config = AgentConfig(workspace=tmp_path, provider="openai", api_key="k")
+    def test_an_unknown_wire_is_a_config_error(self, tmp_path) -> None:
+        config = endpoint_config(tmp_path)
         config.wire = "carrier-pigeon"  # type: ignore[assignment]
         with pytest.raises(ConfigError):
             build_provider(config)

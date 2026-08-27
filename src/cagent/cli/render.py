@@ -52,7 +52,7 @@ from ..agent.events import (
 from ..config import AgentConfig
 from ..tools.base import ApprovalRequest
 from ..types import RiskLevel, ToolCallPart
-from .pricing import estimate_cost
+from .pricing import estimate_cost, parse_prices
 
 __all__ = ["ConsoleRenderer", "prompt_for_approval"]
 
@@ -155,7 +155,8 @@ class ConsoleRenderer:
         header = Table.grid(padding=(0, 1))
         header.add_column(style="dim")
         header.add_column()
-        header.add_row("model", f"{event.provider}/{event.model}")
+        header.add_row("model", event.model)
+        header.add_row("endpoint", event.endpoint)
         header.add_row("workspace", str(self.config.workspace))
         header.add_row("approval", self.config.approval_mode)
         header.add_row("tools", f"{len(event.tool_names)} · {', '.join(event.tool_names)}")
@@ -314,12 +315,18 @@ class ConsoleRenderer:
             table.add_row("reasoning tokens", f"{usage.reasoning_tokens:,}")
 
         cost = estimate_cost(
-            self.config.resolved_model,
+            self.config.model_for_tokens,
             prompt_tokens=usage.prompt_tokens,
             completion_tokens=usage.completion_tokens,
             cached_tokens=usage.cached_tokens,
+            prices=parse_prices(self.config.prices),
         )
-        table.add_row("estimated cost", f"${cost:.4f}" if cost is not None else "unpriced model")
+        if cost is not None:
+            table.add_row("estimated cost", f"${cost:.4f}")
+        else:
+            # No rate configured. Reporting tokens and saying so beats printing
+            # a number from a table that went stale after release.
+            table.add_row("cost", "no rate set for this model")
         if self._files_touched:
             table.add_row("files touched", ", ".join(sorted(self._files_touched)[:6]))
         if event.trace_path:
