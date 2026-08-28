@@ -157,7 +157,10 @@ def main(argv: list[str] | None = None) -> int:
         return _replay(console, args.replay)
 
     try:
-        config = load_config(_overrides(args))
+        # An explicit workspace is also the project-config root.  This makes
+        # ``cagent --workspace D:\\project`` behave like starting from inside
+        # that project, even when the shell remains in another directory.
+        config = load_config(_overrides(args), cwd=args.workspace)
     except ConfigError as exc:
         console.print(f"[red]Configuration error:[/red] {exc}")
         return 2

@@ -113,6 +113,29 @@ cagent --list-tools                                  # tools and their arguments
 cagent --replay .cagent/traces/<id>.jsonl            # re-narrate a past run
 ```
 
+The command is installed by the Python package; it is not tied to this
+repository. On Windows, activate the virtual environment once per terminal and
+then run it from any project directory:
+
+```powershell
+& "C:\path\to\CodingAgent\venv\Scripts\Activate.ps1"
+cd D:\Projects\MyProject
+cagent "run the tests and fix the failure"
+```
+
+To avoid activating a virtual environment manually, install the project with
+`pipx install --editable C:\path\to\CodingAgent`; `pipx` exposes `cagent` on
+your user `PATH`. You can also keep the shell in another directory and select
+the target explicitly:
+
+```powershell
+cagent --workspace D:\Projects\MyProject "inspect and fix the tests"
+```
+
+With `--workspace`, that directory is both the file/command sandbox and the
+location where the project `.cagent.toml` is read. The user-level
+`%USERPROFILE%\.cagent.toml` remains available for shared endpoint settings.
+
 **Supervision.** `--approval suggest` confirms every change; `auto-edit` (the
 default) lets file edits through and confirms shell commands; `full-auto`
 confirms only destructive commands. Nothing auto-approves a destructive command.

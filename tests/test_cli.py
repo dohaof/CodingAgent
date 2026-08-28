@@ -154,6 +154,19 @@ class TestInformationalCommands:
         assert "file-model" in out
         assert "set" in out
 
+    def test_explicit_workspace_loads_its_project_config(self, capsys, tmp_path) -> None:
+        project = tmp_path / "project"
+        project.mkdir()
+        (project / ".cagent.toml").write_text(
+            '[cagent]\nbase_url = "https://project.example/v1"\nmodel = "project-model"\n',
+            encoding="utf-8",
+        )
+
+        assert main(["--show-config", "--workspace", str(project)]) == 0
+        out = capsys.readouterr().out
+        assert "https://project.example/v1" in out
+        assert "project-model" in out
+
     def test_show_config_never_prints_the_key(self, capsys, tmp_path, write_config) -> None:
         write_config(api_key="sk-do-not-print-me")
         main(["--show-config", "--workspace", str(tmp_path)])

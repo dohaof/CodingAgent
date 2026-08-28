@@ -1,4 +1,4 @@
-"""Run the benchmark and report a pass rate.
+"""Run the basic benchmark and report a pass rate.
 
 Usage::
 
