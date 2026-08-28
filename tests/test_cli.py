@@ -175,7 +175,8 @@ class TestInformationalCommands:
         console, buffer = captured
         _print_help(console, "resume")
         out = buffer.getvalue()
-        assert "/resume TRACE" in out
+        assert "/resume" in out and "list saved conversations" in out
+        assert "/resume ID" in out and "/resume PATH" in out
         assert "current Agent" in out
 
     def test_resume_command_restores_trace_into_current_agent(
@@ -216,6 +217,117 @@ class TestInformationalCommands:
 
         assert [message.text for message in agent.restored] == ["old task", "old answer"]
         assert "resumed 2 message(s)" in buffer.getvalue()
+
+    def test_resume_without_argument_presents_recent_traces(
+        self, captured, tmp_path: Path, monkeypatch
+    ) -> None:
+        console, buffer = captured
+        trace_dir = tmp_path / ".cagent" / "traces"
+        trace_dir.mkdir(parents=True)
+        for session_id, prompt in (("new-session", "new task"), ("old-session", "old task")):
+            (trace_dir / f"{session_id}.jsonl").write_text(
+                "\n".join(
+                    json.dumps(record)
+                    for record in (
+                        {"type": "session", "workspace": str(tmp_path)},
+                        {"type": "user", "text": prompt},
+                        {
+                            "type": "step_finished",
+                            "step": 1,
+                            "message": {
+                                "role": "assistant",
+                                "parts": [{"type": "text", "text": "old answer"}],
+                            },
+                        },
+                    )
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+        # Ensure the first directory entry is the newest one deterministically.
+        now = __import__("time").time()
+        (trace_dir / "new-session.jsonl").touch()
+        (trace_dir / "old-session.jsonl").touch()
+        import os
+
+        os.utime(trace_dir / "new-session.jsonl", (now + 2, now + 2))
+        os.utime(trace_dir / "old-session.jsonl", (now, now))
+
+        class StubAgent:
+            def __init__(self) -> None:
+                self.restored = []
+
+            def restore_history(self, messages) -> None:
+                self.restored = messages
+
+        agent = StubAgent()
+        config = AgentConfig(workspace=tmp_path)
+        monkeypatch.setattr("builtins.input", lambda _: "1")
+
+        _command(console, agent, config, "/resume")  # type: ignore[arg-type]
+
+        assert [message.text for message in agent.restored] == ["new task", "old answer"]
+        out = buffer.getvalue()
+        assert "Saved conversations" in out and "new task" in out
+        assert "resumed 2 message(s)" in out
+
+    def test_resume_short_id_is_found_in_the_default_trace_directory(
+        self, captured, tmp_path: Path
+    ) -> None:
+        console, buffer = captured
+        trace_dir = tmp_path / ".cagent" / "traces"
+        trace_dir.mkdir(parents=True)
+        path = trace_dir / "f52a54aac599.jsonl"
+        path.write_text(
+            "\n".join(
+                json.dumps(record)
+                for record in (
+                    {"type": "session", "workspace": str(tmp_path)},
+                    {"type": "user", "text": "continue this"},
+                )
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        class StubAgent:
+            def __init__(self) -> None:
+                self.restored = []
+
+            def restore_history(self, messages) -> None:
+                self.restored = messages
+
+        agent = StubAgent()
+        config = AgentConfig(workspace=tmp_path)
+        _command(console, agent, config, "/resume f52a54aac599")  # type: ignore[arg-type]
+
+        assert [message.text for message in agent.restored] == ["continue this"]
+        assert "resumed 1 message(s)" in buffer.getvalue()
+
+    def test_resume_explains_when_trace_files_are_empty(
+        self, captured, tmp_path: Path
+    ) -> None:
+        console, buffer = captured
+        trace_dir = tmp_path / ".cagent" / "traces"
+        trace_dir.mkdir(parents=True)
+        (trace_dir / "empty.jsonl").write_text(
+            '{"type":"session"}\n{"type":"run_finished","steps":0}\n',
+            encoding="utf-8",
+        )
+        config = AgentConfig(workspace=tmp_path)
+
+        class StubAgent:
+            def restore_history(self, messages) -> None:
+                raise AssertionError("empty traces must not be restored")
+
+        _command(console, StubAgent(), config, "/resume")  # type: ignore[arg-type]
+        out = buffer.getvalue()
+        assert "found 1 trace file" in out
+        assert "non-empty user turn" in out
+
+    def test_resume_uses_a_relative_configured_trace_directory(self, tmp_path: Path) -> None:
+        config = AgentConfig(workspace=tmp_path, trace_dir=Path("saved-traces"))
+        assert config.trace_dir == (tmp_path / "saved-traces").resolve()
 
     def test_list_tools_prints_every_tool(self, capsys) -> None:
         assert main(["--list-tools"]) == 0

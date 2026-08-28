@@ -112,7 +112,10 @@ cagent --list-tools                                  # tools and their arguments
 ```
 
 To continue a previous conversation, start an interactive session with `cagent`,
-then enter `/resume TRACE`. Use `/help resume` inside the session for details.
+then enter `/resume`. The agent lists saved conversations from the current
+workspace and lets you choose one by number. A short session ID or full JSONL
+path can also be passed directly. Use `/help resume` inside the session for
+details.
 The trace is read-only; the current configuration, credentials, workspace,
 approvals, and sandbox remain active. A trace cannot restore an old Docker
 container or unsynchronised sandbox files, and clipped tool output means
@@ -144,8 +147,21 @@ command name to see its details, for example `/help sandbox` or `/help resume`.
 Conversation recovery is available only inside the session:
 
 ```text
-/resume .cagent/traces/<id>.jsonl
+/resume                         # list and choose a saved conversation
+/resume <number>                # choose an item from that list
+/resume <session-id>            # find it in the workspace trace directory
+/resume path/to/session.jsonl   # use an explicit path
 ```
+
+By default traces live in `<workspace>/.cagent/traces`; `/trace` prints the
+resolved directory. The picker shows the most recent sessions first, including
+their timestamp, short ID, step count, status, and first request.
+Only sessions with at least one non-empty user request are saved and listed;
+commands such as `/help`, `/trace`, and `/exit` alone do not create a saved
+conversation. Restoring a conversation alone also does not create a new trace;
+the restored checkpoint is recorded only when you submit a new non-empty
+request. A partially interrupted session is listed only when its trace still
+contains provider-valid conversation history.
 
 This replaces the current conversation history with the messages recorded in
 the trace and keeps using the current workspace and configuration. It does not
@@ -445,7 +461,7 @@ a human should see; the same run drives a terminal renderer, a JSONL trace, and 
 test that asserts on a list, concurrently.
 
 The trace is one JSON object per event, flushed per line, because the runs worth
-examining are the ones that crashed. `/resume TRACE` reconstructs the recorded
+examining are the ones that crashed. `/resume` reconstructs the recorded
 user, assistant, and tool-result messages in the current interactive Agent;
 credentials, approvals, usage counters, and Docker state are deliberately not
 stored in the trace.

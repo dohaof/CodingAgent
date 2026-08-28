@@ -24,6 +24,7 @@ from cagent.agent.events import (
     StepStarted,
     ToolFinished,
     ToolStarted,
+    UserMessage,
     Warning,
 )
 from cagent.agent.guards import LoopGuard, call_signature
@@ -679,6 +680,7 @@ class TestTrace:
         config.trace_dir = config.workspace / "traces"
         writer = TraceWriter.create(config, session_id="abc")
         assert writer is not None
+        writer.handle(UserMessage("a real task"))
         call = ToolCallPart(id="c", name="read_file", arguments={"path": "a.py"})
         writer.handle(StepStarted(step=1, prompt_tokens_estimate=500))
         writer.handle(ToolStarted(call=call, risk=RiskLevel.SAFE))
@@ -696,6 +698,7 @@ class TestTrace:
         by_kind = {record["type"]: record for record in records}
         assert list(by_kind) == [
             "session",
+            "user",
             "step_started",
             "tool_started",
             "tool_finished",
@@ -712,6 +715,7 @@ class TestTrace:
         config.api_key = "sk-super-secret"
         writer = TraceWriter.create(config, session_id="abc")
         assert writer is not None
+        writer.handle(UserMessage("a real task"))
         writer.handle(RunFinished(reason="x", steps=0, usage=Usage(), elapsed_s=0.0))
         writer.close()
         assert "sk-super-secret" not in writer.path.read_text(encoding="utf-8")
@@ -720,6 +724,7 @@ class TestTrace:
         config.trace_dir = config.workspace / "traces"
         writer = TraceWriter.create(config, session_id="abc")
         assert writer is not None
+        writer.handle(UserMessage("a real task"))
         writer.handle(
             ToolFinished(
                 call=ToolCallPart(id="c", name="run_bash", arguments={}),
@@ -748,6 +753,23 @@ class TestTrace:
         config.trace_dir = None
         assert TraceWriter.create(config, session_id="abc") is None
 
+    def test_empty_trace_can_be_discarded(self, config: AgentConfig) -> None:
+        config.trace_dir = config.workspace / "traces"
+        writer = TraceWriter.create(config, session_id="empty")
+        assert writer is not None and not writer.path.exists()
+        writer.discard_if_empty()
+        assert not writer.path.exists()
+
+    def test_trace_with_a_user_turn_is_kept_when_discarding_empty_sessions(
+        self, config: AgentConfig
+    ) -> None:
+        config.trace_dir = config.workspace / "traces"
+        writer = TraceWriter.create(config, session_id="used")
+        assert writer is not None
+        writer.handle(UserMessage("a real task"))
+        writer.discard_if_empty()
+        assert writer.path.exists()
+
     def test_an_unwritable_location_degrades_instead_of_raising(
         self, config: AgentConfig
     ) -> None:
@@ -756,7 +778,9 @@ class TestTrace:
         blocker.write_text("i am a file, not a directory", encoding="utf-8")
         config.trace_dir = blocker / "traces"
         writer = TraceWriter.create(config, session_id="abc")
-        assert writer is not None and writer.error is not None
+        assert writer is not None
+        writer.handle(UserMessage("a real task"))
+        assert writer.error is not None
         writer.handle(RunFinished(reason="x", steps=0, usage=Usage(), elapsed_s=0.0))
 
     def test_a_truncated_final_line_is_tolerated(self, config: AgentConfig) -> None:
@@ -777,11 +801,24 @@ class TestTrace:
         writer = TraceWriter.create(config, session_id="checkpoint")
         assert writer is not None
         writer.record_history([Message.user("old"), Message.assistant(TextPart("answer"))])
+        assert not writer.path.exists()
+        writer.handle(UserMessage("continue"))
         writer.close()
 
         history = history_from_trace(read_trace(writer.path))
 
-        assert [message.text for message in history] == ["old", "answer"]
+        assert [message.text for message in history] == ["old", "answer", "continue"]
+
+    def test_restored_history_alone_is_discarded_as_an_empty_new_session(
+        self, config: AgentConfig
+    ) -> None:
+        config.trace_dir = config.workspace / "traces"
+        writer = TraceWriter.create(config, session_id="resumed-only")
+        assert writer is not None
+        writer.record_history([Message.user("old")])
+        assert not writer.has_user_message
+        writer.discard_if_empty()
+        assert not writer.path.exists()
 
 
 class TestEventSinks:

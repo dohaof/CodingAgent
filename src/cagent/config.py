@@ -158,7 +158,10 @@ class AgentConfig:
         # compare them without re-resolving.
         self.workspace = Path(self.workspace).expanduser().resolve()
         if self.trace_dir is not None:
-            self.trace_dir = Path(self.trace_dir).expanduser().resolve()
+            trace_dir = Path(self.trace_dir).expanduser()
+            if not trace_dir.is_absolute():
+                trace_dir = self.workspace / trace_dir
+            self.trace_dir = trace_dir.resolve()
 
     def __repr__(self) -> str:
         shown = ", ".join(

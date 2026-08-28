@@ -13,8 +13,10 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import datetime as dt
 import signal
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from types import FrameType
 from typing import NoReturn
@@ -38,22 +40,29 @@ __all__ = ["main"]
 
 _BANNER_HELP = """\
 Commands: /help <instruct>  /tools  /cost  /context  /approve <mode>
-          /sandbox  /resume TRACE  /clear  /trace  /exit
+          /sandbox  /resume [ID|PATH]  /clear  /trace  /exit
 Use /help <instruct> for details about one command.
 Ctrl-C interrupts the current task; Ctrl-C again at the prompt exits."""
 
 _RESUME_HELP = """\
 Conversation recovery
 
-  /resume TRACE       restore the conversation recorded in TRACE
+  /resume             list saved conversations and choose one
+  /resume ID          restore a saved conversation by its short ID
+  /resume PATH        restore a conversation from an explicit JSONL path
 
-The current Agent, configuration, API key, workspace, approvals, and sandbox
+With no argument, traces are read from the configured trace directory (by
+default <workspace>/.cagent/traces) and shown with their time, first request,
+step count, and last known status. The current Agent, configuration, API key,
+workspace, approvals, and sandbox
 remain active. The trace is read-only. It restores recorded user, assistant,
 thinking, tool-call, and tool-result messages, then the next normal prompt
 continues from that history. It does not restore an old Docker container,
 unsynchronised sandbox files, token usage, or clipped tool output. A trace from
 another project is accepted as conversation context, but the current workspace
-is used for tools and a warning is shown."""
+is used for tools and a warning is shown. Only traces with at least one
+non-empty user request and provider-valid history appear in the picker; startup
+metadata or interrupted traces with no restorable user turn are hidden."""
 
 _SANDBOX_HELP = """\
 Docker sandbox - one disposable container per Agent conversation
@@ -311,12 +320,17 @@ def _run_session(
             result = agent.run_turn(task)
             exit_code = 0 if result.completed else 1
     finally:
+        trace_path = (
+            str(trace.path)
+            if trace is not None and trace.has_user_message and not trace.error
+            else None
+        )
         agent.finish(
             "finished" if exit_code == 0 else "incomplete",
-            trace_path=str(trace.path) if trace and not trace.error else None,
+            trace_path=trace_path,
         )
         if trace is not None:
-            trace.close()
+            trace.discard_if_empty()
         agent.close()
         if sink.failures:
             console.print(f"[dim]display/trace sinks dropped: {'; '.join(sink.failures)}[/dim]")
@@ -490,13 +504,33 @@ def _resume_command(
     config: AgentConfig,
     arguments: list[str],
 ) -> None:
-    """Restore a trace into the current interactive Agent."""
-    path_text = " ".join(arguments).strip().strip('"')
-    if not path_text:
-        console.print("[dim]usage: /resume TRACE[/dim]")
-        return
+    """Restore a trace into the current interactive Agent.
 
-    path = Path(path_text).expanduser().resolve()
+    The normal path is a numbered picker. A short session ID or an explicit
+    path remains available for scripts and for users who already know which
+    conversation they need.
+    """
+    path_text = " ".join(arguments).strip().strip('"')
+    trace_dir = _resume_trace_dir(config)
+    choices = _find_trace_choices(trace_dir)
+
+    if not path_text:
+        path = _pick_trace(console, choices, trace_dir)
+        if path is None:
+            return
+    else:
+        path = _resolve_trace_reference(path_text, trace_dir)
+        if path is None and path_text.isdecimal() and choices:
+            index = int(path_text) - 1
+            if 0 <= index < len(choices):
+                path = choices[index].path
+        if path is None:
+            console.print(
+                f"[red]resume:[/red] no trace named {path_text!r} in {trace_dir}\n"
+                "[dim]Use /resume to list saved conversations, or provide a full path.[/dim]"
+            )
+            return
+
     try:
         records = read_trace(path)
     except OSError as exc:
@@ -504,6 +538,12 @@ def _resume_command(
         return
     if not records:
         console.print(f"[yellow]resume: {path} contains no events.[/yellow]")
+        return
+
+    if _first_user_prompt(records) is None:
+        console.print(
+            f"[yellow]resume: {path} has no non-empty user request and cannot be restored.[/yellow]"
+        )
         return
 
     history = history_from_trace(records)
@@ -530,6 +570,167 @@ def _resume_command(
             sink.record_history(history)
             break
     console.print(f"[dim]resumed {len(history)} message(s) from {path}[/dim]")
+
+
+@dataclass(frozen=True, slots=True)
+class _TraceChoice:
+    """A restorable trace and the small amount of metadata shown in the picker."""
+
+    path: Path
+    session_id: str
+    modified: float
+    prompt: str
+    steps: int
+    status: str
+
+
+def _resume_trace_dir(config: AgentConfig) -> Path:
+    """Return the directory used by the current session's trace writer."""
+    return (config.trace_dir or config.workspace / ".cagent" / "traces").expanduser().resolve()
+
+
+def _find_trace_choices(trace_dir: Path) -> list[_TraceChoice]:
+    """Scan the trace directory for conversations that contain usable history."""
+    if not trace_dir.is_dir():
+        return []
+
+    choices: list[_TraceChoice] = []
+    for path in trace_dir.glob("*.jsonl"):
+        try:
+            records = read_trace(path)
+            modified = path.stat().st_mtime
+        except OSError:
+            continue
+        if not records or not _first_user_prompt(records) or not history_from_trace(records):
+            continue
+
+        session = next(
+            (record for record in records if record.get("type") == "session"), {}
+        )
+        prompt = _first_user_prompt(records) or "(no user prompt)"
+        finished = next(
+            (
+                record
+                for record in reversed(records)
+                if record.get("type") == "run_finished"
+            ),
+            {},
+        )
+        step_records = [record for record in records if record.get("type") == "step_finished"]
+        raw_steps = finished.get("steps", len(step_records))
+        steps = int(raw_steps) if isinstance(raw_steps, int | float) else len(step_records)
+        raw_status = finished.get("reason")
+        status = str(raw_status) if isinstance(raw_status, str) else "in progress"
+        raw_session = session.get("session_id")
+        session_id = (
+            raw_session
+            if isinstance(raw_session, str) and raw_session
+            else path.stem
+        )
+        choices.append(
+            _TraceChoice(
+                path=path,
+                session_id=session_id,
+                modified=modified,
+                prompt=prompt,
+                steps=steps,
+                status=status,
+            )
+        )
+
+    return sorted(choices, key=lambda choice: choice.modified, reverse=True)
+
+
+def _first_user_prompt(records: list[dict[str, object]]) -> str | None:
+    """Return the first non-empty user turn, if the trace has one."""
+    for record in records:
+        if record.get("type") != "user":
+            continue
+        text = record.get("text")
+        if isinstance(text, str) and text.strip():
+            return text
+    return None
+
+
+def _resolve_trace_reference(reference: str, trace_dir: Path) -> Path | None:
+    """Resolve a full path, filename, or short session ID to a trace file."""
+    candidate = Path(reference).expanduser()
+    if candidate.is_file():
+        return candidate.resolve()
+
+    name = candidate.name
+    names = [name]
+    if not name.lower().endswith(".jsonl"):
+        names.append(f"{name}.jsonl")
+    for item in names:
+        exact = trace_dir / item
+        if exact.is_file():
+            return exact.resolve()
+
+    # Accept a unique prefix, which is useful when IDs are long UUIDs.
+    matches = [path for path in trace_dir.glob("*.jsonl") if path.stem.startswith(name)]
+    return matches[0].resolve() if len(matches) == 1 else None
+
+
+def _pick_trace(
+    console: Console,
+    choices: list[_TraceChoice],
+    trace_dir: Path,
+) -> Path | None:
+    """Render the trace picker and ask for a one-based choice."""
+    if not choices:
+        trace_count = len(list(trace_dir.glob("*.jsonl"))) if trace_dir.is_dir() else 0
+        if trace_count:
+            console.print(
+                f"[yellow]resume: found {trace_count} trace file(s) in {trace_dir}, "
+                "but none contain a non-empty user turn that can be restored.[/yellow]"
+            )
+            return None
+        console.print(
+            f"[yellow]resume: no saved conversations in {trace_dir}.[/yellow]\n"
+            "[dim]Run an interactive task first; traces are created automatically.[/dim]"
+        )
+        return None
+
+    trace_count = len(list(trace_dir.glob("*.jsonl"))) if trace_dir.is_dir() else len(choices)
+    if trace_count > len(choices):
+        console.print(
+            f"[dim]Showing {len(choices)} restorable conversation(s) out of "
+            f"{trace_count} trace file(s); empty or incomplete traces are hidden.[/dim]"
+        )
+    table = Table(title=f"Saved conversations · {trace_dir}", header_style="cyan")
+    table.add_column("#", justify="right", style="dim", width=3)
+    table.add_column("started", width=17)
+    table.add_column("id", width=14)
+    table.add_column("steps", justify="right", width=6)
+    table.add_column("status", width=12)
+    table.add_column("task / request")
+    for index, choice in enumerate(choices, start=1):
+        started = dt.datetime.fromtimestamp(choice.modified).astimezone().strftime("%Y-%m-%d %H:%M")
+        prompt = " ".join(choice.prompt.split())
+        if len(prompt) > 58:
+            prompt = prompt[:55] + "..."
+        table.add_row(
+            str(index),
+            started,
+            choice.session_id[:14],
+            str(choice.steps),
+            choice.status,
+            prompt,
+        )
+    console.print(table)
+    try:
+        answer = input("Resume number (Enter to cancel): ").strip()
+    except (EOFError, KeyboardInterrupt, OSError):
+        console.print("[dim]resume cancelled[/dim]")
+        return None
+    if not answer:
+        console.print("[dim]resume cancelled[/dim]")
+        return None
+    if not answer.isdecimal() or not 1 <= int(answer) <= len(choices):
+        console.print(f"[yellow]resume: choose a number from 1 to {len(choices)}.[/yellow]")
+        return None
+    return choices[int(answer) - 1].path
 
 
 def _sandbox_command(console: Console, agent: Agent, arguments: list[str]) -> None:

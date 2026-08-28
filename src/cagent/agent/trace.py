@@ -120,23 +120,28 @@ class TraceWriter:
     started: float = field(default_factory=time.time)
     events_written: int = 0
     error: str | None = None
+    has_user_message: bool = False
+    config: AgentConfig | None = field(default=None, repr=False)
+    _pending: list[AgentEvent] = field(default_factory=list, repr=False)
+    _pending_history: list[Message] | None = field(default=None, repr=False)
     _handle: Any = None
 
     @classmethod
     def create(cls, config: AgentConfig, *, session_id: str) -> TraceWriter | None:
-        """Open a trace under the configured directory, or return ``None``.
+        """Prepare a lazy trace under the configured directory, or return ``None``.
 
-        Returns ``None`` when tracing is switched off, which lets the caller
-        treat "no trace configured" and "trace unavailable" the same way.
+        The file and parent directory are created only after the first real
+        user turn. Returns ``None`` when tracing is switched off.
         """
         if config.trace_dir is None:
             return None
         path = config.trace_dir / f"{session_id}.jsonl"
-        writer = cls(path=path)
-        writer._open(config)
-        return writer
+        return cls(path=path, config=config)
 
     def _open(self, config: AgentConfig) -> None:
+        if config is None:
+            self.error = "trace writer has no configuration"
+            return
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             self._handle = self.path.open("a", encoding="utf-8")
@@ -160,12 +165,35 @@ class TraceWriter:
 
     def handle(self, event: AgentEvent) -> None:
         """Record one event. Never raises."""
+        if isinstance(event, RunStarted):
+            # Keep the startup metadata in memory until a real turn starts.
+            self._pending.append(event)
+            return
+        if not self.has_user_message and not isinstance(event, UserMessage):
+            return
+        if isinstance(event, UserMessage):
+            if not event.text.strip():
+                return
+            self.has_user_message = True
+        self._ensure_open()
         record = self._encode(event)
         if record is not None:
             self._write(record)
 
     def record_history(self, messages: Sequence[Message]) -> None:
-        """Write a self-contained history checkpoint for a resumed session."""
+        """Queue a history checkpoint for the next real turn in a resumed session."""
+        if not any(message.role == "user" and message.text.strip() for message in messages):
+            return
+        self._pending_history = list(messages)
+        if self._handle is None:
+            return
+        self._flush_pending_history()
+
+    def _flush_pending_history(self) -> None:
+        """Write a queued resume checkpoint once the trace is open."""
+        messages, self._pending_history = self._pending_history, None
+        if messages is None:
+            return
         self._write(
             {
                 "type": "history_checkpoint",
@@ -184,6 +212,34 @@ class TraceWriter:
         except (OSError, TypeError, ValueError) as exc:
             self.error = f"trace write failed: {exc}"
             self.close()
+
+    def _ensure_open(self) -> None:
+        """Open the file on the first event that represents real work."""
+        if self._handle is not None or self.error is not None:
+            return
+        assert self.config is not None
+        self._open(self.config)
+        if self._handle is None:
+            return
+        pending, self._pending = self._pending, []
+        for event in pending:
+            record = self._encode(event)
+            if record is not None:
+                self._write(record)
+        self._flush_pending_history()
+
+    def discard_if_empty(self) -> None:
+        """Remove the trace if no non-empty user turn was ever recorded.
+
+        Empty sessions are startup metadata, not useful conversation history,
+        and should not remain in the workspace.
+        """
+        path = self.path
+        self.close()
+        if self.has_user_message:
+            return
+        with contextlib.suppress(OSError):
+            path.unlink()
 
     @staticmethod
     def _encode(event: AgentEvent) -> dict[str, Any] | None:
