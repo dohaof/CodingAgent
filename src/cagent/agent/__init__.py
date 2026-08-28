@@ -12,7 +12,8 @@ from .engine import Agent, TurnResult
 from .events import AgentEvent, CollectingSink, EventSink, FanOutSink
 from .guards import LoopGuard
 from .prompt import PromptBuilder
-from .trace import TraceWriter, read_trace
+from .sandbox import SandboxError, SandboxSession
+from .trace import TraceWriter, history_from_trace, read_trace
 
 __all__ = [
     "Agent",
@@ -25,7 +26,10 @@ __all__ = [
     "FanOutSink",
     "LoopGuard",
     "PromptBuilder",
+    "SandboxError",
+    "SandboxSession",
     "TraceWriter",
     "TurnResult",
+    "history_from_trace",
     "read_trace",
 ]

@@ -110,8 +110,14 @@ when you need it.
 cagent "add a --json flag to the report command"     # one task
 cagent                                               # interactive session
 cagent --list-tools                                  # tools and their arguments
-cagent --replay .cagent/traces/<id>.jsonl            # re-narrate a past run
 ```
+
+To continue a previous conversation, start an interactive session with `cagent`,
+then enter `/resume TRACE`. Use `/help resume` inside the session for details.
+The trace is read-only; the current configuration, credentials, workspace,
+approvals, and sandbox remain active. A trace cannot restore an old Docker
+container or unsynchronised sandbox files, and clipped tool output means
+recovery is best-effort rather than a filesystem snapshot.
 
 The command is installed by the Python package; it is not tied to this
 repository. On Windows, activate the virtual environment once per terminal and
@@ -132,6 +138,61 @@ the target explicitly:
 cagent --workspace D:\Projects\MyProject "inspect and fix the tests"
 ```
 
+#### Interactive commands
+
+Inside the interactive session, `/help` shows a compact command list. Add a
+command name to see its details, for example `/help sandbox` or `/help resume`.
+Conversation recovery is available only inside the session:
+
+```text
+/resume .cagent/traces/<id>.jsonl
+```
+
+This replaces the current conversation history with the messages recorded in
+the trace and keeps using the current workspace and configuration. It does not
+restore the old container, unsynchronised sandbox files, or approval state.
+
+#### 交互式沙箱
+
+不需要重启程序即可在交互窗口中开启、提交或撤销沙箱修改。输入
+`/help sandbox` 可以在程序内查看沙箱操作说明，`/help resume` 可以查看对话恢复说明。
+
+| 命令 | 作用 |
+| --- | --- |
+| `/sandbox` | 查看当前状态、镜像和同步策略 |
+| `/sandbox on [IMAGE]` | 创建项目快照并开启 Docker 隔离；不写 IMAGE 时使用当前配置 |
+| `/sandbox image IMAGE` | 设置本地镜像；沙箱开启时会重启容器，但保留当前快照 |
+| `/sandbox sync never\|ask\|always` | 设置关闭沙箱或退出程序时的处理方式 |
+| `/sandbox apply` | 立即把当前修改同步到真实项目，沙箱继续运行，并建立新基线 |
+| `/sandbox rollback` | 丢弃尚未同步的修改，重新载入真实项目，沙箱继续运行 |
+| `/sandbox off` | 按当前同步策略处理修改，然后回到真实项目模式 |
+
+推荐的交互流程：
+
+```text
+/sandbox image my-project-agent:latest
+/sandbox sync ask
+/sandbox on
+... 让 Agent 修改代码并运行测试 ...
+/sandbox apply       # 阶段性提交，继续在沙箱中工作
+... 继续修改 ...
+/sandbox rollback    # 放弃最近一轮尚未提交的修改
+/sandbox off         # 完成后回到真实项目
+```
+
+同步策略的含义：
+
+- `never`：关闭或退出时丢弃所有未提交的沙箱修改。
+- `ask`：关闭或退出时展示受限 diff，确认后才同步。
+- `always`：关闭或退出时自动同步；若真实项目被其他程序改动，会拒绝同步并提示冲突。
+- `/sandbox apply` 是显式同步命令，不再弹出第二次确认；`/sandbox rollback` 不会撤销已经 apply 的修改。
+
+沙箱生命周期属于“一个 Agent 对话会话”：同一个交互窗口中的多个任务共享
+一个快照和一个容器，容器在第一次 `run_bash` 时才启动，退出窗口后删除。相同
+工作目录同时打开两个 Agent，会分别拥有自己的快照和容器，未同步的修改互不
+可见。沙箱开启期间，文件工具操作临时快照，Shell 在 Linux 容器中运行；真实
+项目只有在同步时才会被修改，默认的工作目录边界和命令审批仍然有效。
+
 With `--workspace`, that directory is both the file/command sandbox and the
 location where the project `.cagent.toml` is read. The user-level
 `%USERPROFILE%\.cagent.toml` remains available for shared endpoint settings.
@@ -139,6 +200,44 @@ location where the project `.cagent.toml` is read. The user-level
 **Supervision.** `--approval suggest` confirms every change; `auto-edit` (the
 default) lets file edits through and confirms shell commands; `full-auto`
 confirms only destructive commands. Nothing auto-approves a destructive command.
+
+**Sandboxing.** Shell commands normally run in the project directory. For an
+isolated run, use `--sandbox docker --sandbox-sync ask` (or set the same fields
+in `.cagent.toml`). The agent copies the project to a temporary snapshot and
+mounts only that snapshot into a constrained, network-disabled Docker
+container. The real project is never mounted into the container. One Agent
+session owns one container: the first `run_bash` starts it and later commands
+use `docker exec`, so tools and packages installed during that session remain
+available in writable locations. The root filesystem is read-only, so stable
+project dependencies should be baked into the image rather than installed by
+the Agent. The container is removed when the Agent closes; opening a new Agent
+creates a new container and a fresh snapshot. Docker reuses local image layers,
+so it does not reinstall image dependencies on every session.
+
+The image must already exist locally because pulls are disabled. For a project
+with non-Python or heavier dependencies, create a project-specific image once:
+
+```dockerfile
+# Dockerfile.agent
+FROM node:22-bookworm
+RUN npm install -g pnpm
+```
+
+```powershell
+docker build -f Dockerfile.agent -t my-project-agent:latest .
+cagent --workspace . --sandbox docker --sandbox-image my-project-agent:latest "run the tests"
+```
+
+Keep credentials out of the Docker build context. At minimum, add
+`.cagent.toml`, `.cagent.toml.*`, `.git`, and `.cagent/` to `.dockerignore`;
+the example Dockerfile above does not need to copy the project into the image.
+
+The image build is an explicit user action because a Dockerfile can execute
+arbitrary installation scripts. At session end, `never` discards the snapshot,
+`ask` shows a bounded diff and requires a separate approval, and `always` copies
+it back after a concurrent-change check. Docker Desktop/Engine must be running;
+if it is unavailable, the sandbox command fails closed rather than falling back
+to the host.
 
 **Cost.** Token counts are always reported. Dollar figures require rates you
 supply, because a built-in price table goes stale and a stale price prints a
@@ -154,7 +253,7 @@ cached_input_per_m = 0.07   # optional
 ### Checking it
 
 ```bash
-pytest                       # 498 tests
+pytest                       # 533 tests
 ruff check src tests eval
 mypy src/cagent eval
 python -m eval.run           # the benchmark; needs a real endpoint
@@ -170,7 +269,7 @@ the design decisions live.
 ```
 ┌──────────────────────────────────────────────────────────────────┐
 │  cli/          argument parsing · streaming render · approval    │
-│                prompt · replay · cost                            │
+│                prompt · cost                                     │
 │                the only layer that prints                        │
 └────────────────────────────┬─────────────────────────────────────┘
                              │ typed events
@@ -346,9 +445,10 @@ a human should see; the same run drives a terminal renderer, a JSONL trace, and 
 test that asserts on a list, concurrently.
 
 The trace is one JSON object per event, flushed per line, because the runs worth
-examining are the ones that crashed. `--replay` re-narrates it — the interesting
-question about a finished session is "what did it actually do", and a second run
-would behave differently anyway.
+examining are the ones that crashed. `/resume TRACE` reconstructs the recorded
+user, assistant, and tool-result messages in the current interactive Agent;
+credentials, approvals, usage counters, and Docker state are deliberately not
+stored in the trace.
 
 The session summary reports tokens, cached tokens, and estimated cost; for a model
 with no published rate it reports the token counts and no dollar figure rather
@@ -428,9 +528,11 @@ responses. Once tokens have arrived, a transport error surfaces to the engine �
 replaying half a completion would corrupt the transcript.
 
 **Command classification is a heuristic.** It decides what is worth interrupting
-the user for, not what is permitted; the approval mode is the real gate. It is not
-a sandbox: a determined command still runs with the user's privileges. Container
-isolation would be the next step.
+the user for, not what is permitted; the approval mode is the real gate. The
+optional Docker mode adds a separate execution boundary, but it is still not a
+kernel-grade security guarantee: Docker itself must be trusted and kept patched,
+and the host project is protected by never mounting it read/write into the
+container and by requiring a reviewed copy-back.
 
 **The repo map is signatures only, and can go stale.** It is an index that tells
 the model a symbol exists so it can search for it — never a substitute for reading

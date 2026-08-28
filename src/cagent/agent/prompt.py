@@ -88,6 +88,7 @@ class PromptBuilder:
     """
 
     config: AgentConfig
+    workspace: Path | None = None
     _cached_map: RepoMap | None = None
     _map_built: bool = False
 
@@ -134,13 +135,33 @@ class PromptBuilder:
         the platform it writes a POSIX command on Windows, and without the
         workspace path it cannot tell an absolute path from an escape attempt.
         """
-        workspace = self.config.workspace
-        lines = [
-            "Environment:",
-            f"- Working directory: {workspace}",
-            f"- Platform: {sys.platform} ({platform.system()} {platform.release()})",
-            f"- Python: {platform.python_version()}",
-        ]
+        workspace = self.workspace or self.config.workspace
+        sandboxed = self.workspace is not None and self.workspace != self.config.workspace
+        lines = ["Environment:", f"- Working directory: {workspace}"]
+        if sandboxed:
+            lines.extend(
+                [
+                    f"- Host platform: {sys.platform} ({platform.system()} {platform.release()})",
+                    f"- Host Python: {platform.python_version()}",
+                ]
+            )
+            lines.append(
+                "- This is a disposable sandbox snapshot; changes are reviewed and "
+                "synced to the real project only when the user allows it."
+            )
+            lines.append(
+                "- Shell commands run inside a Linux Docker container, regardless of "
+                "the host OS. Use /bin/sh syntax and python3/python, never Windows "
+                "py -3. If a command or dependency is missing, report it instead of "
+                "bypassing the sandbox on the host."
+            )
+        else:
+            lines.extend(
+                [
+                    f"- Platform: {sys.platform} ({platform.system()} {platform.release()})",
+                    f"- Python: {platform.python_version()}",
+                ]
+            )
         if not self.config.allow_outside_workspace:
             lines.append(
                 "- Paths outside the working directory are refused. Stay inside it."
@@ -185,7 +206,7 @@ class PromptBuilder:
             return None
         if refresh or not self._map_built:
             self._cached_map = build_repo_map(
-                self.config.workspace,
+                self.workspace or self.config.workspace,
                 token_budget=self.config.repo_map_token_budget,
                 model=self.config.model_for_tokens,
             )

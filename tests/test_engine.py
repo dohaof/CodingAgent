@@ -15,6 +15,7 @@ from pathlib import Path
 
 import pytest
 
+from cagent.agent import sandbox as sandbox_module
 from cagent.agent.approval import ApprovalPolicy, Decision
 from cagent.agent.engine import Agent
 from cagent.agent.events import (
@@ -43,7 +44,7 @@ from cagent.llm.base import (
 from cagent.llm.base import TextDelta as WireTextDelta
 from cagent.tools.base import ApprovalRequest, ToolOutcome
 from cagent.tools.registry import ToolRegistry, default_registry, tool
-from cagent.types import RiskLevel, Usage
+from cagent.types import Message, RiskLevel, TextPart, Usage
 from tests.conftest import ScriptedProvider, text_turn, tool_turn
 
 
@@ -95,6 +96,23 @@ def auto(project: Path, **kwargs: object) -> AgentConfig:
 
 
 class TestTheCycle:
+    def test_restored_history_is_sent_before_the_next_turn(self, project: Path) -> None:
+        agent, _, provider = make_agent(auto(project), [text_turn("continued")])
+        agent.restore_history(
+            [Message.user("old task"), Message.assistant(TextPart("old answer"))]
+        )
+
+        result = agent.run_turn("continue the work")
+
+        assert result.completed
+        assert [message.role for message in provider.requests[0]] == [
+            "user",
+            "assistant",
+            "user",
+        ]
+        assert provider.requests[0][0].text == "old task"
+        assert provider.requests[0][1].text == "old answer"
+
     def test_a_prose_answer_ends_the_turn_in_one_step(self, project: Path) -> None:
         agent, sink, provider = make_agent(auto(project), [text_turn("Nothing to do.")])
         result = agent.run_turn("say hello")
@@ -247,6 +265,89 @@ class TestTheCycle:
 
 
 class TestFailureHandling:
+    def test_sandbox_changes_can_be_applied_or_discarded_mid_session(
+        self, project: Path, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(sandbox_module, "docker_available", lambda: True)
+        config = auto(project, sandbox_sync="ask")
+        agent, _, _ = make_agent(config, [text_turn("done")])
+        try:
+            agent.enable_sandbox()
+            assert agent.sandbox is not None
+            (agent.sandbox.workspace / "applied.txt").write_text("keep\n", encoding="utf-8")
+            assert agent.apply_sandbox_changes() == ("applied.txt",)
+            assert (project / "applied.txt").read_text(encoding="utf-8") == "keep\n"
+
+            (agent.sandbox.workspace / "discarded.txt").write_text("drop\n", encoding="utf-8")
+            agent.discard_sandbox_changes()
+            assert not (project / "discarded.txt").exists()
+            assert agent.sandbox is not None
+        finally:
+            agent.close()
+
+    def test_sandbox_can_be_toggled_between_turns(self, project: Path, monkeypatch) -> None:
+        monkeypatch.setattr(sandbox_module, "docker_available", lambda: True)
+        config = auto(project, sandbox_sync="always")
+        agent, _, _ = make_agent(config, [text_turn("done")])
+        try:
+            assert agent.sandbox_status() == "off"
+            agent.enable_sandbox(image="ubuntu:22.04")
+            assert agent.sandbox is not None
+            assert "docker" in agent.sandbox_status()
+            (agent.sandbox.workspace / "from-sandbox.txt").write_text("ok\n", encoding="utf-8")
+
+            agent.disable_sandbox()
+            assert agent.sandbox is None
+            assert agent.sandbox_status() == "off"
+            assert (project / "from-sandbox.txt").read_text(encoding="utf-8") == "ok\n"
+        finally:
+            agent.close()
+
+    def test_sandbox_edits_are_synced_only_after_final_approval(
+        self, project: Path, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(sandbox_module, "docker_available", lambda: True)
+        config = AgentConfig(
+            workspace=project,
+            api_key="k",
+            base_url="https://api.test.invalid/v1",
+            model="test-model",
+            approval_mode="auto-edit",
+            sandbox_mode="docker",
+            sandbox_sync="ask",
+        )
+        asked: list[ApprovalRequest] = []
+        policy = ApprovalPolicy(
+            config, prompter=lambda request: (asked.append(request), Decision(True))[1]
+        )
+        agent, sink, _ = make_agent(
+            config,
+            [
+                tool_turn(
+                    "edit_file",
+                    {
+                        "path": "calc.py",
+                        "old_string": "return a - b",
+                        "new_string": "return a + b",
+                    },
+                )
+                + [StreamFinished("tool_calls")],
+                text_turn("done"),
+            ],
+            policy=policy,
+        )
+
+        agent.run_turn("fix it in the sandbox")
+        assert "return a - b" in (project / "calc.py").read_text(encoding="utf-8")
+
+        agent.finish("finished")
+        assert "return a + b" in (project / "calc.py").read_text(encoding="utf-8")
+        assert [request.tool for request in asked] == ["sandbox_sync"]
+        assert asked[0].always_prompt
+        assert "+    return a + b" in (asked[0].detail or "")
+        assert sink.of_type(RunFinished)
+        agent.close()
+
     def test_auto_edit_executes_edits_but_still_asks_for_shell_writes(
         self, project: Path
     ) -> None:

@@ -1,4 +1,4 @@
-"""The command-line surface: parsing, rendering, pricing, replay.
+"""The command-line surface: parsing, rendering, pricing, and interaction.
 
 Rendering is tested by writing to a captured console rather than a terminal, so
 the assertions are about what information reaches the user — the diff, the exit
@@ -28,9 +28,10 @@ from cagent.agent.events import (
     ToolStarted,
     Warning,
 )
-from cagent.cli.app import _overrides, build_parser, main
+from cagent.cli.app import _command, _overrides, _print_help, build_parser, main
 from cagent.cli.pricing import Price, estimate_cost, parse_prices, price_for
 from cagent.cli.render import ConsoleRenderer, prompt_for_approval
+from cagent.config import AgentConfig
 from cagent.tools.base import ApprovalRequest, ToolOutcome
 from cagent.types import Message, RiskLevel, TextPart, ToolCallPart, Usage
 
@@ -49,6 +50,11 @@ class TestArgumentParsing:
 
     def test_no_task_means_interactive(self) -> None:
         assert build_parser().parse_args([]).task == []
+
+    def test_trace_cli_flags_are_removed(self) -> None:
+        for option in ("--replay", "--resume"):
+            with pytest.raises(SystemExit):
+                build_parser().parse_args([option, "trace.jsonl"])
 
     def test_flags_map_onto_config_fields(self) -> None:
         args = build_parser().parse_args(
@@ -91,6 +97,28 @@ class TestArgumentParsing:
         args = build_parser().parse_args(["--approval", "suggest", "task"])
         assert _overrides(args)["approval_mode"] == "suggest"
 
+    def test_docker_sandbox_flags_map_to_config(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "--sandbox", "docker",
+                "--sandbox-sync", "ask",
+                "--sandbox-image", "local/cagent:latest",
+                "--sandbox-memory-mb", "256",
+                "--sandbox-cpus", "1.5",
+                "--sandbox-pids", "64",
+                "--sandbox-workspace-mb", "128",
+                "task",
+            ]
+        )
+        overrides = _overrides(args)
+        assert overrides["sandbox_mode"] == "docker"
+        assert overrides["sandbox_sync"] == "ask"
+        assert overrides["sandbox_image"] == "local/cagent:latest"
+        assert overrides["sandbox_memory_mb"] == 256
+        assert overrides["sandbox_cpus"] == 1.5
+        assert overrides["sandbox_pids"] == 64
+        assert overrides["sandbox_workspace_mb"] == 128
+
     def test_repo_map_can_be_switched_off(self) -> None:
         args = build_parser().parse_args(["--no-repo-map", "task"])
         assert _overrides(args)["repo_map_enabled"] is False
@@ -128,6 +156,69 @@ def write_config() -> Callable[..., Path]:
 
 
 class TestInformationalCommands:
+    def test_help_overview_is_concise(self, captured) -> None:
+        console, buffer = captured
+        _print_help(console)
+        out = buffer.getvalue()
+        assert "/help <instruct>" in out
+        assert "/sandbox" in out
+        assert "Docker sandbox" not in out
+
+    def test_help_instruction_shows_detail(self, captured) -> None:
+        console, buffer = captured
+        _print_help(console, "sandbox")
+        out = buffer.getvalue()
+        assert "Docker sandbox" in out
+        assert "/sandbox apply" in out
+        assert "/sandbox rollback" in out
+        assert "/sandbox sync never|ask|always" in out
+
+    def test_help_resume_shows_detail(self, captured) -> None:
+        console, buffer = captured
+        _print_help(console, "resume")
+        out = buffer.getvalue()
+        assert "/resume TRACE" in out
+        assert "current Agent" in out
+
+    def test_resume_command_restores_trace_into_current_agent(
+        self, captured, tmp_path: Path
+    ) -> None:
+        console, buffer = captured
+        trace = tmp_path / "session.jsonl"
+        trace.write_text(
+            "\n".join(
+                json.dumps(record)
+                for record in (
+                    {"type": "session", "workspace": str(tmp_path)},
+                    {"type": "user", "text": "old task"},
+                    {
+                        "type": "step_finished",
+                        "message": {
+                            "role": "assistant",
+                            "parts": [{"type": "text", "text": "old answer"}],
+                        },
+                    },
+                )
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        class StubAgent:
+            def __init__(self) -> None:
+                self.restored = []
+
+            def restore_history(self, messages) -> None:
+                self.restored = messages
+
+        agent = StubAgent()
+        config = AgentConfig(workspace=tmp_path)
+
+        _command(console, agent, config, f"/resume {trace}")  # type: ignore[arg-type]
+
+        assert [message.text for message in agent.restored] == ["old task", "old answer"]
+        assert "resumed 2 message(s)" in buffer.getvalue()
+
     def test_list_tools_prints_every_tool(self, capsys) -> None:
         assert main(["--list-tools"]) == 0
         out = capsys.readouterr().out
@@ -525,6 +616,15 @@ class TestRendering:
 
 
 class TestApprovalPrompt:
+    def test_shortcuts_are_visible_in_approval_menu(self, monkeypatch, captured) -> None:
+        console, buffer = captured
+        monkeypatch.setattr("builtins.input", lambda: "n")
+        prompt_for_approval(
+            console, ApprovalRequest(tool="run_bash", risk=RiskLevel.MUTATING, summary="run tests")
+        )
+        out = buffer.getvalue()
+        assert "[y]es" in out and "[n]o" in out and "[a]lways" in out and "[q]uit" in out
+
     def test_yes_approves(self, monkeypatch, captured) -> None:
         console, _ = captured
         monkeypatch.setattr("builtins.input", lambda: "y")
@@ -723,72 +823,3 @@ class TestPricing:
             }
         )
         assert set(table) == {"good"}
-
-
-class TestReplay:
-    def test_a_recorded_run_is_renarrated(self, tmp_path: Path, capsys) -> None:
-        trace = tmp_path / "session.jsonl"
-        trace.write_text(
-            "\n".join(
-                json.dumps(record)
-                for record in (
-                    {
-                        "type": "session",
-                        "provider": "deepseek",
-                        "model": "deepseek-chat",
-                        "workspace": "/proj",
-                        "approval_mode": "auto-edit",
-                    },
-                    {"type": "user", "text": "fix the bug", "t": 0.1},
-                    {"type": "step_started", "step": 1, "prompt_tokens_estimate": 1500, "t": 0.2},
-                    {
-                        "type": "tool_started",
-                        "name": "edit_file",
-                        "arguments": {"path": "app.py"},
-                        "t": 0.5,
-                    },
-                    {
-                        "type": "tool_finished",
-                        "name": "edit_file",
-                        "is_error": False,
-                        "content": "Edited app.py",
-                        "t": 0.6,
-                    },
-                    {
-                        "type": "step_finished",
-                        "step": 1,
-                        "finish_reason": "stop",
-                        "latency_s": 1.2,
-                        "usage": {"prompt": 1500, "completion": 40},
-                        "message": {"parts": [{"type": "text", "text": "Done."}]},
-                        "t": 1.8,
-                    },
-                    {
-                        "type": "run_finished",
-                        "reason": "finished",
-                        "steps": 1,
-                        "elapsed_s": 2.0,
-                        "usage": {"prompt": 1500, "completion": 40},
-                        "t": 2.0,
-                    },
-                )
-            ),
-            encoding="utf-8",
-        )
-
-        assert main(["--replay", str(trace)]) == 0
-        out = capsys.readouterr().out
-        assert "fix the bug" in out
-        assert "edit_file" in out and "app.py" in out
-        assert "Done." in out
-        assert "finished" in out
-
-    def test_a_missing_trace_is_an_error(self, tmp_path: Path, capsys) -> None:
-        assert main(["--replay", str(tmp_path / "absent.jsonl")]) == 2
-        assert "Could not read" in capsys.readouterr().out
-
-    def test_an_empty_trace_is_reported(self, tmp_path: Path, capsys) -> None:
-        empty = tmp_path / "empty.jsonl"
-        empty.write_text("", encoding="utf-8")
-        assert main(["--replay", str(empty)]) == 1
-        assert "no events" in capsys.readouterr().out

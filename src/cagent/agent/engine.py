@@ -68,6 +68,7 @@ from .events import (
 )
 from .guards import LoopGuard
 from .prompt import PromptBuilder
+from .sandbox import SandboxError, SandboxSession
 
 __all__ = ["Agent", "TurnResult"]
 
@@ -127,9 +128,13 @@ class Agent:
     started: float = field(default_factory=time.monotonic)
     _system: str = ""
     _files_changed: bool = False
+    sandbox: SandboxSession | None = field(init=False, default=None)
 
     def __post_init__(self) -> None:
-        self.prompt_builder = PromptBuilder(self.config)
+        self.sandbox = SandboxSession.create(self.config)
+        self.prompt_builder = PromptBuilder(
+            self.config, workspace=self.sandbox.workspace if self.sandbox is not None else None
+        )
         self.guard = LoopGuard(self.config)
         self.context = ContextManager(self.config, summarizer=self._summarise)
         self._refresh_system_prompt()
@@ -179,8 +184,20 @@ class Agent:
             )
         )
 
+    def restore_history(self, messages: Sequence[Message]) -> None:
+        """Replace the empty transcript with a validated resumed history.
+
+        A resumed process is a new Agent: usage, loop limits, approvals, and
+        sandbox state intentionally start fresh. Only the provider conversation
+        is restored from the trace.
+        """
+        self.context.history = list(messages)
+        self.context.compactions = 0
+        self.guard.note_progress()
+
     def finish(self, reason: str, *, trace_path: str | None = None) -> RunFinished:
         """Emit and return the closing event."""
+        self._finalize_sandbox()
         event = RunFinished(
             reason=reason,
             steps=self.guard.steps,
@@ -419,12 +436,15 @@ class Agent:
 
     def _tool_context(self) -> ToolContext:
         """Fresh context per call, so a tool cannot retain host state."""
+        workspace = self.sandbox.workspace if self.sandbox is not None else self.config.workspace
         return ToolContext(
-            workspace=self.config.workspace,
+            workspace=workspace,
             config=self.config,
             approve=lambda request: self.policy.decide(request).approved,
             emit=lambda line: self._emit(Warning(line)),
             abort=self.abort,
+            force_workspace_boundary=self.sandbox is not None,
+            sandbox=self.sandbox,
         )
 
     # ------------------------------------------------------------ housekeeping
@@ -509,6 +529,133 @@ class Agent:
         """Clear a previous interrupt so the session can continue."""
         self.abort.clear()
 
+    def sandbox_status(self) -> str:
+        """Return a concise status line for the interactive CLI."""
+        if self.sandbox is None:
+            return "off"
+        container = self.sandbox.container_name or "not started"
+        return f"docker (container: {container}; sync: {self.config.sandbox_sync})"
+
+    def enable_sandbox(self, *, image: str | None = None) -> None:
+        """Create a disposable snapshot and enable Docker execution."""
+        if self.sandbox is not None:
+            if image is not None:
+                self.set_sandbox_image(image)
+            return
+        previous_mode = self.config.sandbox_mode
+        previous_image = self.config.sandbox_image
+        if image is not None:
+            if not image.strip():
+                raise SandboxError("Sandbox image must not be empty.")
+            self.config.sandbox_image = image.strip()
+        self.config.sandbox_mode = "docker"
+        try:
+            sandbox = SandboxSession.create(self.config)
+        except SandboxError:
+            self.config.sandbox_mode = previous_mode
+            self.config.sandbox_image = previous_image
+            raise
+        assert sandbox is not None
+        self.sandbox = sandbox
+        self.prompt_builder.workspace = sandbox.workspace
+        self.prompt_builder.invalidate_map()
+        self._refresh_system_prompt()
+
+    def set_sandbox_image(self, image: str) -> None:
+        """Select an image, recycling only the container and keeping the snapshot."""
+        image = image.strip()
+        if not image:
+            raise SandboxError("Sandbox image must not be empty.")
+        if image == self.config.sandbox_image:
+            return
+        if self.sandbox is not None:
+            self.sandbox.stop_container()
+        self.config.sandbox_image = image
+
+    def disable_sandbox(self) -> None:
+        """Synchronise/discard the snapshot and return tools to the host tree."""
+        sandbox = self.sandbox
+        if sandbox is None:
+            self.config.sandbox_mode = "off"
+            return
+        try:
+            self._finish_sandbox()
+        finally:
+            sandbox.close()
+            self.sandbox = None
+            self.config.sandbox_mode = "off"
+            self.prompt_builder.workspace = None
+            self.prompt_builder.invalidate_map()
+            self._refresh_system_prompt()
+
+    def apply_sandbox_changes(self) -> tuple[str, ...]:
+        """Immediately sync current sandbox edits while keeping it enabled."""
+        if self.sandbox is None:
+            raise SandboxError("Sandbox is not active.")
+        changed = self.sandbox.changed_paths
+        if not changed:
+            self._emit(Warning("No pending sandbox changes."))
+            return ()
+        applied = self.sandbox.apply()
+        self._emit(Warning(f"Copied {len(applied)} sandbox change(s) back to the project."))
+        self.prompt_builder.invalidate_map()
+        self._refresh_system_prompt()
+        return applied
+
+    def discard_sandbox_changes(self) -> None:
+        """Immediately discard current sandbox edits while keeping it enabled."""
+        if self.sandbox is None:
+            raise SandboxError("Sandbox is not active.")
+        changed = self.sandbox.changed_paths
+        self.sandbox.discard_changes()
+        if changed:
+            self._emit(Warning(f"Discarded {len(changed)} sandbox change(s)."))
+        else:
+            self._emit(Warning("No pending sandbox changes."))
+        self.prompt_builder.invalidate_map()
+        self._refresh_system_prompt()
+
     def close(self) -> None:
-        """Release the provider's connection."""
+        """Synchronise or discard an isolated workspace, then close the provider."""
+        self._finalize_sandbox()
         self.provider.close()
+
+    def _finalize_sandbox(self) -> None:
+        """Finish a sandbox exactly once, without letting cleanup break shutdown."""
+        sandbox = self.sandbox
+        if sandbox is None:
+            return
+        try:
+            self._finish_sandbox()
+        except SandboxError as exc:
+            self._emit(Warning("Sandbox changes were not copied back.", detail=str(exc)))
+        finally:
+            sandbox.close()
+            self.sandbox = None
+
+    def _finish_sandbox(self) -> None:
+        """Handle the explicit boundary from a disposable copy to the project."""
+        assert self.sandbox is not None
+        changed = self.sandbox.changed_paths
+        if not changed:
+            return
+        if self.config.sandbox_sync == "never":
+            self._emit(Warning("Sandbox changes were discarded; the project was left untouched."))
+            return
+        request = ApprovalRequest(
+            tool="sandbox_sync",
+            risk=RiskLevel.MUTATING,
+            summary=f"copy {len(changed)} sandbox change(s) back to the project",
+            detail=self.sandbox.diff(),
+            signature="sandbox_sync",
+            always_prompt=self.config.sandbox_sync == "ask",
+        )
+        if self.config.sandbox_sync == "always" or self._authorise(request):
+            try:
+                applied = self.sandbox.apply()
+            except SandboxError as exc:
+                self._emit(Warning("Sandbox changes were not copied back.", detail=str(exc)))
+            else:
+                self._emit(Warning(f"Copied {len(applied)} sandbox change(s) back to the project."))
+        else:
+            self._emit(Warning("Sandbox changes were discarded; the project was left untouched."))

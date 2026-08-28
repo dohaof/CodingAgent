@@ -19,6 +19,7 @@ from __future__ import annotations
 import contextlib
 import json
 import time
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -41,7 +42,7 @@ from .events import (
     Warning,
 )
 
-__all__ = ["TraceWriter", "read_trace"]
+__all__ = ["TraceWriter", "history_from_trace", "read_trace"]
 
 _TRACE_VERSION = 1
 _MAX_FIELD_CHARS = 20_000
@@ -63,7 +64,16 @@ def _encode_message(message: Message) -> dict[str, Any]:
         if isinstance(part, TextPart):
             parts.append({"type": "text", "text": _clip(part.text)})
         elif isinstance(part, ThinkingPart):
-            parts.append({"type": "thinking", "text": _clip(part.text)})
+            parts.append(
+                {
+                    "type": "thinking",
+                    "text": _clip(part.text),
+                    # Provider signatures are opaque verification material;
+                    # clipping one would make an otherwise resumable turn
+                    # invalid, so retain it verbatim.
+                    "signature": part.signature,
+                }
+            )
         elif isinstance(part, ToolCallPart):
             parts.append(
                 {
@@ -71,6 +81,7 @@ def _encode_message(message: Message) -> dict[str, Any]:
                     "id": part.id,
                     "name": part.name,
                     "arguments": _jsonable(part.arguments),
+                    "raw_arguments": _clip(part.raw_arguments) if part.raw_arguments else None,
                 }
             )
         elif isinstance(part, ToolResultPart):
@@ -141,6 +152,8 @@ class TraceWriter:
                 "wire": config.wire,
                 "workspace": str(config.workspace),
                 "approval_mode": config.approval_mode,
+                "sandbox_mode": config.sandbox_mode,
+                "sandbox_sync": config.sandbox_sync,
                 "context_window": config.context_window,
                 "max_steps": config.max_steps,
             }
@@ -151,6 +164,15 @@ class TraceWriter:
         record = self._encode(event)
         if record is not None:
             self._write(record)
+
+    def record_history(self, messages: Sequence[Message]) -> None:
+        """Write a self-contained history checkpoint for a resumed session."""
+        self._write(
+            {
+                "type": "history_checkpoint",
+                "messages": [_encode_message(message) for message in messages],
+            }
+        )
 
     def _write(self, record: dict[str, Any]) -> None:
         if self._handle is None:
@@ -211,6 +233,7 @@ class TraceWriter:
                     "risk": event.request.risk.name,
                     "summary": _clip(event.request.summary),
                     "signature": event.request.signature,
+                    "always_prompt": event.request.always_prompt,
                 }
             case ApprovalDecided():
                 return {
@@ -295,7 +318,9 @@ def read_trace(path: Path) -> list[dict[str, Any]]:
     which is exactly the case a trace exists to explain.
     """
     records: list[dict[str, Any]] = []
-    with path.open(encoding="utf-8") as handle:
+    # ``utf-8-sig`` keeps normal UTF-8 behaviour and also accepts traces saved
+    # by Windows editors that prepend a BOM.
+    with path.open(encoding="utf-8-sig") as handle:
         for line in handle:
             stripped = line.strip()
             if not stripped:
@@ -307,3 +332,119 @@ def read_trace(path: Path) -> list[dict[str, Any]]:
             if isinstance(record, dict):
                 records.append(record)
     return records
+
+
+def _decode_message(raw: object) -> Message | None:
+    """Decode one trace message, tolerating fields from older trace versions."""
+    if not isinstance(raw, Mapping):
+        return None
+    role = raw.get("role")
+    if role not in ("system", "user", "assistant", "tool"):
+        return None
+    raw_parts = raw.get("parts")
+    if not isinstance(raw_parts, list):
+        return None
+    parts: list[TextPart | ThinkingPart | ToolCallPart | ToolResultPart] = []
+    for item in raw_parts:
+        if not isinstance(item, Mapping):
+            continue
+        kind = item.get("type")
+        if kind == "text" and isinstance(item.get("text"), str):
+            parts.append(TextPart(item["text"]))
+        elif kind == "thinking" and isinstance(item.get("text"), str):
+            signature = item.get("signature")
+            parts.append(
+                ThinkingPart(
+                    item["text"], signature if isinstance(signature, str) else None
+                )
+            )
+        elif kind == "tool_call":
+            call_id = item.get("id")
+            name = item.get("name")
+            arguments = item.get("arguments")
+            raw_arguments = item.get("raw_arguments")
+            if isinstance(call_id, str) and isinstance(name, str) and isinstance(arguments, dict):
+                parts.append(
+                    ToolCallPart(
+                        call_id,
+                        name,
+                        dict(arguments),
+                        raw_arguments if isinstance(raw_arguments, str) else "",
+                    )
+                )
+        elif kind == "tool_result":
+            call_id = item.get("call_id")
+            content = item.get("content")
+            if isinstance(call_id, str) and isinstance(content, str):
+                parts.append(
+                    ToolResultPart(call_id, content, bool(item.get("is_error", False)))
+                )
+    return Message(role=role, parts=parts) if parts else None
+
+
+def history_from_trace(records: Sequence[Mapping[str, Any]]) -> list[Message]:
+    """Reconstruct a provider-valid conversation history from trace events.
+
+    A trace stores assistant messages in ``step_finished`` records and tool
+    outcomes in ``tool_finished`` records.  The latter are grouped back into a
+    single tool message, matching the history shape sent to both wire adapters.
+    An interrupted final tool call is dropped instead of producing an invalid
+    assistant message with no results.
+    """
+    history: list[Message] = []
+    pending: list[ToolResultPart] = []
+
+    def flush_tools() -> None:
+        if not history or history[-1].role != "assistant" or not history[-1].tool_calls:
+            pending.clear()
+            return
+        if not pending:
+            # A user/assistant event after this call means the process ended
+            # before any result was recorded. Keep the transcript provider-safe.
+            history.pop()
+            return
+        by_id = {result.call_id: result for result in pending}
+        calls = history[-1].tool_calls
+        expected = {call.id for call in calls}
+        if expected <= by_id.keys():
+            history.append(Message.from_tool_results([by_id[call.id] for call in calls]))
+        else:
+            # The process may have died between the model response and tool
+            # execution. Do not hand an incomplete tool turn to the provider.
+            history.pop()
+        pending.clear()
+
+    for record in records:
+        kind = record.get("type")
+        if kind == "history_checkpoint":
+            raw_messages = record.get("messages")
+            if isinstance(raw_messages, list):
+                restored = [
+                    message
+                    for raw_message in raw_messages
+                    if (message := _decode_message(raw_message)) is not None
+                ]
+                if restored:
+                    history = restored
+                    pending.clear()
+        elif kind == "user":
+            flush_tools()
+            text = record.get("text")
+            if isinstance(text, str):
+                history.append(Message.user(text))
+        elif kind == "step_finished":
+            flush_tools()
+            message = _decode_message(record.get("message"))
+            if message is not None:
+                history.append(message)
+        elif kind == "tool_finished":
+            call_id = record.get("id")
+            content = record.get("content")
+            if isinstance(call_id, str) and isinstance(content, str):
+                pending.append(
+                    ToolResultPart(call_id, content, bool(record.get("is_error", False)))
+                )
+    flush_tools()
+    if history and history[-1].role == "assistant" and history[-1].tool_calls:
+        history.pop()
+    return history

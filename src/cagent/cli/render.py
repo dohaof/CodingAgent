@@ -159,6 +159,10 @@ class ConsoleRenderer:
         header.add_row("endpoint", event.endpoint)
         header.add_row("workspace", str(self.config.workspace))
         header.add_row("approval", self.config.approval_mode)
+        header.add_row(
+            "sandbox",
+            f"{self.config.sandbox_mode} ({self.config.sandbox_sync})",
+        )
         header.add_row("tools", f"{len(event.tool_names)} · {', '.join(event.tool_names)}")
         header.add_row("system", f"{event.system_tokens} tokens")
         self.console.print(Panel(header, title="cagent", border_style="cyan", expand=False))
@@ -408,8 +412,10 @@ def prompt_for_approval(console: Console, request: ApprovalRequest) -> Decision:
         )
     )
 
-    allow_always = request.risk is not RiskLevel.DANGEROUS
-    options = "[y]es  [n]o" + ("  [a]lways" if allow_always else "") + "  [q]uit"
+    allow_always = request.risk is not RiskLevel.DANGEROUS and not request.always_prompt
+    # Escape the brackets: Rich treats ``[y]`` as a markup tag otherwise and
+    # the user sees ``es o lways uit`` with the shortcut letters swallowed.
+    options = r"\[y]es  \[n]o" + (r"  \[a]lways" if allow_always else "") + r"  \[q]uit"
     while True:
         console.print(f"[{style}]{options}[/{style}] ", end="")
         try:

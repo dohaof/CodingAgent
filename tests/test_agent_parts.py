@@ -28,13 +28,14 @@ from cagent.agent.events import (
 from cagent.agent.guards import LoopGuard, call_signature
 from cagent.agent.prompt import PromptBuilder
 from cagent.agent.repomap import build_repo_map
-from cagent.agent.trace import TraceWriter, read_trace
+from cagent.agent.trace import TraceWriter, history_from_trace, read_trace
 from cagent.config import AgentConfig
 from cagent.errors import MaxStepsExceeded, RepetitionDetected, TokenBudgetExceeded
 from cagent.tools.base import ApprovalRequest, ToolOutcome
 from cagent.types import (
     Message,
     RiskLevel,
+    TextPart,
     ToolCallPart,
     ToolResultPart,
     Usage,
@@ -335,6 +336,22 @@ class TestApprovalPolicy:
         policy = ApprovalPolicy(config, prompter=lambda r: Decision(approved=False))
         assert policy.decide(request(RiskLevel.MUTATING)).approved
 
+    def test_forced_confirmation_still_asks_in_full_auto(self, tmp_path: Path) -> None:
+        config = AgentConfig(workspace=tmp_path, api_key="k", approval_mode="full-auto")
+        asked: list[ApprovalRequest] = []
+        policy = ApprovalPolicy(
+            config, prompter=lambda item: (asked.append(item), Decision(approved=False))[1]
+        )
+        sync = ApprovalRequest(
+            tool="sandbox_sync",
+            risk=RiskLevel.MUTATING,
+            summary="copy changes back",
+            always_prompt=True,
+        )
+
+        assert not policy.decide(sync).approved
+        assert asked == [sync]
+
     @pytest.mark.parametrize(
         "tool_name", ["write_file", "edit_file", "multi_edit", "apply_patch"]
     )
@@ -563,12 +580,107 @@ class TestPromptBuilder:
         (config.workspace / "pyproject.toml").write_text("[project]\n", encoding="utf-8")
         assert "pyproject.toml" in PromptBuilder(config).build().text
 
+    def test_sandbox_prompt_names_container_runtime(self, config: AgentConfig) -> None:
+        snapshot = config.workspace / "snapshot"
+        snapshot.mkdir()
+        prompt = PromptBuilder(config, workspace=snapshot).build()
+        assert "Linux Docker container" in prompt.text
+        assert "python3/python" in prompt.text
+        assert "never Windows" in prompt.text
+        assert "Host platform" in prompt.text and "Host Python" in prompt.text
+
     def test_extra_context_is_appended_verbatim(self, config: AgentConfig) -> None:
         prompt = PromptBuilder(config).build(extra_context="Always use tabs.")
         assert "Always use tabs." in prompt.text
 
 
 class TestTrace:
+    def test_history_from_trace_preserves_tool_call_order(self) -> None:
+        records = [
+            {"type": "user", "text": "inspect both files"},
+            {
+                "type": "step_finished",
+                "message": {
+                    "role": "assistant",
+                    "parts": [
+                        {
+                            "type": "tool_call",
+                            "id": "a",
+                            "name": "read_file",
+                            "arguments": {"path": "a.py"},
+                        },
+                        {
+                            "type": "tool_call",
+                            "id": "b",
+                            "name": "read_file",
+                            "arguments": {"path": "b.py"},
+                        },
+                    ],
+                },
+            },
+            {"type": "tool_finished", "id": "b", "content": "B"},
+            {"type": "tool_finished", "id": "a", "content": "A"},
+            {
+                "type": "step_finished",
+                "message": {"role": "assistant", "parts": [{"type": "text", "text": "done"}]},
+            },
+        ]
+
+        history = history_from_trace(records)
+
+        assert [message.role for message in history] == ["user", "assistant", "tool", "assistant"]
+        assert [result.call_id for result in history[2].tool_results] == ["a", "b"]
+        assert history[-1].text == "done"
+
+    def test_history_from_trace_drops_an_incomplete_final_tool_call(self) -> None:
+        records = [
+            {"type": "user", "text": "run the check"},
+            {
+                "type": "step_finished",
+                "message": {
+                    "role": "assistant",
+                    "parts": [
+                        {"type": "thinking", "text": "plan", "signature": "sig"},
+                        {
+                            "type": "tool_call",
+                            "id": "a",
+                            "name": "run_bash",
+                            "arguments": {"command": "pytest"},
+                        },
+                    ],
+                },
+            },
+        ]
+
+        history = history_from_trace(records)
+
+        assert [message.role for message in history] == ["user"]
+
+    def test_history_from_trace_drops_incomplete_call_before_a_new_user_turn(self) -> None:
+        records = [
+            {"type": "user", "text": "first"},
+            {
+                "type": "step_finished",
+                "message": {
+                    "role": "assistant",
+                    "parts": [
+                        {
+                            "type": "tool_call",
+                            "id": "a",
+                            "name": "run_bash",
+                            "arguments": {"command": "pytest"},
+                        }
+                    ],
+                },
+            },
+            {"type": "user", "text": "second"},
+        ]
+
+        history = history_from_trace(records)
+
+        assert [message.role for message in history] == ["user", "user"]
+        assert [message.text for message in history] == ["first", "second"]
+
     def test_events_are_recorded_as_jsonl(self, config: AgentConfig) -> None:
         config.trace_dir = config.workspace / "traces"
         writer = TraceWriter.create(config, session_id="abc")
@@ -660,6 +772,22 @@ class TestTrace:
             encoding="utf-8",
         )
         assert [r["type"] for r in read_trace(path)] == ["session"]
+
+    def test_a_utf8_bom_is_tolerated(self, config: AgentConfig) -> None:
+        path = config.workspace / "bom.jsonl"
+        path.write_bytes(b'\xef\xbb\xbf{"type":"session"}\n')
+        assert [r["type"] for r in read_trace(path)] == ["session"]
+
+    def test_history_checkpoint_can_be_restored(self, config: AgentConfig) -> None:
+        config.trace_dir = config.workspace / "traces"
+        writer = TraceWriter.create(config, session_id="checkpoint")
+        assert writer is not None
+        writer.record_history([Message.user("old"), Message.assistant(TextPart("answer"))])
+        writer.close()
+
+        history = history_from_trace(read_trace(writer.path))
+
+        assert [message.text for message in history] == ["old", "answer"]
 
 
 class TestEventSinks:

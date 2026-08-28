@@ -25,10 +25,12 @@ import signal
 import subprocess
 import sys
 import time
+import uuid
 from dataclasses import dataclass
 from typing import Annotated, ClassVar
 
-from ..errors import UserAbort
+from ..agent.sandbox import SandboxError
+from ..errors import ToolError, UserAbort
 from ..types import RiskLevel
 from .base import ApprovalRequest, BaseTool, ToolContext, ToolOutcome
 from .schema import Doc
@@ -221,6 +223,67 @@ def _build_invocation(command: str) -> tuple[list[str] | str, bool]:
     return command, True
 
 
+def _docker_command(command: str, ctx: ToolContext, *, name: str | None = None) -> list[str]:
+    """Build a one-shot constrained Docker invocation.
+
+    Kept as a small, testable helper for callers that need a disposable
+    command.  :class:`RunBashTool` uses the session-level container path below
+    so normal Agent sessions do not pay a container startup cost per command.
+    """
+    if ctx.sandbox is None:
+        raise ToolError("Docker sandbox is not available for this tool context.")
+    image = ctx.config.sandbox_image.strip()
+    return [
+        "docker",
+        "run",
+        "--rm",
+        "--pull=never",
+        "--name",
+        name or f"cagent-{uuid.uuid4().hex[:12]}",
+        "--network=none",
+        "--read-only",
+        "--cap-drop=ALL",
+        "--security-opt=no-new-privileges",
+        "--pids-limit",
+        str(ctx.config.sandbox_pids),
+        "--memory",
+        f"{ctx.config.sandbox_memory_mb}m",
+        "--cpus",
+        str(ctx.config.sandbox_cpus),
+        "--tmpfs",
+        "/tmp:rw,noexec,nosuid,size=128m",
+        "--mount",
+        # Bind mounts are read/write by default.  Do not append ``rw`` here:
+        # it is valid for ``--volume`` but invalid as a ``--mount`` field.
+        f"type=bind,src={ctx.workspace},dst=/workspace",
+        "--workdir",
+        "/workspace",
+        "--env",
+        "HOME=/tmp",
+        "--env",
+        "PYTHONDONTWRITEBYTECODE=1",
+        "--entrypoint",
+        "/bin/sh",
+        image,
+        "-lc",
+        command,
+    ]
+
+
+def _docker_exec_command(command: str, container_name: str) -> list[str]:
+    """Build a command executed inside an already-running session container."""
+    return [
+        "docker",
+        "exec",
+        "--workdir",
+        "/workspace",
+        container_name,
+        "/bin/sh",
+        "-lc",
+        command,
+    ]
+
+
 def _windows_native_bash() -> str | None:
     """Find Git Bash or another native Bash without selecting WSL's launcher."""
     bash = shutil.which("bash")
@@ -385,13 +448,29 @@ class RunBashTool(BaseTool):
         if timeout is None:
             timeout = ctx.config.bash_timeout
 
-        argv, use_shell = _build_invocation(command)
+        argv: list[str] | str
+        use_shell: bool
+        container_name: str | None = None
+        if ctx.sandbox is not None:
+            try:
+                # One container is shared by all commands in this Agent
+                # session.  The snapshot remains the source of truth for
+                # file changes and is synchronised only at session close.
+                container_name = ctx.sandbox.ensure_container(ctx.config)
+            except SandboxError as exc:
+                return ToolOutcome.error(
+                    str(exc),
+                    metadata={"exit_code": None, "timeout": False, "sandbox": "docker"},
+                )
+            argv, use_shell = _docker_exec_command(command, container_name), False
+        else:
+            argv, use_shell = _build_invocation(command)
         started = time.perf_counter()
         try:
             process = subprocess.Popen(  # noqa: S603  # running commands is the point
                 argv,
                 shell=use_shell,
-                cwd=str(ctx.workspace),
+                cwd=str(ctx.workspace) if ctx.sandbox is None else None,
                 env=_child_environment(),
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
@@ -401,9 +480,19 @@ class RunBashTool(BaseTool):
                 start_new_session=_POSIX,
             )
         except OSError as exc:
+            if ctx.sandbox is not None and isinstance(exc, FileNotFoundError):
+                return ToolOutcome.error(
+                    "Docker sandbox could not start because the Docker CLI is not available. "
+                    "Install/start Docker, or set sandbox_mode = 'off'.",
+                    metadata={"exit_code": None, "timeout": False, "sandbox": "docker"},
+                )
             return ToolOutcome.error(
                 f"Could not start the command: {exc}",
-                metadata={"exit_code": None, "timeout": False},
+                metadata={
+                    "exit_code": None,
+                    "timeout": False,
+                    **({"sandbox": "docker"} if ctx.sandbox is not None else {}),
+                },
             )
 
         timed_out = False
@@ -412,6 +501,11 @@ class RunBashTool(BaseTool):
         except subprocess.TimeoutExpired:
             timed_out = True
             kill_process_tree(process)
+            if container_name is not None and ctx.sandbox is not None:
+                # A killed ``docker exec`` client can leave the command
+                # running in the container.  Recycle the container so a
+                # timed-out process cannot survive into the next tool call.
+                ctx.sandbox.stop_container()
             stdout_bytes, stderr_bytes = self._drain(process)
         duration = time.perf_counter() - started
 
@@ -433,6 +527,18 @@ class RunBashTool(BaseTool):
             "duration_s": round(duration, 3),
             "timeout": timed_out,
         }
+        if ctx.sandbox is not None:
+            metadata["sandbox"] = "docker"
+            if ctx.sandbox.exceeds_size_limit(ctx.config.sandbox_workspace_mb):
+                ctx.sandbox.restore()
+                return ToolOutcome.error(
+                    "The sandbox command exceeded the workspace disk limit. The disposable "
+                    "workspace was reset and all pending sandbox changes were discarded.",
+                    metadata={
+                        **metadata,
+                        "sandbox_limit_mb": ctx.config.sandbox_workspace_mb,
+                    },
+                )
         failed = timed_out or exit_code != 0
         factory = ToolOutcome.error if failed else ToolOutcome.ok
         return factory(body, metadata=metadata, truncated=truncated)

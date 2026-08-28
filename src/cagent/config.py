@@ -30,6 +30,8 @@ from .errors import ConfigError
 __all__ = [
     "AgentConfig",
     "ApprovalMode",
+    "SandboxMode",
+    "SandboxSync",
     "Wire",
     "load_config",
 ]
@@ -39,6 +41,12 @@ Wire = Literal["openai", "anthropic"]
 
 ApprovalMode = Literal["suggest", "auto-edit", "full-auto"]
 """How much the agent may do without asking. See :class:`AgentConfig`."""
+
+SandboxMode = Literal["off", "docker"]
+"""Where shell commands execute: on the host, or in a disposable Docker copy."""
+
+SandboxSync = Literal["never", "ask", "always"]
+"""What to do with changes in a disposable workspace when a run ends."""
 
 CONFIG_FILENAME = ".cagent.toml"
 CONFIG_TABLE = "cagent"
@@ -123,6 +131,21 @@ class AgentConfig:
     approval_mode: ApprovalMode = "auto-edit"
     workspace: Path = field(default_factory=Path.cwd)
     allow_outside_workspace: bool = False
+
+    # sandbox
+    sandbox_mode: SandboxMode = "off"
+    """Use Docker for shell execution against a disposable workspace copy."""
+
+    sandbox_sync: SandboxSync = "ask"
+    """Copy sandbox changes back never, after a prompt, or automatically."""
+
+    sandbox_image: str = "python:3.12-slim"
+    """Docker image used for isolated shell commands; it must be local."""
+
+    sandbox_memory_mb: int = 1024
+    sandbox_cpus: float = 2.0
+    sandbox_pids: int = 256
+    sandbox_workspace_mb: int = 512
 
     # repomap
     repo_map_token_budget: int = 1600
@@ -256,6 +279,26 @@ class AgentConfig:
                 f"approval_mode must be one of suggest, auto-edit, full-auto; "
                 f"got {self.approval_mode!r}."
             )
+        if self.sandbox_mode not in ("off", "docker"):
+            raise ConfigError(
+                f"sandbox_mode must be one of off, docker; got {self.sandbox_mode!r}."
+            )
+        if self.sandbox_mode == "docker" and self.allow_outside_workspace:
+            raise ConfigError(
+                "allow_outside_workspace cannot be combined with sandbox_mode='docker'."
+            )
+        if self.sandbox_sync not in ("never", "ask", "always"):
+            raise ConfigError(
+                f"sandbox_sync must be one of never, ask, always; got {self.sandbox_sync!r}."
+            )
+        if not self.sandbox_image.strip():
+            raise ConfigError("sandbox_image must not be empty.")
+        for name in ("sandbox_memory_mb", "sandbox_pids", "sandbox_workspace_mb"):
+            value_int = int(getattr(self, name))
+            if value_int <= 0:
+                raise ConfigError(f"{name} must be positive, got {value_int!r}.")
+        if self.sandbox_cpus <= 0:
+            raise ConfigError(f"sandbox_cpus must be positive, got {self.sandbox_cpus!r}.")
         return self
 
 
@@ -384,5 +427,3 @@ def load_config(
 
     values.setdefault("workspace", base)
     return AgentConfig(**values)  # type: ignore[arg-type]
-
-

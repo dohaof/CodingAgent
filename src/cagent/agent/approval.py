@@ -89,7 +89,11 @@ class ApprovalPolicy:
             return Decision(approved=True)
 
         key = request.signature or request.tool
-        if request.risk is not RiskLevel.DANGEROUS and key in self.remembered:
+        if (
+            not request.always_prompt
+            and request.risk is not RiskLevel.DANGEROUS
+            and key in self.remembered
+        ):
             return Decision(approved=self.remembered[key])
 
         if self.prompter is None:
@@ -101,7 +105,11 @@ class ApprovalPolicy:
         decision = self.prompter(request)
         if decision.abort:
             self.aborted = True
-        if decision.remember and request.risk is not RiskLevel.DANGEROUS:
+        if (
+            decision.remember
+            and not request.always_prompt
+            and request.risk is not RiskLevel.DANGEROUS
+        ):
             self.remembered[key] = decision.approved
         return decision
 
@@ -115,12 +123,14 @@ class ApprovalPolicy:
             return False
         if self._auto_allows(request):
             return False
-        if request.risk is RiskLevel.DANGEROUS:
+        if request.always_prompt or request.risk is RiskLevel.DANGEROUS:
             return True
         return (request.signature or request.tool) not in self.remembered
 
     def _auto_allows(self, request: ApprovalRequest) -> bool:
         """Whether this mode runs ``request`` without asking."""
+        if request.always_prompt:
+            return False
         if request.risk is RiskLevel.SAFE:
             return True
         if request.risk is RiskLevel.DANGEROUS:

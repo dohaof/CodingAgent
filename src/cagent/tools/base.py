@@ -22,12 +22,15 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 from ..config import AgentConfig
 from ..errors import PathOutsideWorkspaceError, ToolError
 from ..types import RiskLevel, ToolSpec
 from .schema import build_object_schema, parse_object
+
+if TYPE_CHECKING:
+    from ..agent.sandbox import SandboxSession
 
 __all__ = [
     "ApprovalRequest",
@@ -59,6 +62,14 @@ class ApprovalRequest:
 
     signature: str = ""
     """Stable key for remembered approvals; defaults to the tool name."""
+
+    always_prompt: bool = False
+    """Require a fresh human answer even in ``full-auto`` mode.
+
+    Used for copying an isolated workspace back to the real project: execution
+    has already happened safely, but crossing that boundary is a separate act
+    which a broad pre-approved command signature must not silently authorise.
+    """
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,6 +114,12 @@ class ToolContext:
     abort: threading.Event
     """Set when the user interrupts; long-running tools should poll it."""
 
+    force_workspace_boundary: bool = False
+    """Ignore ``allow_outside_workspace`` for an isolated snapshot."""
+
+    sandbox: SandboxSession | None = None
+    """Session snapshot used by isolated file and shell tools."""
+
     def resolve_path(self, raw: str) -> Path:
         """Resolve a model-supplied path and enforce the workspace sandbox.
 
@@ -126,7 +143,7 @@ class ToolContext:
             candidate = self.workspace / candidate
 
         resolved = self._resolve(candidate)
-        if self.config.allow_outside_workspace:
+        if self.config.allow_outside_workspace and not self.force_workspace_boundary:
             return resolved
 
         root = self._resolve(self.workspace)

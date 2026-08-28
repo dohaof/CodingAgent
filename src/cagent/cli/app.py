@@ -1,8 +1,8 @@
 """The command-line entry point.
 
-Three ways to run: one task and exit, an interactive session, or replaying a
-trace from a previous run. All three build the same :class:`~cagent.agent.Agent`
-and differ only in what drives it and what renders it.
+The command-line surface starts either one task or an interactive session.
+Interactive commands can inspect the agent, control the sandbox, and restore a
+conversation from a trace.
 
 Credentials are deliberately not accepted as a flag. A key on the command line
 lands in shell history and in the process list, so it comes from an untracked
@@ -22,12 +22,13 @@ from typing import NoReturn
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
+from rich.text import Text
 
 from .. import __version__
 from ..agent.approval import ApprovalPolicy
 from ..agent.engine import Agent
 from ..agent.events import FanOutSink
-from ..agent.trace import TraceWriter, read_trace
+from ..agent.trace import TraceWriter, history_from_trace, read_trace
 from ..config import AgentConfig, load_config
 from ..errors import CagentError, ConfigError
 from ..tools.registry import default_registry
@@ -36,8 +37,51 @@ from .render import ConsoleRenderer, prompt_for_approval
 __all__ = ["main"]
 
 _BANNER_HELP = """\
-Commands: /help  /tools  /cost  /context  /approve <mode>  /clear  /trace  /exit
+Commands: /help <instruct>  /tools  /cost  /context  /approve <mode>
+          /sandbox  /resume TRACE  /clear  /trace  /exit
+Use /help <instruct> for details about one command.
 Ctrl-C interrupts the current task; Ctrl-C again at the prompt exits."""
+
+_RESUME_HELP = """\
+Conversation recovery
+
+  /resume TRACE       restore the conversation recorded in TRACE
+
+The current Agent, configuration, API key, workspace, approvals, and sandbox
+remain active. The trace is read-only. It restores recorded user, assistant,
+thinking, tool-call, and tool-result messages, then the next normal prompt
+continues from that history. It does not restore an old Docker container,
+unsynchronised sandbox files, token usage, or clipped tool output. A trace from
+another project is accepted as conversation context, but the current workspace
+is used for tools and a warning is shown."""
+
+_SANDBOX_HELP = """\
+Docker sandbox - one disposable container per Agent conversation
+
+Before enabling: Docker Desktop/Engine must be running and the selected image
+must exist locally. Pull or build it explicitly; the agent never pulls images.
+
+  /sandbox                         show status, image, and sync policy
+  /sandbox on [IMAGE]              copy the project and enable Docker isolation
+  /sandbox image IMAGE             select an image (safe while sandbox is on)
+  /sandbox sync never|ask|always   choose what /sandbox off or exit does
+  /sandbox apply                   sync changes now; keep sandbox enabled
+  /sandbox rollback                discard unsynced changes; keep sandbox enabled
+  /sandbox off                     apply the sync policy, then return to host mode
+
+Inside the sandbox, file tools and run_bash use the temporary snapshot. The
+real project is unchanged until /sandbox apply, or until /sandbox off/exit
+syncs it according to the selected policy. The normal workspace path boundary
+and command approvals still apply. The container starts on the first shell
+command, is reused for this conversation, and is removed when it closes.
+
+Examples:
+  /sandbox image my-project-agent:latest
+  /sandbox sync ask
+  /sandbox on
+  ... work and test ...
+  /sandbox apply       (keep the sandbox and continue)
+  /sandbox off         (finish and return to the real project)"""
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -101,6 +145,29 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="permit reads and writes outside the workspace",
     )
+    safety.add_argument(
+        "--sandbox",
+        choices=("off", "docker"),
+        help="run against a disposable Docker workspace snapshot (default: off)",
+    )
+    safety.add_argument(
+        "--sandbox-sync",
+        choices=("never", "ask", "always"),
+        help="after Docker runs: discard, ask before syncing, or sync automatically",
+    )
+    safety.add_argument(
+        "--sandbox-image",
+        metavar="IMAGE",
+        help="local Docker image for the sandbox (default: python:3.12-slim)",
+    )
+    safety.add_argument("--sandbox-memory-mb", type=int, help="Docker memory limit in MiB")
+    safety.add_argument("--sandbox-cpus", type=float, help="Docker CPU limit")
+    safety.add_argument("--sandbox-pids", type=int, help="Docker process limit")
+    safety.add_argument(
+        "--sandbox-workspace-mb",
+        type=int,
+        help="maximum regular-file bytes retained in the disposable workspace",
+    )
 
     output = parser.add_argument_group("output")
     output.add_argument("--no-repo-map", action="store_true", help="omit the project map")
@@ -112,7 +179,6 @@ def build_parser() -> argparse.ArgumentParser:
     info = parser.add_argument_group("information")
     info.add_argument("--show-config", action="store_true", help="print the resolved configuration")
     info.add_argument("--list-tools", action="store_true", help="print the tools and their schemas")
-    info.add_argument("--replay", type=Path, metavar="TRACE", help="replay a trace file")
     info.add_argument("--version", action="version", version=f"cagent {__version__}")
     return parser
 
@@ -135,6 +201,13 @@ def _overrides(args: argparse.Namespace) -> dict[str, object]:
         "bash_timeout": args.bash_timeout,
         "approval_mode": approval,
         "workspace": args.workspace,
+        "sandbox_mode": args.sandbox,
+        "sandbox_sync": args.sandbox_sync,
+        "sandbox_image": args.sandbox_image,
+        "sandbox_memory_mb": args.sandbox_memory_mb,
+        "sandbox_cpus": args.sandbox_cpus,
+        "sandbox_pids": args.sandbox_pids,
+        "sandbox_workspace_mb": args.sandbox_workspace_mb,
     }
     if args.no_key:
         values["requires_key"] = False
@@ -152,9 +225,6 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     console = Console(highlight=False, soft_wrap=False)
-
-    if args.replay is not None:
-        return _replay(console, args.replay)
 
     try:
         # An explicit workspace is also the project-config root.  This makes
@@ -280,7 +350,7 @@ def _install_interrupt_handler(agent: Agent, console: Console) -> None:
 
 def _repl(console: Console, agent: Agent, config: AgentConfig) -> int:
     """Read tasks from the user until they leave."""
-    console.print(Panel(_BANNER_HELP, border_style="dim", expand=False))
+    console.print(Panel(Text(_BANNER_HELP), border_style="dim", expand=False))
     while True:
         try:
             console.print("\n[bold cyan]›[/bold cyan] ", end="")
@@ -312,7 +382,7 @@ def _command(console: Console, agent: Agent, config: AgentConfig, line: str) -> 
         case "/exit" | "/quit":
             return True
         case "/help":
-            console.print(Panel(_BANNER_HELP, border_style="dim", expand=False))
+            _print_help(console, arguments[0] if arguments else None)
         case "/tools":
             _list_tools(console)
         case "/cost":
@@ -332,6 +402,10 @@ def _command(console: Console, agent: Agent, config: AgentConfig, line: str) -> 
             agent.context.history.clear()
             agent.guard.note_progress()
             console.print("[dim]history cleared[/dim]")
+        case "/sandbox":
+            _sandbox_command(console, agent, arguments)
+        case "/resume":
+            _resume_command(console, agent, config, arguments)
         case "/approve":
             if arguments and arguments[0] in ("suggest", "auto-edit", "full-auto"):
                 config.approval_mode = arguments[0]  # type: ignore[assignment]
@@ -343,6 +417,167 @@ def _command(console: Console, agent: Agent, config: AgentConfig, line: str) -> 
         case _:
             console.print(f"[dim]unknown command {name}; try /help[/dim]")
     return False
+
+
+_HELP_TOPICS = {
+    "help": (
+        "Help",
+        "Use /help for the command list, or /help <instruct> for one command's details.",
+        "dim",
+    ),
+    "resume": ("Resume", _RESUME_HELP, "green"),
+    "sandbox": ("Sandbox", _SANDBOX_HELP, "cyan"),
+    "tools": (
+        "Tools",
+        "List the tools and argument shapes currently available to the agent.",
+        "dim",
+    ),
+    "cost": (
+        "Cost",
+        "Show token usage and the number of model steps used in this session.",
+        "dim",
+    ),
+    "context": (
+        "Context",
+        "Show estimated context usage, retained messages, and compaction count.",
+        "dim",
+    ),
+    "approve": (
+        "Approve",
+        "Use /approve suggest, /approve auto-edit, or /approve full-auto to change\n"
+        "the approval policy for later tool calls.",
+        "dim",
+    ),
+    "clear": (
+        "Clear",
+        "Discard the current conversation history. This cannot restore unsaved context.",
+        "dim",
+    ),
+    "trace": (
+        "Trace",
+        "Show the directory where this session's JSONL trace is written.",
+        "dim",
+    ),
+    "exit": (
+        "Exit",
+        "Leave the interactive session. Sandbox changes follow the selected sync policy.",
+        "dim",
+    ),
+}
+
+
+def _print_help(console: Console, instruction: str | None = None) -> None:
+    """Render the overview or details for one interactive instruction."""
+    if instruction is None:
+        console.print(
+            Panel(Text(_BANNER_HELP), title="Commands", border_style="dim", expand=False)
+        )
+        return
+
+    topic = instruction.lower().lstrip("/")
+    detail = _HELP_TOPICS.get(topic)
+    if detail is None:
+        console.print(
+            f"[yellow]No detailed help for /{topic}.[/yellow] "
+            "Try /help resume or /help sandbox."
+        )
+        return
+    title, body, border = detail
+    console.print(Panel(Text(body), title=title, border_style=border, expand=False))
+
+
+def _resume_command(
+    console: Console,
+    agent: Agent,
+    config: AgentConfig,
+    arguments: list[str],
+) -> None:
+    """Restore a trace into the current interactive Agent."""
+    path_text = " ".join(arguments).strip().strip('"')
+    if not path_text:
+        console.print("[dim]usage: /resume TRACE[/dim]")
+        return
+
+    path = Path(path_text).expanduser().resolve()
+    try:
+        records = read_trace(path)
+    except OSError as exc:
+        console.print(f"[red]resume:[/red] could not read {path}: {exc}")
+        return
+    if not records:
+        console.print(f"[yellow]resume: {path} contains no events.[/yellow]")
+        return
+
+    history = history_from_trace(records)
+    if not history:
+        console.print(f"[yellow]resume: {path} has no restorable conversation history.[/yellow]")
+        return
+
+    recorded_workspace = next(
+        (record.get("workspace") for record in records if record.get("type") == "session"),
+        None,
+    )
+    if (
+        isinstance(recorded_workspace, str)
+        and Path(recorded_workspace).expanduser().resolve() != config.workspace
+    ):
+        console.print(
+            f"[yellow]resume: trace workspace is {recorded_workspace}; "
+            f"current workspace is {config.workspace}.[/yellow]"
+        )
+
+    agent.restore_history(history)
+    for sink in getattr(getattr(agent, "sink", None), "sinks", ()):
+        if isinstance(sink, TraceWriter):
+            sink.record_history(history)
+            break
+    console.print(f"[dim]resumed {len(history)} message(s) from {path}[/dim]")
+
+
+def _sandbox_command(console: Console, agent: Agent, arguments: list[str]) -> None:
+    """Inspect or change the Docker sandbox between interactive turns."""
+    action = arguments[0].lower() if arguments else "status"
+    try:
+        if action in ("status", "show"):
+            console.print(
+                f"sandbox: {agent.sandbox_status()}\n"
+                f"image: {agent.config.sandbox_image}\n"
+                f"sync: {agent.config.sandbox_sync}"
+            )
+        elif action == "on":
+            image = arguments[1] if len(arguments) > 1 else None
+            agent.enable_sandbox(image=image)
+            console.print(f"[dim]sandbox enabled: {agent.sandbox_status()}[/dim]")
+        elif action == "off":
+            agent.disable_sandbox()
+            console.print("[dim]sandbox disabled; tools now use the real workspace[/dim]")
+        elif action == "apply" and len(arguments) == 1:
+            applied = agent.apply_sandbox_changes()
+            if applied:
+                console.print(f"[dim]sandbox changes applied: {len(applied)}[/dim]")
+        elif action in ("rollback", "discard") and len(arguments) == 1:
+            agent.discard_sandbox_changes()
+            console.print("[dim]sandbox changes discarded; sandbox remains enabled[/dim]")
+        elif action == "image" and len(arguments) == 2:
+            image = arguments[1].strip()
+            if not image:
+                raise ValueError("image must not be empty")
+            agent.set_sandbox_image(image)
+            console.print(f"[dim]sandbox image: {image}[/dim]")
+        elif action == "sync" and len(arguments) == 2 and arguments[1] in (
+            "never",
+            "ask",
+            "always",
+        ):
+            agent.config.sandbox_sync = arguments[1]  # type: ignore[assignment]
+            console.print(f"[dim]sandbox sync: {arguments[1]}[/dim]")
+        else:
+            console.print(
+                "[dim]usage: /sandbox [status|on [IMAGE]|apply|rollback|off|"
+                "image IMAGE|sync never|ask|always][/dim]"
+            )
+    except (CagentError, ValueError) as exc:
+        console.print(f"[red]sandbox:[/red] {exc}")
 
 
 def _show_config(console: Console, config: AgentConfig) -> int:
@@ -369,6 +604,7 @@ def _show_config(console: Console, config: AgentConfig) -> int:
         "api key": key_state,
         "workspace": str(config.workspace),
         "approval mode": config.approval_mode,
+        "sandbox": f"{config.sandbox_mode} ({config.sandbox_sync})",
         "context window": f"{config.context_window:,}",
         "compact at": f"{config.compact_at_tokens:,} tokens",
         "max steps": str(config.max_steps),
@@ -410,111 +646,6 @@ def _list_tools(console: Console) -> int:
         table.add_row(tool.name, tool.risk.name.lower(), rendered)
     console.print(table)
     return 0
-
-
-def _replay(console: Console, path: Path) -> int:
-    """Re-narrate a recorded run.
-
-    Useful because the interesting question about a finished session is usually
-    "what did it actually do", and the trace answers it without a second run
-    that would behave differently anyway.
-    """
-    try:
-        records = read_trace(path)
-    except OSError as exc:
-        console.print(f"[red]Could not read {path}:[/red] {exc}")
-        return 2
-    if not records:
-        console.print(f"[yellow]{path} contains no events.[/yellow]")
-        return 1
-
-    for record in records:
-        kind = record.get("type")
-        stamp = f"[dim]{record.get('t', 0):7.2f}s[/dim]"
-        match kind:
-            case "session":
-                # Older traces recorded a "provider" name; fall back to it so a
-                # trace written before that field was dropped still replays.
-                where = record.get("endpoint") or record.get("provider") or "unknown endpoint"
-                console.print(
-                    Panel(
-                        f"{record.get('model')} @ {where} · "
-                        f"{record.get('workspace')} · {record.get('approval_mode')}",
-                        title="replay",
-                        border_style="cyan",
-                        expand=False,
-                    )
-                )
-            case "user":
-                console.print(f"{stamp} [bold cyan]›[/bold cyan] {record.get('text', '')}")
-            case "step_started":
-                console.print(
-                    f"{stamp} [dim]· step {record.get('step')} "
-                    f"({record.get('prompt_tokens_estimate', 0):,} tokens)[/dim]"
-                )
-            case "step_finished":
-                usage = record.get("usage", {})
-                text = _first_text(record.get("message", {}))
-                console.print(
-                    f"{stamp} [dim]{record.get('finish_reason')} · "
-                    f"{usage.get('prompt', 0)}+{usage.get('completion', 0)} tokens · "
-                    f"{record.get('latency_s', 0):.2f}s[/dim]"
-                )
-                if text:
-                    console.print(f"        {text}")
-            case "tool_started":
-                console.print(
-                    f"{stamp} ⏺ [bold]{record.get('name')}[/bold] "
-                    f"[dim]{_short(record.get('arguments'))}[/dim]"
-                )
-            case "tool_finished":
-                mark = "[red]✗[/red]" if record.get("is_error") else "[green]✓[/green]"
-                first = str(record.get("content", "")).strip().split("\n", 1)[0]
-                console.print(f"        ⎿ {mark} {first[:100]}")
-            case "approval_requested":
-                console.print(f"{stamp} [yellow]?[/yellow] {record.get('summary')}")
-            case "approval_decided":
-                verdict = "approved" if record.get("approved") else "declined"
-                if not record.get("automatic"):
-                    console.print(f"        [dim]{verdict}[/dim]")
-            case "compaction":
-                console.print(
-                    f"{stamp} [dim]· compacted ({record.get('strategy')}): "
-                    f"{record.get('tokens_before', 0):,} → {record.get('tokens_after', 0):,}[/dim]"
-                )
-            case "warning":
-                console.print(f"{stamp} [yellow]![/yellow] {record.get('message')}")
-            case "run_finished":
-                usage = record.get("usage", {})
-                console.print(
-                    Panel(
-                        f"{record.get('reason')} · {record.get('steps')} steps · "
-                        f"{record.get('elapsed_s', 0):.1f}s · "
-                        f"{usage.get('prompt', 0):,}+{usage.get('completion', 0):,} tokens",
-                        border_style="cyan",
-                        expand=False,
-                    )
-                )
-    return 0
-
-
-def _first_text(message: dict[str, object]) -> str:
-    """The prose of a recorded message, if it had any."""
-    parts = message.get("parts")
-    if not isinstance(parts, list):
-        return ""
-    for part in parts:
-        if isinstance(part, dict) and part.get("type") == "text":
-            return str(part.get("text", "")).strip()
-    return ""
-
-
-def _short(value: object, limit: int = 90) -> str:
-    """Render recorded arguments compactly."""
-    if not isinstance(value, dict):
-        return ""
-    rendered = ", ".join(f"{key}={str(item)[:40]}" for key, item in value.items())
-    return rendered[:limit]
 
 
 def _entry() -> NoReturn:
