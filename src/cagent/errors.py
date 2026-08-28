@@ -19,7 +19,6 @@ __all__ = [
     "ConfigError",
     "ContextOverflowError",
     "LoopGuardError",
-    "MaxStepsExceeded",
     "PathOutsideWorkspaceError",
     "ProviderError",
     "RateLimitError",
@@ -177,14 +176,6 @@ class LoopGuardError(CagentError):
     """Base class for the guards that stop a runaway agentic loop."""
 
 
-class MaxStepsExceeded(LoopGuardError):
-    """The loop hit its step ceiling without the model finishing."""
-
-    def __init__(self, max_steps: int) -> None:
-        super().__init__(f"Reached the step limit of {max_steps} without a final answer.")
-        self.max_steps = max_steps
-
-
 class TokenBudgetExceeded(LoopGuardError):
     """Cumulative token spend passed the configured budget."""
 
@@ -209,4 +200,3 @@ class RepetitionDetected(LoopGuardError):
 
 class UserAbort(CagentError):
     """The user interrupted the run, e.g. with Ctrl-C."""
-

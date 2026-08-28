@@ -9,6 +9,7 @@ assumed.
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -30,7 +31,7 @@ from cagent.agent.prompt import PromptBuilder
 from cagent.agent.repomap import build_repo_map
 from cagent.agent.trace import TraceWriter, history_from_trace, read_trace
 from cagent.config import AgentConfig
-from cagent.errors import MaxStepsExceeded, RepetitionDetected, TokenBudgetExceeded
+from cagent.errors import RepetitionDetected, TokenBudgetExceeded
 from cagent.tools.base import ApprovalRequest, ToolOutcome
 from cagent.types import (
     Message,
@@ -142,21 +143,21 @@ class TestContextCompaction:
     def test_heavy_pressure_escalates_and_reports_every_stage(
         self, tight: AgentConfig
     ) -> None:
-        manager = loaded(tight, 10)
+        manager = loaded(replace(tight, context_window=2000), 10)
         report = manager.compact()
         assert "elide" in report.strategy
         assert len(report.stages) > 1, report.strategy
-        assert report.tokens_after <= tight.compact_at_tokens
+        assert report.tokens_after <= manager.config.compact_at_tokens
         assert_pairing(manager)
 
     def test_the_original_task_always_survives(self, tight: AgentConfig) -> None:
         # An agent that forgets the task finishes the wrong job confidently.
-        manager = loaded(tight, 12)
+        manager = loaded(replace(tight, context_window=2000), 12)
         manager.compact()
         assert "do a lot of work" in manager.history[0].text
 
     def test_recent_steps_are_kept_verbatim(self, tight: AgentConfig) -> None:
-        manager = loaded(tight, 10)
+        manager = loaded(replace(tight, context_window=2000), 10)
         manager.compact()
         recent = [p.content for m in manager.history[-2:] for p in m.tool_results]
         assert any("removed to save context" not in c for c in recent)
@@ -164,13 +165,13 @@ class TestContextCompaction:
     def test_dropping_leaves_a_marker(self, tight: AgentConfig) -> None:
         # Without it the model sees the task jump straight to recent output and
         # redoes finished work.
-        manager = loaded(tight, 12)
+        manager = loaded(replace(tight, context_window=2000), 12)
         manager.compact()
         joined = "\n".join(m.text for m in manager.history)
         assert "were dropped" in joined and "Re-read any file" in joined
 
     def test_a_summarizer_replaces_history_with_its_note(self, tight: AgentConfig) -> None:
-        manager = loaded(tight, 10)
+        manager = loaded(replace(tight, context_window=2000), 10)
         manager.summarizer = lambda messages: "Ran 10 commands; app.py still needs the fix."
         report = manager.compact()
         joined = "\n".join(m.text for m in manager.history)
@@ -187,7 +188,7 @@ class TestContextCompaction:
             seen.append(len(messages))
             return "note"
 
-        manager = loaded(tight, 10)
+        manager = loaded(replace(tight, context_window=2000), 10)
         manager.summarizer = summarise
         manager.compact()
         assert seen and 0 < seen[0] < len(manager.history) + seen[0]
@@ -196,7 +197,7 @@ class TestContextCompaction:
         def broken(messages) -> str:
             raise RuntimeError("summariser offline")
 
-        manager = loaded(tight, 10)
+        manager = loaded(replace(tight, context_window=2000), 10)
         manager.summarizer = broken
         report = manager.compact()
         assert report.changed and "drop" in report.strategy
@@ -239,12 +240,11 @@ class TestLoopGuard:
         guard.before_step()
         assert guard.steps == 2
 
-    def test_the_step_ceiling_stops_the_run(self, tmp_path: Path) -> None:
-        guard = LoopGuard(AgentConfig(workspace=tmp_path, api_key="k", max_steps=2))
-        guard.before_step()
-        guard.before_step()
-        with pytest.raises(MaxStepsExceeded):
+    def test_steps_are_unbounded_without_a_token_budget(self, tmp_path: Path) -> None:
+        guard = LoopGuard(AgentConfig(workspace=tmp_path, api_key="k"))
+        for _ in range(45):
             guard.before_step()
+        assert guard.steps == 45
 
     def test_the_token_budget_stops_the_run(self, tmp_path: Path) -> None:
         guard = LoopGuard(AgentConfig(workspace=tmp_path, api_key="k", token_budget=100))
@@ -301,12 +301,6 @@ class TestLoopGuard:
         guard.check_call(call)
         guard.note_progress()
         assert guard.check_call(call) is None
-
-    def test_remaining_steps_is_reported(self, tmp_path: Path) -> None:
-        guard = LoopGuard(AgentConfig(workspace=tmp_path, api_key="k", max_steps=5))
-        guard.before_step()
-        assert guard.remaining_steps == 4
-
 
 def request(risk: RiskLevel, *, signature: str = "sig") -> ApprovalRequest:
     return ApprovalRequest(tool="t", risk=risk, summary="do a thing", signature=signature)
@@ -686,7 +680,7 @@ class TestTrace:
         writer = TraceWriter.create(config, session_id="abc")
         assert writer is not None
         call = ToolCallPart(id="c", name="read_file", arguments={"path": "a.py"})
-        writer.handle(StepStarted(step=1, max_steps=10, prompt_tokens_estimate=500))
+        writer.handle(StepStarted(step=1, prompt_tokens_estimate=500))
         writer.handle(ToolStarted(call=call, risk=RiskLevel.SAFE))
         writer.handle(
             ToolFinished(
@@ -794,7 +788,7 @@ class TestEventSinks:
     def test_collecting_sink_filters_by_type(self) -> None:
         sink = CollectingSink()
         sink.handle(Warning("careful"))
-        sink.handle(StepStarted(step=1, max_steps=5, prompt_tokens_estimate=10))
+        sink.handle(StepStarted(step=1, prompt_tokens_estimate=10))
         assert len(sink.of_type(Warning)) == 1
         assert sink.of_type(StepStarted)[0].step == 1
 

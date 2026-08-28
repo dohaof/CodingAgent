@@ -568,18 +568,6 @@ class TestFailureHandling:
 
 
 class TestTermination:
-    def test_the_step_ceiling_stops_the_turn_with_an_explanation(self, project: Path) -> None:
-        script = [
-            tool_turn("read_file", {"path": "calc.py", "offset": n})
-            + [StreamFinished("tool_calls")]
-            for n in range(1, 10)
-        ]
-        agent, _, _ = make_agent(auto(project, max_steps=3), script)
-        result = agent.run_turn("keep reading")
-        assert result.stopped_by == "MaxStepsExceeded"
-        assert result.steps == 3
-        assert "--max-steps" in result.reply
-
     def test_the_token_budget_stops_the_turn(self, project: Path) -> None:
         script = [
             tool_turn("read_file", {"path": "calc.py", "offset": n})
@@ -594,7 +582,7 @@ class TestTermination:
     def test_a_looping_model_is_nudged_then_stopped(self, project: Path) -> None:
         same = tool_turn("read_file", {"path": "calc.py"}) + [StreamFinished("tool_calls")]
         agent, _, provider = make_agent(
-            auto(project, max_repeated_calls=2, max_steps=20), [list(same) for _ in range(8)]
+            auto(project, max_repeated_calls=2), [list(same) for _ in range(8)]
         )
         result = agent.run_turn("read it repeatedly")
 
@@ -639,7 +627,6 @@ class TestContextPressure:
             context_window=4000,
             compact_threshold=0.5,
             keep_recent_turns=1,
-            max_steps=30,
         )
         script = [
             tool_turn("run_bash", {"command": "python noisy.py"}) + [StreamFinished("tool_calls")]
@@ -659,7 +646,7 @@ class TestContextPressure:
             "for i in range(200): print('line', i, 'y' * 40)\n", encoding="utf-8"
         )
         config = auto(
-            project, context_window=4000, compact_threshold=0.5, keep_recent_turns=1, max_steps=30
+            project, context_window=4000, compact_threshold=0.5, keep_recent_turns=1
         )
         script = [
             tool_turn("run_bash", {"command": "python noisy.py"}) + [StreamFinished("tool_calls")]

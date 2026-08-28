@@ -2,7 +2,7 @@
 
 A coding agent, written from scratch. It talks to a language model, reads and
 edits files, runs commands, reads what they printed, and keeps going until the
-task is done or a limit stops it.
+task is done or a safety guard stops it.
 
 No agent framework or SDK is used. The model is reached over raw HTTP; the tool
 schemas, the streaming parser, the conversation history, the context budget, the
@@ -12,15 +12,15 @@ the project.
 ```
 $ cagent "the tests are failing, find out why and fix it"
 
-· step 1/40 · 1,757 tokens (1% of window)
+· step 1 · 1,757 tokens (1% of window)
 ⏺ run_bash(python -m pytest -q, description=see the failure)
   ⎿ ✗ exit 1 (0.68s)
     E       assert -1 == 5
     E        +  where -1 = add(2, 3)
-· step 2/40 · 1,914 tokens (1% of window)
+· step 2 · 1,914 tokens (1% of window)
 ⏺ read_file(calc.py)
   ⎿ ✓ 2 of 2 lines (0.00s)
-· step 3/40 · 1,959 tokens (2% of window)
+· step 3 · 1,959 tokens (2% of window)
 ⏺ edit_file(calc.py, old_string=    return a - b, new_string=    return a + b)
   ⎿ ✓ +1/-1 (0.00s)
     --- a/calc.py
@@ -29,11 +29,11 @@ $ cagent "the tests are failing, find out why and fix it"
      def add(a, b):
     -    return a - b
     +    return a + b
-· step 4/40 · 2,036 tokens (2% of window)
+· step 4 · 2,036 tokens (2% of window)
 ⏺ run_bash(python -m pytest -q, description=confirm green)
   ⎿ ✓ exit 0 (0.63s)
     2 passed in 0.00s
-· step 5/40 · 2,097 tokens (2% of window)
+· step 5 · 2,097 tokens (2% of window)
 
 add subtracted instead of adding (calc.py:2). Fixed and pytest passes.
 
@@ -74,9 +74,8 @@ Anything OpenAI-compatible works — a vendor API, a gateway, a proxy, or a loca
 server. Every key in that table is a field name, and flags of the same name
 (`--base-url`, `--model`) override it for one run: the layers are `~/.cagent.toml`
 → `./.cagent.toml` → flags, later winning. There is no environment layer, on
-purpose — `CAGENT_MAX_STEPS` beside `max_steps` is one setting with two
-spellings, which is one place too many to look when the agent does something
-unexpected.
+purpose: configuration has one spelling and one place to inspect when the agent
+behaves unexpectedly.
 
 Details worth knowing:
 
@@ -383,8 +382,9 @@ wrong job.
 ### Stopping — `agent/guards.py`
 
 An agent that decides its own next action can fail by never stopping, and that
-failure is expensive rather than loud. Three independent bounds: a step ceiling,
-a token budget, and repetition detection.
+failure is expensive rather than loud. There is no arbitrary step ceiling. The
+loop stops when the model returns a final answer, the optional token budget is
+spent, a repeated identical tool call is detected, or the user interrupts it.
 
 Repetition is handled in two stages. A repeated identical call first earns a
 *nudge* — a tool result telling the model it is looping and what to try instead —

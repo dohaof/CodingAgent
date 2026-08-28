@@ -1,10 +1,9 @@
 """Stopping conditions: why the loop is not a ``while True``.
 
 An agent that decides its own next action can fail by never stopping, and the
-failure is expensive rather than loud — it burns tokens looking productive. Three
+failure is expensive rather than loud — it burns tokens looking productive. Two
 independent guards bound a run:
 
-* a step ceiling, for the plain runaway;
 * a token budget, because cost is the resource the user actually feels;
 * repetition detection, for the common live-lock where the model retries an
   identical failing call forever.
@@ -22,7 +21,7 @@ import json
 from dataclasses import dataclass, field
 
 from ..config import AgentConfig
-from ..errors import MaxStepsExceeded, RepetitionDetected, TokenBudgetExceeded
+from ..errors import RepetitionDetected, TokenBudgetExceeded
 from ..types import ToolCallPart
 
 __all__ = ["LoopGuard", "call_signature"]
@@ -65,11 +64,8 @@ class LoopGuard:
         """Account for one more model request.
 
         Raises:
-            MaxStepsExceeded: If the step ceiling is reached.
             TokenBudgetExceeded: If the token budget is already spent.
         """
-        if self.steps >= self.config.max_steps:
-            raise MaxStepsExceeded(self.config.max_steps)
         budget = self.config.token_budget
         if budget is not None and self.tokens_used >= budget:
             raise TokenBudgetExceeded(self.tokens_used, budget)
@@ -117,8 +113,3 @@ class LoopGuard:
         """
         self._last_signature = None
         self._repeats = 0
-
-    @property
-    def remaining_steps(self) -> int:
-        """Steps left before the ceiling."""
-        return max(self.config.max_steps - self.steps, 0)

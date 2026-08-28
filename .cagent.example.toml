@@ -68,7 +68,6 @@ tool_output_tail_lines = 40
 tool_output_max_chars = 20000
 
 # --- loop ------------------------------------------------------------------
-max_steps = 40
 # token_budget = 400000          # unset means no cumulative budget
 max_repeated_calls = 3           # identical calls in a row before the loop stops
 bash_timeout = 120.0

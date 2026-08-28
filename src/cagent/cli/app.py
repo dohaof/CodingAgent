@@ -121,7 +121,6 @@ def build_parser() -> argparse.ArgumentParser:
     endpoint.add_argument("--temperature", type=float, help="sampling temperature")
 
     limits = parser.add_argument_group("limits")
-    limits.add_argument("--max-steps", type=int, help="model requests allowed per task")
     limits.add_argument("--token-budget", type=int, help="stop after this many tokens")
     limits.add_argument("--context-window", type=int, help="model's context window, for compaction")
     limits.add_argument("--bash-timeout", type=float, help="seconds before a command is killed")
@@ -195,7 +194,6 @@ def _overrides(args: argparse.Namespace) -> dict[str, object]:
         "base_url": args.base_url,
         "wire": args.wire,
         "temperature": args.temperature,
-        "max_steps": args.max_steps,
         "token_budget": args.token_budget,
         "context_window": args.context_window,
         "bash_timeout": args.bash_timeout,
@@ -607,7 +605,6 @@ def _show_config(console: Console, config: AgentConfig) -> int:
         "sandbox": f"{config.sandbox_mode} ({config.sandbox_sync})",
         "context window": f"{config.context_window:,}",
         "compact at": f"{config.compact_at_tokens:,} tokens",
-        "max steps": str(config.max_steps),
         "token budget": str(config.token_budget or "unlimited"),
         "bash timeout": f"{config.bash_timeout:g}s",
         "fuzzy threshold": f"{config.fuzzy_threshold:.2f}",

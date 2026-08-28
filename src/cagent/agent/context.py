@@ -173,6 +173,12 @@ class ContextManager:
                 continue
             applied.append(stage)
             self.compactions += 1
+            # A generated progress note is valuable context in its own right.
+            # Do not immediately discard it when the protected recent history
+            # leaves the estimate a little above the target; a later pass can
+            # drop it if the window is still under pressure.
+            if stage == "summarise":
+                break
             if self.token_count() <= target:
                 break
 
@@ -234,17 +240,32 @@ class ContextManager:
         The result parts stay in place with shortened content, so every call
         keeps its answer and the wire format stays valid. This is the cheapest
         stage and usually the only one needed, because tool output dominates.
+
+        The configured recent window is a preference, not a reason to leave the
+        request over budget. If eliding the strictly old blocks is insufficient,
+        progressively elide the oldest blocks in that recent window while
+        preserving the latest block verbatim. This keeps the state most useful
+        for the next request and avoids an unnecessary drop/summarise escalation
+        for a transcript that is only slightly over the target.
         """
-        compactable, _ = self._protected_split()
-        if not compactable:
+        compactable, protected = self._protected_split()
+        if not compactable and len(protected) <= 2:
             return False
 
         changed = False
-        for block in compactable:
+        # Oldest history is always the first thing to elide.
+        candidates = list(compactable)
+        # If that was not enough, consume the older part of the protected
+        # recent window. The first block is the original task and the final
+        # block is the state immediately preceding the next model request.
+        candidates.extend(protected[1:-1])
+
+        for block in candidates:
             for message in block.messages:
                 if message.role != "tool":
                     continue
                 new_parts: list[ToolResultPart] = []
+                message_changed = False
                 for part in message.tool_results:
                     shortened = self._elide(part.content)
                     if shortened == part.content:
@@ -258,9 +279,12 @@ class ContextManager:
                         )
                     )
                     changed = True
-                if changed:
+                    message_changed = True
+                if message_changed:
                     message.parts = list(new_parts)
                     message.token_estimate = None
+            if self.token_count() <= self.config.compact_at_tokens:
+                break
         return changed
 
     @staticmethod

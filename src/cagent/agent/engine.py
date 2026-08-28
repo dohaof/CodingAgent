@@ -274,7 +274,6 @@ class Agent:
             self._emit(
                 StepStarted(
                     step=step,
-                    max_steps=self.config.max_steps,
                     prompt_tokens_estimate=self.context.token_count(),
                 )
             )
@@ -503,14 +502,9 @@ class Agent:
     @staticmethod
     def _explain_stop(exc: LoopGuardError) -> str:
         """Turn a guard trip into something a user can act on."""
-        from ..errors import MaxStepsExceeded, RepetitionDetected, TokenBudgetExceeded
+        from ..errors import RepetitionDetected, TokenBudgetExceeded
 
         match exc:
-            case MaxStepsExceeded():
-                return (
-                    f"Stopped after the step limit ({exc}). The task may need to be "
-                    "broken into smaller pieces, or run again with a higher --max-steps."
-                )
             case TokenBudgetExceeded():
                 return f"Stopped on the token budget ({exc}). Raise --token-budget to continue."
             case RepetitionDetected():

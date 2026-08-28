@@ -68,7 +68,6 @@ class StepStarted:
     """One iteration of the loop begins: a request is about to be sent."""
 
     step: int
-    max_steps: int
     prompt_tokens_estimate: int
 
 

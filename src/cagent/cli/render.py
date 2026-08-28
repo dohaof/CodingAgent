@@ -175,7 +175,7 @@ class ConsoleRenderer:
             return
         pressure = event.prompt_tokens_estimate / max(self.config.context_window, 1)
         self.console.print(
-            f"[dim]· step {event.step}/{event.max_steps} · "
+            f"[dim]· step {event.step} · "
             f"{event.prompt_tokens_estimate:,} tokens ({pressure:.0%} of window)[/dim]"
         )
         self._start_live()

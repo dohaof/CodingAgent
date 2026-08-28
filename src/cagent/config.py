@@ -7,10 +7,9 @@ names, so there is exactly one name to learn per setting no matter which layer
 sets it.
 
 There is deliberately no environment layer. It would restate every field under
-a second spelling — ``CAGENT_MAX_STEPS`` beside ``max_steps`` — and a setting
-with two spellings is a setting people have to check twice when the agent
-behaves unexpectedly. The file is the one place a setting lives; a flag
-overrides it for a single run.
+another spelling, and a setting with two spellings is a setting people have to
+check twice when the agent behaves unexpectedly. The file is the one place a
+setting lives; a flag overrides it for a single run.
 
 ``cwd`` is injected rather than read from globals so the whole chain is
 unit-testable.
@@ -119,7 +118,6 @@ class AgentConfig:
     tool_output_max_chars: int = 20_000
 
     # loop
-    max_steps: int = 40
     token_budget: int | None = None
     max_repeated_calls: int = 3
     bash_timeout: float = 120.0
@@ -254,7 +252,6 @@ class AgentConfig:
             "tool_output_head_lines",
             "tool_output_tail_lines",
             "tool_output_max_chars",
-            "max_steps",
             "max_repeated_calls",
             "repo_map_token_budget",
         )

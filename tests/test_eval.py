@@ -343,14 +343,14 @@ class TestReporting:
                 elapsed_s=30.0,
                 verify_output="ImportError: cannot import name 'retrieve'",
                 reply="I could not finish.",
-                error="MaxStepsExceeded",
+                error="TokenBudgetExceeded",
             )
         )
         print_report(report)
         out = capsys.readouterr().out
         assert "pass@1: 1/2 (50%)" in out
         assert "sign-error" in out and "two-files" in out
-        assert "MaxStepsExceeded" in out
+        assert "TokenBudgetExceeded" in out
         assert "retrieve" in out  # the failing check's last line
         assert "$" in out  # a rate was configured
         assert "some-model" in out

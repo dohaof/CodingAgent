@@ -52,7 +52,7 @@ class TestArgumentParsing:
         assert build_parser().parse_args([]).task == []
 
     def test_trace_cli_flags_are_removed(self) -> None:
-        for option in ("--replay", "--resume"):
+        for option in ("--replay", "--resume", "--max-steps"):
             with pytest.raises(SystemExit):
                 build_parser().parse_args([option, "trace.jsonl"])
 
@@ -61,14 +61,12 @@ class TestArgumentParsing:
             [
                 "--base-url", "https://api.example.com/v1",
                 "--model", "m",
-                "--max-steps", "7",
                 "task",
             ]
         )
         overrides = _overrides(args)
         assert overrides["base_url"] == "https://api.example.com/v1"
         assert overrides["model"] == "m"
-        assert overrides["max_steps"] == 7
 
     def test_unset_flags_stay_none_so_lower_layers_decide(self) -> None:
         # The loader drops None, which is what lets a config file or environment
@@ -486,9 +484,9 @@ class TestRendering:
     def test_a_step_reports_its_share_of_the_window(self, config, captured) -> None:
         console, buffer = captured
         renderer = ConsoleRenderer(config, console=console)
-        renderer.handle(StepStarted(step=3, max_steps=40, prompt_tokens_estimate=64_000))
+        renderer.handle(StepStarted(step=3, prompt_tokens_estimate=64_000))
         out = buffer.getvalue()
-        assert "step 3/40" in out and "64,000" in out and "50%" in out
+        assert "step 3" in out and "step 3/" not in out and "64,000" in out and "50%" in out
 
     def test_compaction_is_reported_to_the_user(self, config, captured) -> None:
         # Silently shrinking history looks to the user like the model getting confused.
@@ -515,7 +513,7 @@ class TestRendering:
     def test_quiet_suppresses_routine_narration(self, config, captured) -> None:
         console, buffer = captured
         renderer = ConsoleRenderer(config, console=console, quiet=True)
-        renderer.handle(StepStarted(step=1, max_steps=10, prompt_tokens_estimate=100))
+        renderer.handle(StepStarted(step=1, prompt_tokens_estimate=100))
         renderer.handle(
             ToolStarted(
                 call=ToolCallPart(id="c", name="read_file", arguments={}), risk=RiskLevel.SAFE
@@ -601,7 +599,7 @@ class TestRendering:
     def test_settled_prose_is_printed_once(self, config, captured) -> None:
         console, buffer = captured
         renderer = ConsoleRenderer(config, console=console)
-        renderer.handle(StepStarted(step=1, max_steps=5, prompt_tokens_estimate=10))
+        renderer.handle(StepStarted(step=1, prompt_tokens_estimate=10))
         renderer.handle(TextDelta("The answer is 42."))
         renderer.handle(
             StepFinished(

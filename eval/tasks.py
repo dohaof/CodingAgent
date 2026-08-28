@@ -47,7 +47,6 @@ class Task:
     binary_files: dict[str, bytes] = field(default_factory=dict)
     """Files written byte-for-byte, for encoding and line-ending cases."""
 
-    max_steps: int = 20
 
 
 TASKS: tuple[Task, ...] = (

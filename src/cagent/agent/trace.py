@@ -155,7 +155,6 @@ class TraceWriter:
                 "sandbox_mode": config.sandbox_mode,
                 "sandbox_sync": config.sandbox_sync,
                 "context_window": config.context_window,
-                "max_steps": config.max_steps,
             }
         )
 

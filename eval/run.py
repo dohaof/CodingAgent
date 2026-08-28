@@ -243,7 +243,6 @@ def _clone_for(config: AgentConfig, root: Path, task: Task) -> AgentConfig:
     return dataclasses.replace(
         config,
         workspace=root,
-        max_steps=task.max_steps,
         trace_dir=None,
         approval_mode="full-auto",
     )
