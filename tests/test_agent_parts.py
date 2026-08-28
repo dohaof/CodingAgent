@@ -335,6 +335,41 @@ class TestApprovalPolicy:
         policy = ApprovalPolicy(config, prompter=lambda r: Decision(approved=False))
         assert policy.decide(request(RiskLevel.MUTATING)).approved
 
+    @pytest.mark.parametrize(
+        "tool_name", ["write_file", "edit_file", "multi_edit", "apply_patch"]
+    )
+    def test_auto_edit_runs_file_writes_unattended(
+        self, tmp_path: Path, tool_name: str
+    ) -> None:
+        config = AgentConfig(workspace=tmp_path, api_key="k", approval_mode="auto-edit")
+        asked: list[ApprovalRequest] = []
+        policy = ApprovalPolicy(
+            config, prompter=lambda r: (asked.append(r), Decision(approved=False))[1]
+        )
+        edit = ApprovalRequest(
+            tool=tool_name,
+            risk=RiskLevel.MUTATING,
+            summary="edit a file",
+        )
+
+        assert policy.decide(edit).approved
+        assert not asked
+
+    def test_auto_edit_still_asks_for_mutating_shell_commands(self, tmp_path: Path) -> None:
+        config = AgentConfig(workspace=tmp_path, api_key="k", approval_mode="auto-edit")
+        asked: list[ApprovalRequest] = []
+        policy = ApprovalPolicy(
+            config, prompter=lambda r: (asked.append(r), Decision(approved=False))[1]
+        )
+        shell = ApprovalRequest(
+            tool="run_bash",
+            risk=RiskLevel.MUTATING,
+            summary="run tests",
+        )
+
+        assert not policy.decide(shell).approved
+        assert asked == [shell]
+
     def test_no_mode_auto_approves_a_dangerous_call(self, tmp_path: Path) -> None:
         config = AgentConfig(workspace=tmp_path, api_key="k", approval_mode="full-auto")
         asked: list[ApprovalRequest] = []
@@ -400,6 +435,10 @@ class TestApprovalPolicy:
         assert policy.requires_prompt(None) is False
         assert policy.requires_prompt(request(RiskLevel.SAFE)) is False
         assert policy.requires_prompt(request(RiskLevel.MUTATING)) is True
+        edit = ApprovalRequest(
+            tool="edit_file", risk=RiskLevel.MUTATING, summary="edit a file"
+        )
+        assert policy.requires_prompt(edit) is False
         policy.decide(request(RiskLevel.MUTATING, signature="sig"))
         policy.remembered["sig"] = True
         assert policy.requires_prompt(request(RiskLevel.MUTATING, signature="sig")) is False

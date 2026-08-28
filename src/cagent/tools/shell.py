@@ -49,20 +49,32 @@ _SECRET_PATTERN = re.compile(r"(?i)(api[_-]?key|secret|token|passw|credential)")
 _SEGMENT_SPLIT = re.compile(r"[\n;]|&&|\|\||\|")
 """Shell separators, so each stage of a compound command is judged on its own."""
 
+_OUTPUT_REDIRECTION = re.compile(r"(?<!<)(?:\d*>>?|&>)")
+"""Shell output redirection writes even when the command itself is read-only."""
+
 _DANGEROUS_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(r"^\s*sudo\b"),
-    re.compile(r"^\s*rm\b.*\s-[a-z]*[rf]"),
-    re.compile(r"^\s*rm\s+(/|~|\*|\.\.)"),
-    re.compile(r"^\s*rmdir\b.*/s"),
-    re.compile(r"^\s*del\b.*/[sq]"),
-    re.compile(r"^\s*(format|mkfs(\.\w+)?)\b"),
-    re.compile(r"^\s*dd\b.*\bif="),
-    re.compile(r"^\s*(shutdown|reboot|halt|poweroff)\b"),
-    re.compile(r"^\s*git\s+push\b.*(--force\b|\s-f\b)"),
-    re.compile(r"^\s*git\s+reset\b.*--hard"),
-    re.compile(r"^\s*git\s+clean\b.*\s-[a-z]*f"),
-    re.compile(r"^\s*chmod\b.*(-R|--recursive).*777"),
-    re.compile(r">\s*/dev/(sd|nvme|disk)"),
+    re.compile(r"^\s*sudo\b", re.IGNORECASE),
+    # File deletion is irreversible from the agent's point of view, even when
+    # it lacks a recursive or force flag. Include common POSIX, cmd and
+    # PowerShell spellings, plus nested shell invocations.
+    re.compile(r"^\s*(rm|rmdir|del|erase|remove-item|ri)\b", re.IGNORECASE),
+    re.compile(
+        r"^\s*(powershell|pwsh)(\.exe)?\b.*\b(remove-item|del|erase|ri|rm|rmdir)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"^\s*cmd(\.exe)?\s+/[ck]\b.*\b(del|erase|rd|rmdir)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\bfind\b.*\s-delete\b", re.IGNORECASE),
+    re.compile(r"^\s*(format|mkfs(\.\w+)?)\b", re.IGNORECASE),
+    re.compile(r"^\s*dd\b.*\bif=", re.IGNORECASE),
+    re.compile(r"^\s*(shutdown|reboot|halt|poweroff)\b", re.IGNORECASE),
+    re.compile(r"^\s*git\s+push\b.*(--force\b|\s-f\b)", re.IGNORECASE),
+    re.compile(r"^\s*git\s+reset\b.*--hard", re.IGNORECASE),
+    re.compile(r"^\s*git\s+clean\b.*\s-[a-z]*f", re.IGNORECASE),
+    re.compile(r"^\s*chmod\b.*(-R|--recursive).*777", re.IGNORECASE),
+    re.compile(r">\s*/dev/(sd|nvme|disk)", re.IGNORECASE),
     re.compile(r"^\s*:\(\)\s*\{.*\}\s*;?\s*:"),
 )
 """Irreversible or system-level actions. Deliberately matched on the raw text:
@@ -162,6 +174,8 @@ def _classify_segment(segment: str) -> RiskLevel:
         return RiskLevel.SAFE
     if any(pattern.search(text) for pattern in _DANGEROUS_PATTERNS):
         return RiskLevel.DANGEROUS
+    if _OUTPUT_REDIRECTION.search(text):
+        return RiskLevel.MUTATING
 
     tokens = text.split()
     if not tokens:

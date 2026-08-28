@@ -41,7 +41,7 @@ from cagent.llm.base import (
     UsageReport,
 )
 from cagent.llm.base import TextDelta as WireTextDelta
-from cagent.tools.base import ToolOutcome
+from cagent.tools.base import ApprovalRequest, ToolOutcome
 from cagent.tools.registry import ToolRegistry, default_registry, tool
 from cagent.types import RiskLevel, Usage
 from tests.conftest import ScriptedProvider, text_turn, tool_turn
@@ -247,6 +247,52 @@ class TestTheCycle:
 
 
 class TestFailureHandling:
+    def test_auto_edit_executes_edits_but_still_asks_for_shell_writes(
+        self, project: Path
+    ) -> None:
+        config = AgentConfig(
+            workspace=project,
+            api_key="k",
+            base_url="https://api.test.invalid/v1",
+            model="test-model",
+            approval_mode="auto-edit",
+        )
+        asked: list[str] = []
+
+        def refuse(request: ApprovalRequest) -> Decision:
+            asked.append(request.tool)
+            return Decision(approved=False)
+
+        agent, sink, provider = make_agent(
+            config,
+            [
+                tool_turn(
+                    "edit_file",
+                    {
+                        "path": "calc.py",
+                        "old_string": "return a - b",
+                        "new_string": "return a + b",
+                    },
+                )
+                + [StreamFinished("tool_calls")],
+                tool_turn("run_bash", {"command": "echo changed > marker.txt"})
+                + [StreamFinished("tool_calls")],
+                text_turn("done"),
+            ],
+            policy=ApprovalPolicy(config, prompter=refuse),
+        )
+
+        result = agent.run_turn("fix the code and write a marker")
+
+        assert result.completed
+        assert "return a + b" in (project / "calc.py").read_text(encoding="utf-8")
+        assert not (project / "marker.txt").exists()
+        assert asked == ["run_bash"]
+        (prompt,) = sink.of_type(ApprovalRequested)
+        assert prompt.request.tool == "run_bash"
+        assert prompt.request.risk is RiskLevel.MUTATING
+        assert any("declined" in result for result in provider.last_tool_results)
+
     def test_a_refused_call_is_reported_to_the_model_and_changes_nothing(
         self, project: Path
     ) -> None:

@@ -34,6 +34,9 @@ from ..types import RiskLevel
 
 __all__ = ["ApprovalPolicy", "Decision", "Prompter"]
 
+_FILE_WRITE_TOOLS = frozenset({"write_file", "edit_file", "multi_edit", "apply_patch"})
+"""Mutating tools whose effects stay inside the workspace and are reviewable as diffs."""
+
 Prompter = Callable[[ApprovalRequest], "Decision"]
 """Asks the user about one request. Supplied by the UI layer."""
 
@@ -81,7 +84,7 @@ class ApprovalPolicy:
             self.auto_approved += 1
             return Decision(approved=True)
 
-        if self._auto_allows(request.risk):
+        if self._auto_allows(request):
             self.auto_approved += 1
             return Decision(approved=True)
 
@@ -110,25 +113,27 @@ class ApprovalPolicy:
         """
         if request is None or self.prompter is None:
             return False
-        if self._auto_allows(request.risk):
+        if self._auto_allows(request):
             return False
         if request.risk is RiskLevel.DANGEROUS:
             return True
         return (request.signature or request.tool) not in self.remembered
 
-    def _auto_allows(self, risk: RiskLevel) -> bool:
-        """Whether this mode runs ``risk`` without asking."""
-        if risk is RiskLevel.SAFE:
+    def _auto_allows(self, request: ApprovalRequest) -> bool:
+        """Whether this mode runs ``request`` without asking."""
+        if request.risk is RiskLevel.SAFE:
             return True
-        if risk is RiskLevel.DANGEROUS:
+        if request.risk is RiskLevel.DANGEROUS:
             return False
-        return self.config.approval_mode == "full-auto"
+        if self.config.approval_mode == "full-auto":
+            return True
+        return self.allows_unattended_edits() and request.tool in _FILE_WRITE_TOOLS
 
     def allows_unattended_edits(self) -> bool:
         """Whether file edits skip the prompt in the current mode.
 
-        Consulted by the engine rather than by the tools: an edit is judged by
-        where it writes, which is the engine's business, not the file layer's.
+        The request must also come from a known file-writing tool; arbitrary
+        mutating tools, including ``run_bash``, still require confirmation.
         """
         return self.config.approval_mode in ("auto-edit", "full-auto")
 
