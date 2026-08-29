@@ -113,7 +113,8 @@ cagent --list-tools                                  # tools and their arguments
 
 When connected to a terminal, the interactive session opens a full-screen
 interface with a scrollable conversation, a fixed input box, and a small live
-activity line for approval, sandbox, and context state. `Ctrl+C` interrupts the current turn,
+activity line for approval, sandbox, and context state. `Ctrl+C` interrupts the current turn
+and exits after saving the trace,
 `Ctrl+R` opens the saved-conversation picker, `F1` shows help, and `Ctrl+Q`
 exits. Piped or redirected input automatically uses the line-oriented fallback
 so logs remain script-friendly.
@@ -122,7 +123,8 @@ The session details are shown once in a bordered block at the start of the
 conversation rather than occupying a fixed header. The conversation pane is
 read-only but selectable: drag over any user message, model response, command,
 diff, or tool result and press `Ctrl+C` to copy it. With no selected text,
-`Ctrl+C` keeps its normal role of interrupting the active turn.
+`Ctrl+C` keeps its normal role of interrupting the active turn and then exits
+after the partial conversation has been saved.
 
 When a mutating or dangerous tool needs permission, the request and its diff
 are written directly into the conversation. Enter `y`, `n`, `a` (`always`, when
@@ -447,7 +449,9 @@ the long task that needs it.
 
 The first block — the task — is never touched, and the last few steps are kept
 verbatim. An agent that forgets what it was asked will confidently finish the
-wrong job.
+wrong job. If all three stages still leave the history above the configured
+model window, the turn stops with an instruction to increase `--context-window`
+instead of sending a request that will certainly fail.
 
 ### Stopping — `agent/guards.py`
 
@@ -528,7 +532,7 @@ than guessing.
 
 ## Testing
 
-482 tests, hermetic: no network, no real sleeps, no dependence on the machine's
+581 tests, hermetic: no network, no real sleeps, no dependence on the machine's
 PATH. `mypy` clean, `ruff` clean, 86% line coverage.
 
 The interesting choices are in what gets tested. A scripted provider records the

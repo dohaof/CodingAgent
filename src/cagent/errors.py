@@ -18,6 +18,7 @@ __all__ = [
     "CagentError",
     "ConfigError",
     "ContextOverflowError",
+    "ContextWindowTooSmall",
     "LoopGuardError",
     "PathOutsideWorkspaceError",
     "ProviderError",
@@ -85,6 +86,10 @@ class ContextOverflowError(ProviderError):
         self.message = message
         self.required_tokens = required_tokens
         self.window_tokens = window_tokens
+
+
+class ContextWindowTooSmall(CagentError):
+    """History still exceeds the configured compaction target after all stages."""
 
 
 class ResponseParseError(ProviderError):

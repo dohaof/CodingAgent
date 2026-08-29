@@ -24,6 +24,7 @@ app and by the evaluation harness.
 
 from __future__ import annotations
 
+import contextlib
 import threading
 import time
 import uuid
@@ -34,6 +35,8 @@ from typing import Any
 from ..config import AgentConfig
 from ..errors import (
     CagentError,
+    ContextOverflowError,
+    ContextWindowTooSmall,
     LoopGuardError,
     ProviderError,
     ToolError,
@@ -258,6 +261,10 @@ class Agent:
             stopped_by = "aborted"
             reply = str(exc) or "Interrupted."
             self._emit(Warning(reply))
+        except ContextWindowTooSmall as exc:
+            stopped_by = "context_window"
+            reply = str(exc)
+            self._emit(Warning(reply))
         except ProviderError as exc:
             stopped_by = "provider_error"
             reply = f"The model could not be reached: {exc}"
@@ -281,6 +288,7 @@ class Agent:
 
         Returns the model's final prose once it stops requesting tools.
         """
+        overflow_retries = 0
         while True:
             if self.abort.is_set():
                 raise UserAbort("Interrupted.")
@@ -296,14 +304,50 @@ class Agent:
                 )
             )
 
-            result = self.provider.complete(
-                self.context.history,
-                system=self._system,
-                tools=self.registry.specs(),
-                abort=self.abort,
-                on_event=self._forward_stream_event,
-            )
+            try:
+                result = self.provider.complete(
+                    self.context.history,
+                    system=self._system,
+                    tools=self.registry.specs(),
+                    abort=self.abort,
+                    on_event=self._forward_stream_event,
+                )
+            except ContextOverflowError as exc:
+                # Token estimation is intentionally conservative but cannot
+                # know every provider's hidden prompt overhead. Give one
+                # provider-reported overflow a fresh three-stage compaction
+                # attempt; if that still cannot fit, stop with an actionable
+                # window-size message instead of retrying the same request.
+                if self.abort.is_set():
+                    raise UserAbort("Interrupted.") from exc
+                if overflow_retries:
+                    raise ContextWindowTooSmall(
+                        "The model rejected the context after compaction "
+                        f"({exc}). Increase --context-window and retry, or start a new session."
+                    ) from exc
+                overflow_retries += 1
+                report = self.context.compact()
+                current_tokens = self.context.token_count()
+                if report.changed:
+                    self._emit(
+                        CompactionDone(
+                            strategy=report.strategy,
+                            tokens_before=report.tokens_before,
+                            tokens_after=report.tokens_after,
+                            messages_before=report.messages_before,
+                            messages_after=report.messages_after,
+                        )
+                    )
+                if not report.changed or current_tokens > self.config.context_window:
+                    raise ContextWindowTooSmall(
+                        "The model rejected the context and the three compaction stages "
+                        "could not reduce it below the configured window "
+                        f"({self.config.context_window:,} tokens). "
+                        "Increase --context-window and retry, or start a new session."
+                    ) from exc
+                continue
 
+            overflow_retries = 0
             self.usage = self.usage + result.usage
             self.guard.add_tokens(result.usage.total)
             self.context.append(result.message)
@@ -477,23 +521,26 @@ class Agent:
             return
 
         report = self.context.compact()
-        if not report.changed:
+        current_tokens = self.context.token_count()
+        if report.changed:
             self._emit(
-                Warning(
-                    "The context window is full and history cannot be reduced further; "
-                    "the next request may be rejected."
+                CompactionDone(
+                    strategy=report.strategy,
+                    tokens_before=report.tokens_before,
+                    tokens_after=report.tokens_after,
+                    messages_before=report.messages_before,
+                    messages_after=report.messages_after,
                 )
             )
+        if current_tokens <= self.config.context_window:
             return
-        self._emit(
-            CompactionDone(
-                strategy=report.strategy,
-                tokens_before=report.tokens_before,
-                tokens_after=report.tokens_after,
-                messages_before=report.messages_before,
-                messages_after=report.messages_after,
-            )
+        message = (
+            "The context window is too small: history remains at "
+            f"{self.context.token_count():,} estimated tokens after all three "
+            f"compaction stages (window {self.config.context_window:,}). Increase "
+            "--context-window and retry, or start a new session."
         )
+        raise ContextWindowTooSmall(message)
 
     def _summarise(self, messages: Sequence[Message]) -> str:
         """Condense history with a separate, tool-free model call.
@@ -536,6 +583,10 @@ class Agent:
     def interrupt(self) -> None:
         """Ask the run to stop at the next safe point."""
         self.abort.set()
+        # Wake a provider blocked on network I/O immediately. The provider
+        # still emits an ``aborted`` completion so the partial turn is saved.
+        with contextlib.suppress(Exception):
+            self.provider.cancel()
 
     def reset_interrupt(self) -> None:
         """Clear a previous interrupt so the session can continue."""

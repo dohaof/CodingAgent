@@ -909,12 +909,10 @@ class CagentTui(App[int]):
             conversation.action_copy()
             self.notify("Selected text copied", timeout=1.5)
             return
-        if self._busy:
-            self._abort_pending_approval()
-            self.agent.interrupt()
-            self._set_activity("Interrupting at the next safe point")
-        else:
-            self._request_close()
+        # Treat Ctrl+C as a session exit while a turn is running. The
+        # cancellation is still graceful: the worker records its partial
+        # response, then ``_finish_session`` flushes the trace.
+        self._request_close()
 
     def action_quit_session(self) -> None:
         self._request_close()
@@ -974,7 +972,8 @@ class CagentTui(App[int]):
                 and not self.trace.error
                 else None
             )
-            self.agent.finish("finished", trace_path=trace_path)
+            reason = "interrupted" if self.agent.abort.is_set() else "finished"
+            self.agent.finish(reason, trace_path=trace_path)
             if self.trace is not None:
                 self.trace.discard_if_empty()
             self.agent.close()

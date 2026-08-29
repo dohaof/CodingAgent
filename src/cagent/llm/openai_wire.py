@@ -265,6 +265,7 @@ class OpenAIProvider(LLMProvider):
         body = self._build_body(messages, system=system, tools=tools)
         policy = RetryPolicy(max_retries=self.config.max_retries)
         response = with_retries(lambda: self._open_stream(body), policy, abort=abort)
+        self._set_active_response(response)
 
         finish: FinishReason | None = None
         usage: Usage | None = None
@@ -281,10 +282,15 @@ class OpenAIProvider(LLMProvider):
                     _, payload = next(events)
                 except StopIteration:
                     break
-                except httpx.HTTPError as exc:
+                except Exception as exc:  # noqa: BLE001  # cancellation closes the stream
                     # Never reissue mid-stream: replaying half a completion
                     # would corrupt the transcript. The engine decides.
-                    raise TransientProviderError(f"Stream dropped mid-response: {exc}") from exc
+                    if abort is not None and abort.is_set():
+                        yield StreamFinished("aborted")
+                        return
+                    if isinstance(exc, httpx.HTTPError):
+                        raise TransientProviderError(f"Stream dropped mid-response: {exc}") from exc
+                    raise
 
                 choices = payload.get("choices")
                 if isinstance(choices, list):
@@ -302,6 +308,7 @@ class OpenAIProvider(LLMProvider):
                 if isinstance(usage_payload, dict):
                     usage = _parse_usage(usage_payload)
         finally:
+            self._clear_active_response(response)
             response.close()
 
         if usage is not None:

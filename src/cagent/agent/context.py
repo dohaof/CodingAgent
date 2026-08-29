@@ -155,8 +155,9 @@ class ContextManager:
 
         Returns:
             What was done. ``strategy == "none"`` means nothing could be freed —
-            the transcript is already at its floor, and the caller must decide
-            whether to proceed and risk a provider rejection.
+            the transcript is already at its floor. The engine reports an
+            actionable context-window error instead of sending a request that
+            is certain to be rejected.
         """
         tokens_before = self.token_count()
         messages_before = len(self.history)
@@ -173,11 +174,10 @@ class ContextManager:
                 continue
             applied.append(stage)
             self.compactions += 1
-            # A generated progress note is valuable context in its own right.
-            # Do not immediately discard it when the protected recent history
-            # leaves the estimate a little above the target; a later pass can
-            # drop it if the window is still under pressure.
-            if stage == "summarise":
+            # Keep a useful progress note when it fits the actual model window,
+            # even if it remains above the preferred compaction threshold. If
+            # it still exceeds the real window, continue to the final drop rung.
+            if stage == "summarise" and self.token_count() <= self.config.context_window:
                 break
             if self.token_count() <= target:
                 break

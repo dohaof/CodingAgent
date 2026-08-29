@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import shutil
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Annotated
@@ -543,6 +544,27 @@ class TestBuildInvocation:
 
 
 class TestRunBash:
+    def test_abort_kills_a_running_command_promptly(self, make_ctx, tmp_path: Path) -> None:
+        harness = make_ctx(allow_outside_workspace=True)
+        (tmp_path / "hang.py").write_text("import time\ntime.sleep(30)\n", encoding="utf-8")
+        result: list[ToolOutcome] = []
+        started = time.perf_counter()
+
+        def run() -> None:
+            result.append(RunBashTool().invoke({"command": "python hang.py"}, harness.ctx))
+
+        worker = threading.Thread(target=run)
+        worker.start()
+        time.sleep(0.2)
+        harness.ctx.abort.set()
+        worker.join(timeout=5)
+        elapsed = time.perf_counter() - started
+
+        assert not worker.is_alive(), "abort left the shell blocked"
+        assert result and result[0].is_error
+        assert result[0].metadata["interrupted"] is True
+        assert elapsed < 5
+
     def test_host_shell_is_unrestricted_with_workspace_only_file_tools(self, make_ctx) -> None:
         harness = make_ctx()
         outside = harness.ctx.workspace.parent / f"{harness.ctx.workspace.name}-outside.txt"

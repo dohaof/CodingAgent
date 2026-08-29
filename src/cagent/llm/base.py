@@ -19,6 +19,7 @@ import threading
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterator, Sequence
+from contextlib import suppress
 from dataclasses import dataclass, field
 from typing import ClassVar
 
@@ -274,6 +275,42 @@ class LLMProvider(ABC):
         self.config = config
         self._owns_client = client is None
         self._client = client if client is not None else self._build_client(config)
+        # ``httpx`` does not expose a cancellation token for an open stream.
+        # Keep the response handle so Ctrl+C can close it from the UI thread
+        # while the worker is blocked in ``iter_lines``.
+        self._active_response: httpx.Response | None = None
+        self._active_response_lock = threading.Lock()
+
+    def _set_active_response(self, response: httpx.Response) -> None:
+        with self._active_response_lock:
+            self._active_response = response
+
+    def _clear_active_response(self, response: httpx.Response) -> None:
+        with self._active_response_lock:
+            if self._active_response is response:
+                self._active_response = None
+
+    def cancel(self) -> None:
+        """Cancel the currently streamed response, if one is active.
+
+        Closing a response is idempotent and wakes ``iter_lines`` in the
+        worker thread. Providers that are only test doubles need not call the
+        base initializer; ``getattr`` keeps this hook harmless for them.
+        """
+        lock = getattr(self, "_active_response_lock", None)
+        if lock is None:
+            return
+        with lock:
+            response = self._active_response
+        if response is not None:
+            with suppress(Exception):
+                response.close()
+        elif self._owns_client:
+            # During DNS/connect, httpx has not produced a Response yet. The
+            # owned client is disposable for this session, so closing it wakes
+            # a blocked ``send`` just like closing an active response.
+            with suppress(Exception):
+                self._client.close()
 
     @staticmethod
     def _build_client(config: AgentConfig) -> httpx.Client:
@@ -365,10 +402,13 @@ class LLMProvider(ABC):
         tool_parts = calls.finish()
         parts.extend(tool_parts)
 
-        if not saw_finish:
-            if aborted:
-                reason = "aborted"
-            elif not parts:
+        if aborted:
+            # A close race can deliver a normal finish frame after Ctrl+C.
+            # The user's cancellation must win so the engine performs its
+            # interrupted-turn and trace-finalisation path.
+            reason = "aborted"
+        elif not saw_finish:
+            if not parts:
                 raise UserAbort("Provider stream ended without producing any content.")
             else:
                 # Content but no terminator: trust the content and let the loop
@@ -413,4 +453,3 @@ class LLMProvider(ABC):
 
     def __exit__(self, *exc: object) -> None:
         self.close()
-

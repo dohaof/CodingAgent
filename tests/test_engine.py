@@ -677,11 +677,12 @@ class TestContextPressure:
         ] + [text_turn("done")]
 
         agent, sink, provider = make_agent(config, script)
-        agent.run_turn("generate a lot of output")
+        result = agent.run_turn("generate a lot of output")
 
         compactions = sink.of_type(CompactionDone)
-        assert compactions, "the window filled but nothing was compacted"
-        assert compactions[0].tokens_after < compactions[0].tokens_before
+        assert not compactions
+        assert result.stopped_by == "context_window"
+        assert any("Increase --context-window" in event.message for event in sink.of_type(Warning))
         assert provider.pairing_is_valid(), "compaction broke call/result pairing"
 
     def test_the_task_survives_compaction(self, project: Path) -> None:
@@ -701,8 +702,9 @@ class TestContextPressure:
         ] + [text_turn("done")]
 
         agent, _, provider = make_agent(config, script)
-        agent.run_turn("REMEMBER THIS TASK: tidy the noisy output")
-        assert "REMEMBER THIS TASK" in provider.requests[-1][0].text
+        result = agent.run_turn("REMEMBER THIS TASK: tidy the noisy output")
+        assert result.stopped_by == "context_window"
+        assert "REMEMBER THIS TASK" in agent.context.history[0].text
 
     def test_the_repo_map_is_rebuilt_after_the_agent_writes(self, project: Path) -> None:
         # A map that still describes the tree as it was is worse than none.

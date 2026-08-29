@@ -269,6 +269,7 @@ class AnthropicProvider(LLMProvider):
         body = self._build_body(messages, system=system, tools=tools)
         policy = RetryPolicy(max_retries=self.config.max_retries)
         response = with_retries(lambda: self._open_stream(body), policy, abort=abort)
+        self._set_active_response(response)
 
         input_tokens = 0
         cached_tokens = 0
@@ -297,10 +298,15 @@ class AnthropicProvider(LLMProvider):
                     event_name, payload = next(events)
                 except StopIteration:
                     break
-                except httpx.HTTPError as exc:
+                except Exception as exc:  # noqa: BLE001  # cancellation closes the stream
                     # Never reissue mid-stream: replaying half a completion
                     # would corrupt the transcript. The engine decides.
-                    raise TransientProviderError(f"Stream dropped mid-response: {exc}") from exc
+                    if abort is not None and abort.is_set():
+                        yield StreamFinished("aborted")
+                        return
+                    if isinstance(exc, httpx.HTTPError):
+                        raise TransientProviderError(f"Stream dropped mid-response: {exc}") from exc
+                    raise
 
                 kind = event_name if event_name != "message" else str(payload.get("type", ""))
 
@@ -346,6 +352,7 @@ class AnthropicProvider(LLMProvider):
                     raise _stream_error(payload)
                 # ping and unknown events are ignored.
         finally:
+            self._clear_active_response(response)
             response.close()
 
         # Connection closed without message_stop: report what arrived and

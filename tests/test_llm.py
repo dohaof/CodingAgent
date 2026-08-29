@@ -309,6 +309,13 @@ class TestTokenEstimation:
 
 
 class TestStreamAssembly:
+    def test_abort_wins_over_a_racing_normal_finish(self, config, scripted) -> None:
+        abort = threading.Event()
+        abort.set()
+        provider = scripted(config, [[TextDelta("partial"), StreamFinished("stop")]])
+        result = provider.complete([Message.user("hi")], system="", abort=abort)
+        assert result.finish_reason == "aborted"
+
     def test_complete_assembles_parts_and_usage(self, config, scripted) -> None:
         provider = scripted(
             config,

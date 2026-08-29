@@ -365,10 +365,10 @@ def _run_session(
             if trace is not None and trace.has_user_message and not trace.error
             else None
         )
-        agent.finish(
-            "finished" if exit_code == 0 else "incomplete",
-            trace_path=trace_path,
+        reason = "interrupted" if agent.abort.is_set() else (
+            "finished" if exit_code == 0 else "incomplete"
         )
+        agent.finish(reason, trace_path=trace_path)
         if trace is not None:
             trace.discard_if_empty()
         agent.close()
@@ -421,6 +421,11 @@ def _repl(console: Console, agent: Agent, config: AgentConfig) -> int:
 
         agent.reset_interrupt()
         result = agent.run_turn(text)
+        # A Ctrl+C during a turn requests a graceful session exit. The agent
+        # has already appended the partial history; the caller's finally
+        # block now writes the closing trace record before returning.
+        if agent.abort.is_set():
+            return 0
         if not result.completed:
             console.print(f"[dim](turn ended: {result.stopped_by})[/dim]")
 

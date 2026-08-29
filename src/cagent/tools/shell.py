@@ -24,6 +24,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -44,6 +45,7 @@ __all__ = [
 ]
 
 _POSIX = sys.platform != "win32"
+_ABORT_POLL_SECONDS = 0.1
 
 _SECRET_PATTERN = re.compile(r"(?i)(api[_-]?key|secret|token|passw|credential)")
 """Environment variable names withheld from the child process."""
@@ -409,6 +411,52 @@ def _render(exit_code: int | None, stdout: str, stderr: str, *, prefix: str = ""
     return "\n".join(sections)
 
 
+def _communicate_with_watch(
+    process: subprocess.Popen[bytes],
+    *,
+    timeout: float | None,
+    abort: threading.Event,
+) -> tuple[bytes, bytes, bool, bool]:
+    """Drain a process while watching both timeout and user cancellation.
+
+    ``Popen.communicate`` has no abort callback. Running its pipe readers in a
+    daemon thread lets the caller poll without blocking, while killing the
+    process tree releases inherited pipes before the thread is joined.
+    """
+    output: dict[str, bytes] = {"stdout": b"", "stderr": b""}
+    done = threading.Event()
+
+    def drain() -> None:
+        try:
+            stdout, stderr = process.communicate()
+            output["stdout"] = stdout or b""
+            output["stderr"] = stderr or b""
+        except (ValueError, OSError):
+            pass
+        finally:
+            done.set()
+
+    threading.Thread(target=drain, name="cagent-process-drain", daemon=True).start()
+    deadline = time.monotonic() + timeout if timeout is not None else None
+    timed_out = False
+    interrupted = False
+    while not done.wait(_ABORT_POLL_SECONDS):
+        if abort.is_set():
+            interrupted = True
+            kill_process_tree(process)
+            break
+        if deadline is not None and time.monotonic() >= deadline:
+            timed_out = True
+            kill_process_tree(process)
+            break
+
+    # Normal completion has already populated the buffers. After a kill, give
+    # descendants a bounded moment to release inherited stdout/stderr pipes.
+    if not done.is_set():
+        done.wait(5.0)
+    return output["stdout"], output["stderr"], timed_out, interrupted
+
+
 @dataclass
 class RunBashParams:
     """Arguments for :class:`RunBashTool`."""
@@ -497,24 +545,24 @@ class RunBashTool(BaseTool):
                 },
             )
 
-        timed_out = False
-        try:
-            stdout_bytes, stderr_bytes = process.communicate(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            kill_process_tree(process)
-            if container_name is not None and ctx.sandbox is not None:
-                # A killed ``docker exec`` client can leave the command
-                # running in the container.  Recycle the container so a
-                # timed-out process cannot survive into the next tool call.
-                ctx.sandbox.stop_container()
-            stdout_bytes, stderr_bytes = self._drain(process)
+        stdout_bytes, stderr_bytes, timed_out, interrupted = _communicate_with_watch(
+            process, timeout=timeout, abort=ctx.abort
+        )
+        if (timed_out or interrupted) and container_name is not None and ctx.sandbox is not None:
+            # A killed ``docker exec`` client can leave the command running in
+            # the container. Recycle it before returning.
+            ctx.sandbox.stop_container()
         duration = time.perf_counter() - started
 
         stdout = decode_subprocess_output(stdout_bytes)
         stderr = decode_subprocess_output(stderr_bytes)
         exit_code = None if timed_out else process.returncode
-        prefix = f"Command timed out after {timeout:g}s and was killed." if timed_out else ""
+        if interrupted:
+            prefix = "Command interrupted by the user and killed."
+        elif timed_out:
+            prefix = f"Command timed out after {timeout:g}s and was killed."
+        else:
+            prefix = ""
         body = _render(exit_code, stdout, stderr, prefix=prefix)
         body, truncated = truncate_output(
             body,
@@ -528,6 +576,7 @@ class RunBashTool(BaseTool):
             "exit_code": exit_code,
             "duration_s": round(duration, 3),
             "timeout": timed_out,
+            "interrupted": interrupted,
             "shell_access": "container" if ctx.sandbox is not None else "host-unrestricted",
         }
         if ctx.sandbox is not None:
