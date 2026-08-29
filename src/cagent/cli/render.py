@@ -20,6 +20,7 @@ follow what changed without the model spending tokens narrating it.
 from __future__ import annotations
 
 import shutil
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import TextIO
 
@@ -27,6 +28,7 @@ from rich.console import Console, Group
 from rich.live import Live
 from rich.markdown import Markdown
 from rich.panel import Panel
+from rich.rule import Rule
 from rich.syntax import Syntax
 from rich.table import Table
 from rich.text import Text
@@ -51,10 +53,15 @@ from ..agent.events import (
 )
 from ..config import AgentConfig
 from ..tools.base import ApprovalRequest
-from ..types import RiskLevel, ToolCallPart
+from ..types import Message, RiskLevel, TextPart, ThinkingPart, ToolCallPart, ToolResultPart
 from .pricing import estimate_cost, parse_prices
 
-__all__ = ["ConsoleRenderer", "prompt_for_approval"]
+__all__ = [
+    "ConsoleRenderer",
+    "prompt_for_approval",
+    "render_restored_history",
+    "restored_history_renderables",
+]
 
 _RISK_STYLE = {
     RiskLevel.SAFE: "green",
@@ -65,6 +72,8 @@ _RISK_STYLE = {
 _MAX_ARG_CHARS = 68
 _MAX_RESULT_LINES = 12
 _MAX_DIFF_LINES = 40
+_MAX_RESTORED_DETAIL_LINES = 12
+_MAX_RESTORED_LINE_CHARS = 240
 
 
 def _format_arguments(call: ToolCallPart) -> str:
@@ -83,6 +92,98 @@ def _format_arguments(call: ToolCallPart) -> str:
             text = text[:_MAX_ARG_CHARS] + "…"
         parts.append(text if key in ("path", "command", "pattern") else f"{key}={text}")
     return ", ".join(parts)
+
+
+def _restored_detail(text: str, *, style: str = "dim") -> list[Text]:
+    """Build a bounded tool/thinking excerpt without hiding that it was clipped."""
+    rendered: list[Text] = []
+    lines = text.strip().splitlines()
+    shown = lines[:_MAX_RESTORED_DETAIL_LINES]
+    for line in shown:
+        clipped = (
+            line
+            if len(line) <= _MAX_RESTORED_LINE_CHARS
+            else line[: _MAX_RESTORED_LINE_CHARS - 3] + "..."
+        )
+        rendered.append(Text("    " + clipped, style=style))
+    if len(lines) > _MAX_RESTORED_DETAIL_LINES:
+        rendered.append(
+            Text(
+                f"    [{len(lines) - _MAX_RESTORED_DETAIL_LINES} more lines retained in context]",
+                style="dim italic",
+            )
+        )
+    return rendered
+
+
+def restored_history_renderables(
+    messages: Sequence[Message],
+    *,
+    session_id: str,
+) -> list[Text | Markdown | Rule]:
+    """Build the transcript that replaces the active model context."""
+    rendered: list[Text | Markdown | Rule] = [
+        Rule(Text(f"Restored context: {session_id}", style="bold green"), style="green"),
+        Text(
+            "The transcript below now replaces the active conversation context.",
+            style="dim",
+        ),
+    ]
+
+    call_names: dict[str, str] = {}
+    for message in messages:
+        if message.role == "user":
+            rendered.append(Text("user", style="bold cyan"))
+            if message.text:
+                rendered.append(Text(message.text))
+            continue
+
+        if message.role == "system":
+            rendered.append(Text("system", style="bold magenta"))
+            if message.text:
+                rendered.append(Text(message.text, style="dim"))
+            continue
+
+        if message.role == "assistant":
+            rendered.append(Text("assistant", style="bold green"))
+            for part in message.parts:
+                if isinstance(part, TextPart) and part.text.strip():
+                    rendered.append(Markdown(part.text.strip()))
+                elif isinstance(part, ThinkingPart) and part.text.strip():
+                    rendered.append(Text("  thinking", style="dim italic"))
+                    rendered.extend(_restored_detail(part.text, style="dim italic"))
+                elif isinstance(part, ToolCallPart):
+                    call_names[part.id] = part.name
+                    arguments = _format_arguments(part)
+                    suffix = f"({arguments})" if arguments else "()"
+                    rendered.append(Text(f"  tool call: {part.name}{suffix}", style="yellow"))
+            continue
+
+        for part in message.parts:
+            if not isinstance(part, ToolResultPart):
+                continue
+            name = call_names.get(part.call_id, part.call_id)
+            style = "red" if part.is_error else "dim"
+            state = "error" if part.is_error else "result"
+            rendered.append(Text(f"tool {state}: {name}", style=style))
+            if part.content.strip():
+                rendered.extend(_restored_detail(part.content, style=style))
+
+    rendered.append(
+        Rule(Text("Live conversation continues from here", style="bold green"), style="green")
+    )
+    return rendered
+
+
+def render_restored_history(
+    console: Console,
+    messages: Sequence[Message],
+    *,
+    session_id: str,
+) -> None:
+    """Show the transcript that has just replaced the active model context."""
+    for renderable in restored_history_renderables(messages, session_id=session_id):
+        console.print(renderable)
 
 
 @dataclass(slots=True)

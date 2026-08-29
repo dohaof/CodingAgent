@@ -107,9 +107,28 @@ when you need it.
 
 ```bash
 cagent "add a --json flag to the report command"     # one task
-cagent                                               # interactive session
+cagent                                               # full-screen interactive session
 cagent --list-tools                                  # tools and their arguments
 ```
+
+When connected to a terminal, the interactive session opens a full-screen
+interface with a scrollable conversation, a fixed input box, and a small live
+activity line for approval, sandbox, and context state. `Ctrl+C` interrupts the current turn,
+`Ctrl+R` opens the saved-conversation picker, `F1` shows help, and `Ctrl+Q`
+exits. Piped or redirected input automatically uses the line-oriented fallback
+so logs remain script-friendly.
+
+The session details are shown once in a bordered block at the start of the
+conversation rather than occupying a fixed header. The conversation pane is
+read-only but selectable: drag over any user message, model response, command,
+diff, or tool result and press `Ctrl+C` to copy it. With no selected text,
+`Ctrl+C` keeps its normal role of interrupting the active turn.
+
+When a mutating or dangerous tool needs permission, the request and its diff
+are written directly into the conversation. Enter `y`, `n`, `a` (`always`, when
+offered), or `q` (`quit`) in the input box; an empty answer is the same as `y`.
+Model text streams into the conversation as it arrives, so it can be selected
+without waiting for the turn to finish.
 
 To continue a previous conversation, start an interactive session with `cagent`,
 then enter `/resume`. The agent lists saved conversations from the current
@@ -164,7 +183,10 @@ request. A partially interrupted session is listed only when its trace still
 contains provider-valid conversation history.
 
 This replaces the current conversation history with the messages recorded in
-the trace and keeps using the current workspace and configuration. It does not
+the trace and keeps using the current workspace and configuration. In the
+full-screen interface, the conversation pane is cleared and rebuilt with a
+`Restored context` marker followed by a `Live conversation continues from here`
+marker, so the boundary is visible without opening the JSONL file. It does not
 restore the old container, unsynchronised sandbox files, or approval state.
 
 #### 交互式沙箱

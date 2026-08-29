@@ -16,7 +16,6 @@ import contextlib
 import datetime as dt
 import signal
 import sys
-from dataclasses import dataclass
 from pathlib import Path
 from types import FrameType
 from typing import NoReturn
@@ -34,7 +33,12 @@ from ..agent.trace import TraceWriter, history_from_trace, read_trace
 from ..config import AgentConfig, load_config
 from ..errors import CagentError, ConfigError
 from ..tools.registry import default_registry
-from .render import ConsoleRenderer, prompt_for_approval
+from .render import ConsoleRenderer, prompt_for_approval, render_restored_history
+from .resume import TraceChoice as _TraceChoice
+from .resume import find_trace_choices as _find_trace_choices
+from .resume import first_user_prompt as _first_user_prompt
+from .resume import resolve_trace_reference as _resolve_trace_reference
+from .resume import resume_trace_dir as _resume_trace_dir
 
 __all__ = ["main"]
 
@@ -42,7 +46,9 @@ _BANNER_HELP = """\
 Commands: /help <instruct>  /tools  /cost  /context  /approve <mode>
           /sandbox  /resume [ID|PATH]  /clear  /trace  /exit
 Use /help <instruct> for details about one command.
-Ctrl-C interrupts the current task; Ctrl-C again at the prompt exits."""
+Full-screen TTY: Ctrl+C copies a selection or interrupts; Ctrl+R resumes;
+F1 helps; Ctrl+Q exits.
+Ctrl-C again at the prompt exits in the line-oriented fallback."""
 
 _RESUME_HELP = """\
 Conversation recovery
@@ -290,6 +296,29 @@ def _run_session(
     sink = FanOutSink([renderer])
 
     interactive = not task
+    if interactive and sys.stdin.isatty() and sys.stdout.isatty() and not args.quiet:
+        try:
+            from .tui import run_tui_session
+        except ModuleNotFoundError as exc:
+            if exc.name != "textual":
+                raise
+            console.print(
+                "[red]Interactive TUI dependency is missing:[/red] textual\n"
+                "[dim]Install the project again in this virtual environment with "
+                "'.\\venv\\Scripts\\python.exe -m pip install -e .' "
+                "or 'python -m pip install textual'.[/dim]"
+            )
+            return 2
+
+        try:
+            return run_tui_session(
+                config,
+                quiet=args.quiet,
+                show_thinking=not args.no_thinking,
+            )
+        except CagentError as exc:
+            console.print(f"[red]{type(exc).__name__}:[/red] {exc}")
+            return 2
     policy = ApprovalPolicy(
         config,
         prompter=(lambda request: prompt_for_approval(console, request))
@@ -434,7 +463,9 @@ def _command(console: Console, agent: Agent, config: AgentConfig, line: str) -> 
 _HELP_TOPICS = {
     "help": (
         "Help",
-        "Use /help for the command list, or /help <instruct> for one command's details.",
+        "Use /help for the command list, or /help <instruct> for one command's details.\n\n"
+        "In a terminal, Ctrl+C copies selected conversation text or interrupts, "
+        "Ctrl+R resumes, F1 opens this help, and Ctrl+Q exits.",
         "dim",
     ),
     "resume": ("Resume", _RESUME_HELP, "green"),
@@ -569,107 +600,8 @@ def _resume_command(
         if isinstance(sink, TraceWriter):
             sink.record_history(history)
             break
+    render_restored_history(console, history, session_id=path.stem)
     console.print(f"[dim]resumed {len(history)} message(s) from {path}[/dim]")
-
-
-@dataclass(frozen=True, slots=True)
-class _TraceChoice:
-    """A restorable trace and the small amount of metadata shown in the picker."""
-
-    path: Path
-    session_id: str
-    modified: float
-    prompt: str
-    steps: int
-    status: str
-
-
-def _resume_trace_dir(config: AgentConfig) -> Path:
-    """Return the directory used by the current session's trace writer."""
-    return (config.trace_dir or config.workspace / ".cagent" / "traces").expanduser().resolve()
-
-
-def _find_trace_choices(trace_dir: Path) -> list[_TraceChoice]:
-    """Scan the trace directory for conversations that contain usable history."""
-    if not trace_dir.is_dir():
-        return []
-
-    choices: list[_TraceChoice] = []
-    for path in trace_dir.glob("*.jsonl"):
-        try:
-            records = read_trace(path)
-            modified = path.stat().st_mtime
-        except OSError:
-            continue
-        if not records or not _first_user_prompt(records) or not history_from_trace(records):
-            continue
-
-        session = next(
-            (record for record in records if record.get("type") == "session"), {}
-        )
-        prompt = _first_user_prompt(records) or "(no user prompt)"
-        finished = next(
-            (
-                record
-                for record in reversed(records)
-                if record.get("type") == "run_finished"
-            ),
-            {},
-        )
-        step_records = [record for record in records if record.get("type") == "step_finished"]
-        raw_steps = finished.get("steps", len(step_records))
-        steps = int(raw_steps) if isinstance(raw_steps, int | float) else len(step_records)
-        raw_status = finished.get("reason")
-        status = str(raw_status) if isinstance(raw_status, str) else "in progress"
-        raw_session = session.get("session_id")
-        session_id = (
-            raw_session
-            if isinstance(raw_session, str) and raw_session
-            else path.stem
-        )
-        choices.append(
-            _TraceChoice(
-                path=path,
-                session_id=session_id,
-                modified=modified,
-                prompt=prompt,
-                steps=steps,
-                status=status,
-            )
-        )
-
-    return sorted(choices, key=lambda choice: choice.modified, reverse=True)
-
-
-def _first_user_prompt(records: list[dict[str, object]]) -> str | None:
-    """Return the first non-empty user turn, if the trace has one."""
-    for record in records:
-        if record.get("type") != "user":
-            continue
-        text = record.get("text")
-        if isinstance(text, str) and text.strip():
-            return text
-    return None
-
-
-def _resolve_trace_reference(reference: str, trace_dir: Path) -> Path | None:
-    """Resolve a full path, filename, or short session ID to a trace file."""
-    candidate = Path(reference).expanduser()
-    if candidate.is_file():
-        return candidate.resolve()
-
-    name = candidate.name
-    names = [name]
-    if not name.lower().endswith(".jsonl"):
-        names.append(f"{name}.jsonl")
-    for item in names:
-        exact = trace_dir / item
-        if exact.is_file():
-            return exact.resolve()
-
-    # Accept a unique prefix, which is useful when IDs are long UUIDs.
-    matches = [path for path in trace_dir.glob("*.jsonl") if path.stem.startswith(name)]
-    return matches[0].resolve() if len(matches) == 1 else None
 
 
 def _pick_trace(

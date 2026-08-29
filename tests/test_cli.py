@@ -14,6 +14,8 @@ from pathlib import Path
 
 import pytest
 from rich.console import Console
+from rich.text import Text
+from textual.widgets import TextArea
 
 from cagent.agent.approval import Decision
 from cagent.agent.events import (
@@ -31,6 +33,7 @@ from cagent.agent.events import (
 from cagent.cli.app import _command, _overrides, _print_help, build_parser, main
 from cagent.cli.pricing import Price, estimate_cost, parse_prices, price_for
 from cagent.cli.render import ConsoleRenderer, prompt_for_approval
+from cagent.cli.tui import CagentTui, TranscriptTextArea, _ApprovalWaiter
 from cagent.config import AgentConfig
 from cagent.tools.base import ApprovalRequest, ToolOutcome
 from cagent.types import Message, RiskLevel, TextPart, ToolCallPart, Usage
@@ -216,7 +219,10 @@ class TestInformationalCommands:
         _command(console, agent, config, f"/resume {trace}")  # type: ignore[arg-type]
 
         assert [message.text for message in agent.restored] == ["old task", "old answer"]
-        assert "resumed 2 message(s)" in buffer.getvalue()
+        out = buffer.getvalue()
+        assert "Restored context" in out and "old task" in out and "old answer" in out
+        assert "Live conversation continues from here" in out
+        assert "resumed 2 message(s)" in out
 
     def test_resume_without_argument_presents_recent_traces(
         self, captured, tmp_path: Path, monkeypatch
@@ -723,6 +729,237 @@ class TestRendering:
             )
         )
         assert buffer.getvalue().count("The answer is 42.") == 1
+
+
+class TestTui:
+    def test_full_screen_app_mounts_headlessly(self, config: AgentConfig) -> None:
+        class SmokeApp(CagentTui):
+            mounted_ok = False
+
+            def on_mount(self) -> None:
+                super().on_mount()
+                self.mounted_ok = bool(self.query_one("#conversation")) and bool(
+                    self.query_one("#composer")
+                )
+                self.exit(result=7)
+
+        app = SmokeApp(config)
+        try:
+            assert app.run(headless=True, size=(100, 30)) == 7
+            assert app.mounted_ok
+        finally:
+            app.emergency_close()
+
+    def test_startup_status_is_rendered_as_selectable_transcript_panel(
+        self, config: AgentConfig
+    ) -> None:
+        class StartupApp(CagentTui):
+            def on_mount(self) -> None:
+                super().on_mount()
+                self._render_event(
+                    RunStarted(
+                        task="(interactive)",
+                        model="test-model",
+                        endpoint="https://api.test.invalid/v1",
+                        system_tokens=1200,
+                        tool_names=("read_file", "edit_file"),
+                    )
+                )
+                transcript = self.query_one("#conversation", TextArea)
+                assert "test-model" in transcript.text
+                assert "https://api.test.invalid/v1" in transcript.text
+                assert "workspace" in transcript.text
+                assert "read_file" in transcript.text
+                self.exit(result=0)
+
+        app = StartupApp(config)
+        try:
+            assert app.run(headless=True, size=(100, 30)) == 0
+        finally:
+            app.emergency_close()
+
+    def test_transcript_preserves_semantic_colors_for_roles_tools_and_diffs(self) -> None:
+        transcript = TranscriptTextArea(
+            "user\nassistant\ntool: edit_file(path)\n--- a/app.py\n+++ b/app.py\n-old\n+new",
+            read_only=True,
+        )
+        assert str(transcript.get_line(0).spans[0].style) == "bold cyan"
+        assert str(transcript.get_line(1).spans[0].style) == "bold green"
+        assert str(transcript.get_line(2).spans[0].style) == "bold yellow"
+        assert str(transcript.get_line(3).spans[0].style) == "red"
+        assert str(transcript.get_line(4).spans[0].style) == "green"
+        assert str(transcript.get_line(5).spans[0].style) == "red"
+        assert str(transcript.get_line(6).spans[0].style) == "green"
+
+    def test_tool_events_are_written_with_distinguishable_transcript_labels(
+        self, config: AgentConfig
+    ) -> None:
+        class ToolApp(CagentTui):
+            def on_mount(self) -> None:
+                super().on_mount()
+                self._render_event(
+                    ToolStarted(
+                        call=ToolCallPart(
+                            id="call-1", name="read_file", arguments={"path": "add.py"}
+                        ),
+                        risk=RiskLevel.SAFE,
+                    )
+                )
+                conversation = self.query_one("#conversation", TextArea)
+                assert "tool: read_file(add.py)" in conversation.text
+                assert str(conversation.get_line(0).spans[0].style) == "bold yellow"
+                self._render_event(
+                    ToolFinished(
+                        call=ToolCallPart(
+                            id="call-1", name="read_file", arguments={"path": "add.py"}
+                        ),
+                        outcome=ToolOutcome.ok("content"),
+                        duration_s=0.01,
+                    )
+                )
+                assert "tool result: content" in conversation.text
+                assert str(conversation.get_line(1).spans[0].style) == "bold green"
+                self.exit(result=0)
+
+        app = ToolApp(config)
+        try:
+            assert app.run(headless=True, size=(100, 30)) == 0
+        finally:
+            app.emergency_close()
+
+    def test_approval_is_inline_and_uses_y_n_always_quit(self, config: AgentConfig) -> None:
+        class ApprovalApp(CagentTui):
+            waiter = _ApprovalWaiter()
+
+            def on_mount(self) -> None:
+                super().on_mount()
+                request = ApprovalRequest(
+                    tool="edit_file",
+                    risk=RiskLevel.MUTATING,
+                    summary="update add.py",
+                    detail="--- a/add.py\n+++ b/add.py\n-old\n+new",
+                )
+                self._show_approval(request, self.waiter)
+                transcript = self.query_one("#conversation", TextArea)
+                assert "mutating · edit_file" in transcript.text
+                assert "[y]es  [n]o  [a]lways  [q]uit" in transcript.text
+                assert not self.query("ApprovalScreen")
+                self._handle_approval_input("always")
+                assert self.waiter.ready.is_set()
+                assert self.waiter.decision == Decision(True, remember=True)
+                self.exit(result=0)
+
+        app = ApprovalApp(config)
+        try:
+            assert app.run(headless=True, size=(100, 30)) == 0
+        finally:
+            app.emergency_close()
+
+    def test_streaming_deltas_stay_in_the_main_conversation(self, config: AgentConfig) -> None:
+        class StreamApp(CagentTui):
+            def on_mount(self) -> None:
+                super().on_mount()
+                self._render_event(TextDelta("partial "))
+                self._render_event(TextDelta("answer"))
+                conversation = self.query_one("#conversation", TextArea)
+                assert "partial answer" in conversation.text
+                self._render_event(
+                    StepFinished(
+                        step=1,
+                        message=Message.assistant(TextPart("partial answer")),
+                        finish_reason="stop",
+                        usage=Usage(10, 5),
+                        latency_s=0.1,
+                    )
+                )
+                assert conversation.text.count("partial answer") == 1
+                assert not self.query("#stream")
+                self.exit(result=0)
+
+        app = StreamApp(config)
+        try:
+            assert app.run(headless=True, size=(100, 30)) == 0
+        finally:
+            app.emergency_close()
+
+    def test_conversation_is_selectable_and_ctrl_c_copies_selection(
+        self, config: AgentConfig
+    ) -> None:
+        class CopyApp(CagentTui):
+            copied = ""
+            has_topbar = True
+            read_only = False
+
+            def on_mount(self) -> None:
+                super().on_mount()
+                conversation = self.query_one("#conversation", TextArea)
+                self._write(Text("selectable transcript"))
+                conversation.focus()
+                conversation.select_all()
+                self.action_interrupt()
+                self.copied = self.clipboard
+                self.has_topbar = bool(self.query("#topbar"))
+                self.read_only = conversation.read_only
+                self.exit(result=0)
+
+        app = CopyApp(config)
+        try:
+            assert app.run(headless=True, size=(100, 30)) == 0
+            assert "selectable transcript" in app.copied
+            assert app.read_only
+            assert not app.has_topbar
+        finally:
+            app.emergency_close()
+
+    def test_resume_replaces_tui_history_and_rebuilds_the_transcript(
+        self, config: AgentConfig
+    ) -> None:
+        trace_dir = config.workspace / ".cagent" / "traces"
+        trace_dir.mkdir(parents=True)
+        trace = trace_dir / "restored-session.jsonl"
+        trace.write_text(
+            "\n".join(
+                json.dumps(record)
+                for record in (
+                    {"type": "session", "workspace": str(config.workspace)},
+                    {"type": "user", "text": "old request"},
+                    {
+                        "type": "step_finished",
+                        "message": {
+                            "role": "assistant",
+                            "parts": [{"type": "text", "text": "old answer"}],
+                        },
+                    },
+                )
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        config.trace_dir = trace_dir
+
+        class ResumeApp(CagentTui):
+            rendered = []
+
+            def on_mount(self) -> None:
+                super().on_mount()
+                self._restore_path(trace)
+                self.exit(result=0)
+
+            def _write(self, renderable) -> None:
+                self.rendered.append(renderable)
+                super()._write(renderable)
+
+        app = ResumeApp(config)
+        try:
+            assert app.run(headless=True, size=(100, 30)) == 0
+            assert [message.text for message in app.agent.context.history] == [
+                "old request",
+                "old answer",
+            ]
+            assert app._restored_from == "restored-session"
+            assert len(app.rendered) >= 4
+        finally:
+            app.emergency_close()
 
 
 class TestApprovalPrompt:
