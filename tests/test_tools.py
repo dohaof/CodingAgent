@@ -248,6 +248,42 @@ def python_engine(monkeypatch) -> None:
     )
 
 
+class TestSearchSymlinkSafety:
+    def test_search_does_not_follow_a_symlink_outside_the_workspace(
+        self, make_ctx, tmp_path: Path, python_engine
+    ) -> None:
+        outside = tmp_path.parent / "not-in-workspace.txt"
+        outside.write_text("SECRET_OUTSIDE\n", encoding="utf-8")
+        link = tmp_path / "linked.txt"
+        try:
+            link.symlink_to(outside)
+        except OSError:
+            pytest.skip("symlink creation is unavailable on this platform")
+
+        harness = make_ctx()
+        outcome = GrepSearchTool().invoke({"pattern": "SECRET_OUTSIDE"}, harness.ctx)
+        assert "SECRET_OUTSIDE" not in outcome.content
+
+
+class TestListDirSymlinkSafety:
+    def test_list_does_not_traverse_a_symlinked_directory(
+        self, make_ctx, tmp_path: Path
+    ) -> None:
+        outside = tmp_path.parent / "outside-tree"
+        outside.mkdir()
+        (outside / "secret.txt").write_text("secret\n", encoding="utf-8")
+        link = tmp_path / "linked"
+        try:
+            link.symlink_to(outside, target_is_directory=True)
+        except OSError:
+            pytest.skip("symlink creation is unavailable on this platform")
+
+        harness = make_ctx()
+        outcome = ListDirTool().invoke({"path": ".", "depth": 3}, harness.ctx)
+        assert "secret.txt" not in outcome.content
+        assert "linked@" in outcome.content
+
+
 class TestGrepSearch:
     def test_matches_are_path_line_text(self, make_ctx, tree: Path, python_engine) -> None:
         harness = make_ctx(workspace=tree)
@@ -345,6 +381,7 @@ class TestGrepSearch:
         def fake_run(argv, **kwargs):
             assert argv[0] == "rg"
             assert f"--field-match-separator={ms}" in argv
+            assert "--no-config" in argv and "--no-follow" in argv
             return subprocess.CompletedProcess(argv, 0, canned, "")
 
         monkeypatch.setattr(
@@ -365,6 +402,22 @@ class TestGrepSearch:
 
 
 class TestGlobFiles:
+    def test_glob_does_not_follow_a_symlink_outside_the_workspace(
+        self, make_ctx, tmp_path: Path
+    ) -> None:
+        outside = tmp_path.parent / "outside-glob"
+        outside.mkdir()
+        (outside / "secret.py").write_text("SECRET_OUTSIDE\n", encoding="utf-8")
+        link = tmp_path / "linked"
+        try:
+            link.symlink_to(outside, target_is_directory=True)
+        except OSError:
+            pytest.skip("symlink creation is unavailable on this platform")
+
+        harness = make_ctx()
+        outcome = GlobFilesTool().invoke({"pattern": "linked/*.py"}, harness.ctx)
+        assert "secret.py" not in outcome.content
+
     def test_matches_are_listed_with_sizes(self, make_ctx, tree: Path) -> None:
         harness = make_ctx(workspace=tree)
         outcome = GlobFilesTool().invoke({"pattern": "**/*.py", "path": "src"}, harness.ctx)
@@ -490,14 +543,36 @@ class TestBuildInvocation:
 
 
 class TestRunBash:
-    def test_stdout_is_returned_with_the_exit_code(self, make_ctx) -> None:
+    def test_host_shell_is_unrestricted_with_workspace_only_file_tools(self, make_ctx) -> None:
         harness = make_ctx()
+        outside = harness.ctx.workspace.parent / f"{harness.ctx.workspace.name}-outside.txt"
+        try:
+            outcome = RunBashTool().invoke(
+                {"command": f'echo host-shell > "{outside}"'}, harness.ctx
+            )
+            assert not outcome.is_error, outcome.content
+            assert outcome.metadata["shell_access"] == "host-unrestricted"
+            assert outside.exists()
+        finally:
+            outside.unlink(missing_ok=True)
+
+    def test_host_shell_still_classifies_and_requests_approval(self, make_ctx) -> None:
+        harness = make_ctx()
+        request = RunBashTool().approval_request(
+            RunBashParams(command="rm -rf outside"), harness.ctx
+        )
+        assert request is not None
+        assert request.risk is DANGEROUS
+
+    def test_stdout_is_returned_with_the_exit_code(self, make_ctx) -> None:
+        harness = make_ctx(allow_outside_workspace=True)
         outcome = RunBashTool().invoke({"command": "echo hello-world"}, harness.ctx)
         assert not outcome.is_error, outcome.content
         assert "hello-world" in outcome.content and "exit code: 0" in outcome.content
+        assert outcome.metadata["shell_access"] == "host-unrestricted"
 
     def test_python_output_is_utf8_on_every_platform(self, make_ctx, tmp_path: Path) -> None:
-        harness = make_ctx()
+        harness = make_ctx(allow_outside_workspace=True)
         (tmp_path / "unicode_output.py").write_text(
             "print('中文路径')\n", encoding="utf-8"
         )
@@ -522,7 +597,7 @@ class TestRunBash:
         self, make_ctx, tmp_path: Path
     ) -> None:
         # This is the self-correction path: the model needs the traceback.
-        harness = make_ctx()
+        harness = make_ctx(allow_outside_workspace=True)
         (tmp_path / "boom.py").write_text(
             "import sys\nsys.stderr.write('kaboom\\n')\nsys.exit(3)\n", encoding="utf-8"
         )
@@ -532,7 +607,7 @@ class TestRunBash:
         assert outcome.metadata["exit_code"] == 3
 
     def test_commands_run_in_the_workspace(self, make_ctx, tmp_path: Path) -> None:
-        harness = make_ctx()
+        harness = make_ctx(allow_outside_workspace=True)
         (tmp_path / "marker.txt").write_text("here\n", encoding="utf-8")
         outcome = RunBashTool().invoke({"command": "cat marker.txt"}, harness.ctx)
         assert "here" in outcome.content
@@ -540,7 +615,7 @@ class TestRunBash:
     def test_credential_looking_variables_are_withheld(self, make_ctx, monkeypatch) -> None:
         # The model can run `env`, and whatever it prints lands in the transcript
         # and the trace file.
-        harness = make_ctx()
+        harness = make_ctx(allow_outside_workspace=True)
         monkeypatch.setenv("MY_SECRET_API_KEY", "sk-must-not-appear")
         monkeypatch.setenv("HARMLESS_SETTING", "visible-value")
         outcome = RunBashTool().invoke({"command": "env"}, harness.ctx)
@@ -555,7 +630,7 @@ class TestRunBash:
         # neither, so without PYTHONDONTWRITEBYTECODE a re-run inside the same
         # second executes the old bytecode and reports the bug as unfixed —
         # which would send the agent off to "fix" already-correct code.
-        harness = make_ctx()
+        harness = make_ctx(allow_outside_workspace=True)
         (tmp_path / "calc.py").write_text("def add(a, b):\n    return a - b\n", encoding="utf-8")
         (tmp_path / "check.py").write_text(
             "from calc import add\nassert add(2, 3) == 5, 'still broken'\nprint('OK')\n",
@@ -573,7 +648,7 @@ class TestRunBash:
         assert not (tmp_path / "__pycache__").exists()
 
     def test_timeout_is_reported_as_an_outcome(self, make_ctx, tmp_path: Path) -> None:
-        harness = make_ctx()
+        harness = make_ctx(allow_outside_workspace=True)
         (tmp_path / "hang.py").write_text("import time\ntime.sleep(30)\n", encoding="utf-8")
         started = time.perf_counter()
         outcome = RunBashTool().invoke({"command": "python hang.py", "timeout": 1}, harness.ctx)
@@ -584,21 +659,21 @@ class TestRunBash:
         assert elapsed < 15, f"took {elapsed:.1f}s to abandon a 1s timeout"
 
     def test_long_output_is_truncated_and_says_so(self, make_ctx, tmp_path: Path) -> None:
-        harness = make_ctx()
+        harness = make_ctx(allow_outside_workspace=True)
         (tmp_path / "noisy.py").write_text("for i in range(3000): print(i)\n", encoding="utf-8")
         outcome = RunBashTool().invoke({"command": "python noisy.py"}, harness.ctx)
         assert outcome.truncated and "lines omitted" in outcome.content
 
     def test_an_empty_command_is_refused(self, make_ctx) -> None:
-        harness = make_ctx()
+        harness = make_ctx(allow_outside_workspace=True)
         assert RunBashTool().invoke({"command": "   "}, harness.ctx).is_error
 
     def test_a_read_only_command_needs_no_approval(self, make_ctx) -> None:
-        harness = make_ctx()
+        harness = make_ctx(allow_outside_workspace=True)
         assert RunBashTool().approval_request(RunBashParams(command="ls -la"), harness.ctx) is None
 
     def test_a_mutating_command_can_be_remembered_by_program(self, make_ctx) -> None:
-        harness = make_ctx()
+        harness = make_ctx(allow_outside_workspace=True)
         request = RunBashTool().approval_request(
             RunBashParams(command="pytest -q tests/", description="run the tests"), harness.ctx
         )
@@ -608,7 +683,7 @@ class TestRunBash:
 
     def test_a_dangerous_command_signs_on_its_full_text(self, make_ctx) -> None:
         # So approving one `rm -rf` can never pre-approve a different one.
-        harness = make_ctx()
+        harness = make_ctx(allow_outside_workspace=True)
         request = RunBashTool().approval_request(
             RunBashParams(command="rm -rf build"), harness.ctx
         )
@@ -616,7 +691,7 @@ class TestRunBash:
         assert request.signature == "rm -rf build"
 
     def test_the_command_and_directory_are_shown_for_review(self, make_ctx, tmp_path) -> None:
-        harness = make_ctx()
+        harness = make_ctx(allow_outside_workspace=True)
         request = RunBashTool().approval_request(
             RunBashParams(command="pytest -q"), harness.ctx
         )

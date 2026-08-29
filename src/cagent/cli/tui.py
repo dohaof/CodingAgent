@@ -15,12 +15,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from rich.console import Console, Group
+from rich import box
+from rich.console import Console
 from rich.panel import Panel
 from rich.syntax import Syntax
 from rich.table import Table
 from rich.text import Text
-from textual import on
+from textual import events, on
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
@@ -206,25 +207,111 @@ class ResumeScreen(ModalScreen[Path | None]):
         self.dismiss(None)
 
 
+class ComposerInput(Input):
+    """Input whose hint is hidden while an IME may be composing text."""
+
+    def __init__(self, *, prompt_hint: str, id: str) -> None:
+        self._prompt_hint = prompt_hint
+        super().__init__(placeholder=prompt_hint, id=id)
+
+    def set_prompt_hint(self, prompt_hint: str) -> None:
+        """Update the hint without showing it under focused IME pre-edit text."""
+        self._prompt_hint = prompt_hint
+        self.placeholder = "" if self.has_focus else prompt_hint
+
+    def _on_focus(self, event: events.Focus) -> None:
+        super()._on_focus(event)
+        self.placeholder = ""
+
+    def _on_blur(self, event: events.Blur) -> None:
+        super()._on_blur(event)
+        self.placeholder = self._prompt_hint
+
+
 class TranscriptTextArea(TextArea):
     """Selectable transcript with lightweight semantic line highlighting."""
+
+    # Keep the transcript selectable with the mouse, but never make it the
+    # keyboard target. In particular, this prevents IMEs from activating when
+    # the user clicks or drags in the read-only conversation history.
+    can_focus = False
+    _right_button_selecting = False
+
+    def _watch_selection(self, previous_selection: Any, selection: Any) -> None:
+        """Keep mouse selection from moving the terminal's input cursor.
+
+        Textual's ``TextArea`` watcher updates ``app.cursor_position`` for every
+        selection, even when the widget is read-only and not focusable. Restore
+        the position owned by the actual focused input after the base watcher
+        performs its scrolling and selection bookkeeping.
+        """
+        if not self.is_mounted:
+            super()._watch_selection(previous_selection, selection)
+            return
+        cursor_position = self.app.cursor_position
+        super()._watch_selection(previous_selection, selection)
+        self.app.cursor_position = cursor_position
+
+    async def _on_mouse_down(self, event: events.MouseDown) -> None:
+        """Allow selection without showing an editable text caret."""
+        if event.button == 3:
+            if self.selected_text:
+                self.action_copy()
+                self.app.notify("Selected text copied", timeout=1.5)
+                event.stop()
+                event.prevent_default()
+                return
+            self._right_button_selecting = True
+        self.screen.set_focus(None, scroll_visible=False)
+        await super()._on_mouse_down(event)
+        self._pause_blink(visible=False)
+
+    async def _on_mouse_up(self, event: events.MouseUp) -> None:
+        """Copy a selection completed with the right mouse button."""
+        right_button_selecting = event.button == 3 and self._right_button_selecting
+        await super()._on_mouse_up(event)
+        self._right_button_selecting = False
+        if right_button_selecting and self.selected_text:
+            self.action_copy()
+            self.app.notify("Selected text copied", timeout=1.5)
+            event.stop()
+            event.prevent_default()
+
+    def _end_mouse_selection(self) -> None:
+        """Finish selection while keeping the transcript caret hidden."""
+        super()._end_mouse_selection()
+        self._pause_blink(visible=False)
 
     def get_line(self, line_index: int) -> Text:
         line = super().get_line(line_index)
         plain = line.plain
-        if plain in {"user", "assistant", "system"}:
+        if plain in {"USER", "ASSISTANT", "SYSTEM"}:
             styles = {
-                "user": "bold cyan",
-                "assistant": "bold green",
-                "system": "bold magenta",
+                "USER": "bold cyan reverse",
+                "ASSISTANT": "bold green reverse",
+                "SYSTEM": "bold magenta reverse",
             }
             line.stylize(styles[plain])
-        elif plain.startswith("tool error:"):
-            line.stylize("bold red")
-        elif plain.startswith("tool result:"):
-            line.stylize("bold green")
-        elif plain.startswith(("tool:", "  tool call:")) or plain.startswith("[y]es"):
-            line.stylize("bold yellow")
+        elif plain.startswith("TOOL ERROR:"):
+            line.stylize("bold red reverse")
+        elif plain.startswith("TOOL RESULT:"):
+            line.stylize("bold green reverse")
+        elif plain.startswith("TOOL:") or plain.startswith("  TOOL CALL:"):
+            line.stylize("bold yellow reverse")
+        elif plain.startswith("APPROVAL · DANGEROUS"):
+            line.stylize("bold red reverse")
+        elif plain.startswith("APPROVAL ·") or plain.startswith("[Y]ES"):
+            line.stylize("bold yellow reverse")
+        elif plain == "THINKING":
+            line.stylize("dim italic")
+        elif plain in {"COMMAND", "WORKING DIRECTORY", "PURPOSE"}:
+            line.stylize("bold")
+        elif plain.startswith("    "):
+            stripped = plain.lstrip()
+            number, separator, _ = stripped.partition("  ")
+            if separator and number.isdigit():
+                start = len(plain) - len(stripped)
+                line.stylize("cyan", start, start + len(number))
         elif plain.startswith("+++") or (
             plain.startswith("+") and not plain.startswith("+++")
         ):
@@ -305,6 +392,7 @@ class CagentTui(App[int]):
         self._text_buffer = ""
         self._thinking_buffer = ""
         self._stream_kind: str | None = None
+        self._stream_start_offset: int | None = None
         self._approval_waiter: _ApprovalWaiter | None = None
         self._approval_request: ApprovalRequest | None = None
         self._restored_from: str | None = None
@@ -331,7 +419,7 @@ class CagentTui(App[int]):
             id="conversation",
         )
         yield Static("Ready", id="activity")
-        yield Input(placeholder="Ask cagent or enter /help", id="composer")
+        yield ComposerInput(prompt_hint="Ask cagent or enter /help", id="composer")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -403,13 +491,14 @@ class CagentTui(App[int]):
                 self._write(self._session_panel(event))
                 self._update_status()
             case UserMessage():
-                self._write(Text("user", style="bold cyan"))
+                self._write_label("USER", "cyan")
                 self._write(Text(event.text))
             case StepStarted():
                 pressure = event.prompt_tokens_estimate / max(self.config.context_window, 1)
                 self._text_buffer = ""
                 self._thinking_buffer = ""
                 self._stream_kind = None
+                self._stream_start_offset = None
                 self._set_activity(
                     f"Working · step {event.step} · "
                     f"{event.prompt_tokens_estimate:,} tokens ({pressure:.0%})"
@@ -437,7 +526,9 @@ class CagentTui(App[int]):
                     arguments = self._format_arguments(event.call.arguments)
                     suffix = f"({arguments})" if arguments else "()"
                     style = "red" if event.risk is RiskLevel.DANGEROUS else "yellow"
-                    self._write(Text(f"tool: {event.call.name}{suffix}", style=style))
+                    if event.call.name == "read_file":
+                        suffix = ""
+                    self._write_label(f"TOOL: {event.call.name.upper()}{suffix}", style)
             case ToolFinished():
                 self._render_tool_result(event)
             case CompactionDone():
@@ -467,27 +558,35 @@ class CagentTui(App[int]):
         text = message.text
         if text.strip() and not self.quiet:
             if self._stream_kind != "assistant":
-                self._write(Text("assistant", style="bold green"))
+                self._write_label("ASSISTANT", "green")
                 self._append_transcript("\n" + text.strip())
-            elif text.startswith(self._text_buffer):
-                self._append_transcript(text[len(self._text_buffer) :])
+            elif self._stream_start_offset is None:
+                self._append_transcript("\n" + text.strip())
+            elif text != self._text_buffer:
+                # Provider deltas may be normalized by the final message. Keep
+                # the live transcript authoritative unless the final text is
+                # genuinely different, in which case replace just this reply.
+                transcript = self.query_one("#conversation", TextArea)
+                prefix = transcript.text[: self._stream_start_offset]
+                transcript.load_text(prefix + text.strip())
         self._text_buffer = ""
         self._thinking_buffer = ""
         self._stream_kind = None
+        self._stream_start_offset = None
 
     def _append_stream_delta(self, text: str, *, kind: str) -> None:
         """Append a provider delta directly to the selectable transcript."""
         if not text or self.quiet:
             return
         if self._stream_kind != kind:
-            self._write(
-                Text(
-                    "thinking" if kind == "thinking" else "assistant",
-                    style="dim italic" if kind == "thinking" else "bold green",
-                )
-            )
+            if kind == "thinking":
+                self._write_label("THINKING", "dim italic")
+            else:
+                self._write_label("ASSISTANT", "green")
             self._stream_kind = kind
             self._append_transcript("\n")
+            if kind == "assistant":
+                self._stream_start_offset = len(self.query_one("#conversation", TextArea).text)
         self._append_transcript(text)
 
     def _append_transcript(self, text: str) -> None:
@@ -502,12 +601,16 @@ class CagentTui(App[int]):
         metadata = event.outcome.metadata
         if "exit_code" in metadata:
             summary = f"exit {metadata['exit_code']}"
+        elif "matches" in metadata:
+            summary = f"{metadata['matches']} match(es)"
+        elif "lines_shown" in metadata:
+            summary = f"{metadata['lines_shown']} of {metadata.get('total_lines', '?')} lines"
         elif "added" in metadata or "removed" in metadata:
             summary = f"+{metadata.get('added', 0)}/-{metadata.get('removed', 0)}"
         else:
             summary = event.outcome.content.strip().split("\n", 1)[0][:100] or "done"
         style = "red" if event.outcome.is_error else "green"
-        label = "tool error" if event.outcome.is_error else "tool result"
+        label = "TOOL ERROR" if event.outcome.is_error else "TOOL RESULT"
         self._write(Text(f"{label}: {summary} ({event.duration_s:.2f}s)", style=style))
         detail = event.outcome.display or event.outcome.content
         if not detail:
@@ -516,10 +619,52 @@ class CagentTui(App[int]):
         body = "\n".join(lines[:_MAX_DETAIL_LINES])
         if len(lines) > _MAX_DETAIL_LINES:
             body += f"\n[{len(lines) - _MAX_DETAIL_LINES} more lines]"
+        path = metadata.get("path")
+        if isinstance(path, str) and "lines_shown" in metadata:
+            self._write(Text(path, style="bold cyan"))
+            body = self._indent_numbered_lines(body)
+        elif event.call.name == "grep_search":
+            body = self._group_search_results(body)
         if detail.startswith(("--- ", "diff ")):
             self._write(Syntax(body, "diff", theme="ansi_dark", background_color="default"))
         else:
             self._write(Text(body, style="red" if event.outcome.is_error else "dim"))
+
+    @staticmethod
+    def _indent_numbered_lines(body: str) -> str:
+        """Align numbered source lines beneath one file heading."""
+        rendered: list[str] = []
+        for line in body.splitlines():
+            number, separator, text = line.lstrip().partition("\t")
+            shown = (
+                f"{number}  {text}"
+                if separator and number.isdigit()
+                else line.lstrip()
+            )
+            rendered.append("    " + shown)
+        return "\n".join(rendered)
+
+    @staticmethod
+    def _group_search_results(body: str) -> str:
+        """Show each grep result path once, followed by indented line numbers."""
+        import re
+
+        pattern = re.compile(r"^(.+):(\d+)([:-])\s(.*)$")
+        grouped: list[str] = []
+        current_path: str | None = None
+        for line in body.splitlines():
+            match = pattern.match(line)
+            if match is None:
+                grouped.append(line)
+                continue
+            path, number, separator, text = match.groups()
+            if path != current_path:
+                if grouped and grouped[-1] != "":
+                    grouped.append("")
+                grouped.append(path)
+                current_path = path
+            grouped.append(f"    {number}{separator} {text}")
+        return "\n".join(grouped).strip("\n")
 
     @staticmethod
     def _format_arguments(arguments: dict[str, object]) -> str:
@@ -530,6 +675,13 @@ class CagentTui(App[int]):
                 text = text[:77] + "..."
             values.append(text if key in ("path", "command", "pattern") else f"{key}={text}")
         return ", ".join(values)
+
+    def _write_label(self, label: str, color: str) -> None:
+        """Write a prominent semantic label with spacing for quick scanning."""
+        transcript = self.query_one("#conversation", TextArea)
+        if transcript.text:
+            self._append_transcript("\n")
+        self._write(Text(label.upper(), style=f"bold {color} reverse"))
 
     def _handle_command(self, line: str) -> None:
         parts = line.split()
@@ -678,9 +830,16 @@ class CagentTui(App[int]):
     def _show_approval(self, request: ApprovalRequest, waiter: _ApprovalWaiter) -> None:
         self._approval_waiter = waiter
         self._approval_request = request
-        risk = request.risk.name.lower()
+        risk = request.risk.name.upper()
         style = "red" if request.risk is RiskLevel.DANGEROUS else "yellow"
-        body: list[Text | Syntax] = [Text(request.summary, style="bold")]
+        self._write_label(f"APPROVAL · {risk} · {request.tool.upper()}", style)
+        summary = request.summary
+        if request.tool == "run_bash" and " — " in summary:
+            summary = summary.rsplit(" — ", 1)[1]
+            self._write(Text("PURPOSE", style="bold dim"))
+            self._write(Text("  " + summary))
+        elif request.tool != "run_bash":
+            self._write(Text(summary, style="bold"))
         if request.detail:
             detail = request.detail
             lines = detail.splitlines()
@@ -689,23 +848,28 @@ class CagentTui(App[int]):
                     f"\n[{len(lines) - _MAX_DETAIL_LINES} more lines]"
                 )
             if detail.startswith("--- "):
-                body.append(Syntax(detail, "diff", theme="ansi_dark", background_color="default"))
+                self._write(
+                    Syntax(detail, "diff", theme="ansi_dark", background_color="default")
+                )
             else:
-                body.append(Text(detail))
-        self._write(
-            Panel(
-                Group(*body),
-                title=f"{risk} · {request.tool}",
-                border_style=style,
-                expand=False,
-            )
-        )
+                detail_lines = detail.splitlines()
+                command = next((line for line in detail_lines if line.startswith("$ ")), "")
+                location = next((line for line in detail_lines if line.startswith("in ")), "")
+                other = [line for line in detail_lines if line not in (command, location)]
+                if command:
+                    self._write(Text("COMMAND", style="bold dim"))
+                    self._write(Text("  " + command, style="yellow"))
+                if location:
+                    self._write(Text("WORKING DIRECTORY", style="bold dim"))
+                    self._write(Text("  " + location.removeprefix("in ")))
+                if other:
+                    self._write(Text("\n".join(other)))
         allow_always = request.risk is not RiskLevel.DANGEROUS and not request.always_prompt
-        options = "[y]es  [n]o" + ("  [a]lways" if allow_always else "") + "  [q]uit"
+        options = "[Y]ES  [N]O" + ("  [A]LWAYS" if allow_always else "") + "  [Q]UIT"
         self._write(Text(options, style=style))
         self._set_activity(f"Waiting for approval · {request.tool} · y/n/a/q")
-        composer = self.query_one("#composer", Input)
-        composer.placeholder = "Approval: y/n/a/q (Enter = yes)"
+        composer = self.query_one("#composer", ComposerInput)
+        composer.set_prompt_hint("Approval: y/n/a/q (Enter = yes)")
         composer.focus()
 
     def _handle_approval_input(self, answer: str) -> None:
@@ -734,7 +898,9 @@ class CagentTui(App[int]):
         self._approval_waiter = None
         self._approval_request = None
         waiter.resolve(decision)
-        self.query_one("#composer", Input).placeholder = "Ask cagent or enter /help"
+        self.query_one("#composer", ComposerInput).set_prompt_hint(
+            "Ask cagent or enter /help"
+        )
         self._set_activity("Working")
 
     def action_interrupt(self) -> None:
@@ -840,18 +1006,55 @@ class CagentTui(App[int]):
         self._closed_session = True
 
     def _session_panel(self, event: RunStarted) -> Panel:
-        """Build the one-time startup status block shown in the transcript."""
-        status = Table.grid(padding=(0, 2))
-        status.add_column(style="dim")
+        """Build a compact, scannable startup status block."""
+        status = Table.grid(padding=(0, 1), expand=False)
+        status.add_column(style="bold cyan", no_wrap=True)
         status.add_column()
-        status.add_row("model", event.model)
-        status.add_row("endpoint", event.endpoint)
-        status.add_row("workspace", str(self.config.workspace))
-        status.add_row("approval", self.config.approval_mode)
-        status.add_row("sandbox", self.agent.sandbox_status())
-        status.add_row("tools", f"{len(event.tool_names)} · {', '.join(event.tool_names)}")
-        status.add_row("context", f"{self.config.context_window:,} tokens")
-        return Panel(status, title="cagent", border_style="cyan", expand=False)
+        status.add_column(style="bold cyan", no_wrap=True)
+        status.add_column()
+        status.add_row(
+            "MODEL",
+            event.model,
+            "CONTEXT",
+            f"{self.config.context_window:,} tokens",
+        )
+        status.add_row(
+            "APPROVAL",
+            self.config.approval_mode,
+            "SANDBOX",
+            self.agent.sandbox_status(),
+        )
+        status.add_row("PATHS", self._path_boundary_status(), "", "")
+        status.add_row("SHELL", self._shell_execution_status(), "", "")
+        status.add_row("ENDPOINT", event.endpoint, "", "")
+        status.add_row("WORKSPACE", str(self.config.workspace), "", "")
+        status.add_row(
+            "TOOLS",
+            f"{len(event.tool_names)} available · {', '.join(event.tool_names)}",
+            "",
+            "",
+        )
+        return Panel(
+            status,
+            title=Text("CAGENT  /  SESSION READY", style="bold cyan"),
+            title_align="left",
+            border_style="cyan",
+            box=box.SQUARE,
+            padding=(0, 1),
+            expand=False,
+        )
+
+    def _path_boundary_status(self) -> str:
+        """Describe whether file tools enforce the workspace boundary."""
+        if self.config.allow_outside_workspace and self.agent.sandbox is None:
+            return "unrestricted"
+        return "workspace-only"
+
+    def _shell_execution_status(self) -> str:
+        """Describe the process boundary used by ``run_bash``."""
+        if self.agent.sandbox is not None:
+            return "container"
+        return "host (unrestricted)"
 
     def _write(self, renderable: Any) -> None:
         """Append a Rich renderable as plain selectable transcript text."""
@@ -886,8 +1089,8 @@ class CagentTui(App[int]):
     def _set_busy(self, busy: bool, activity: str) -> None:
         self._busy = busy
         self._set_activity(activity)
-        composer = self.query_one("#composer", Input)
-        composer.placeholder = (
+        composer = self.query_one("#composer", ComposerInput)
+        composer.set_prompt_hint(
             "Agent is working · Ctrl+C interrupts" if busy else "Ask cagent or enter /help"
         )
 
@@ -897,7 +1100,9 @@ class CagentTui(App[int]):
         restored = f" · resumed {self._restored_from}" if self._restored_from else ""
         self.query_one("#activity", Static).update(
             f"{'Working' if self._busy else 'Ready'} · {self.config.approval_mode} · "
-            f"sandbox {sandbox} · context {tokens:,}/{self.config.context_window:,}{restored}"
+            f"sandbox {sandbox} · shell {self._shell_execution_status()} · "
+            f"paths {self._path_boundary_status()} · "
+            f"context {tokens:,}/{self.config.context_window:,}{restored}"
         )
 
 

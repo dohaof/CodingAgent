@@ -84,6 +84,25 @@ def _is_ignored(path: Path, base: Path) -> bool:
     return any(part in IGNORED_DIRS for part in parts)
 
 
+def _has_symlink_component(path: Path, root: Path) -> bool:
+    """Return whether a candidate reaches a file through a symlink.
+
+    ``Path.is_file`` and ``open`` follow links. Skipping every linked component
+    keeps discovery tools from reading a file outside the workspace through a
+    link, including links to directories that ``Path.glob`` may traverse.
+    """
+    try:
+        relative = path.relative_to(root)
+    except ValueError:
+        return True
+    current = root
+    for part in relative.parts:
+        current /= part
+        if current.is_symlink():
+            return True
+    return False
+
+
 def _clip(line: str) -> str:
     """Bound one output line."""
     text = line.rstrip("\n\r")
@@ -132,7 +151,18 @@ class GlobFilesTool(BaseTool):
                 "Use shell-style globs such as **/*.py or src/*.ts.",
             ) from exc
 
-        files = [p for p in candidates if p.is_file() and not _is_ignored(p, base)]
+        files: list[Path] = []
+        for candidate in candidates:
+            try:
+                ctx.resolve_path(str(candidate))
+            except ToolError:
+                continue
+            if (
+                not _has_symlink_component(candidate, base)
+                and candidate.is_file()
+                and not _is_ignored(candidate, base)
+            ):
+                files.append(candidate)
         if not files:
             return ToolOutcome.ok(
                 f"No files match {pattern!r} under {ctx.rel(base)}.",
@@ -224,7 +254,7 @@ class GrepSearchTool(BaseTool):
             if hits is None:
                 engine = "python"
         if engine == "python":
-            hits = self._python_search(params, base, limit, context)
+            hits = self._python_search(params, base, limit, context, ctx)
 
         assert hits is not None  # both branches assign, or fall through to python
         if not hits.lines:
@@ -264,6 +294,8 @@ class GrepSearchTool(BaseTool):
             "--no-heading",
             "--color",
             "never",
+            "--no-config",
+            "--no-follow",
             f"--field-match-separator={_MATCH_SEP}",
             f"--field-context-separator={_CONTEXT_SEP}",
         ]
@@ -323,7 +355,12 @@ class GrepSearchTool(BaseTool):
         return _Hits(lines, matches, capped)
 
     def _python_search(
-        self, params: GrepSearchParams, base: Path, limit: int, context: int
+        self,
+        params: GrepSearchParams,
+        base: Path,
+        limit: int,
+        context: int,
+        ctx: ToolContext,
     ) -> _Hits:
         """Search with the standard library, for machines without ripgrep."""
         flags = 0 if params.case_sensitive else re.IGNORECASE
@@ -334,6 +371,10 @@ class GrepSearchTool(BaseTool):
         capped = False
         first_file = True
         for path in self._candidate_files(params, base):
+            try:
+                ctx.resolve_path(str(path))
+            except ToolError:
+                continue
             text = self._read_text(path)
             if text is None:
                 continue
@@ -378,9 +419,15 @@ class GrepSearchTool(BaseTool):
 
         selected: list[Path] = []
         for root, dirnames, filenames in os.walk(base):
-            dirnames[:] = sorted(d for d in dirnames if d not in IGNORED_DIRS)
+            dirnames[:] = sorted(
+                d
+                for d in dirnames
+                if d not in IGNORED_DIRS and not (Path(root) / d).is_symlink()
+            )
             for filename in sorted(filenames):
                 path = Path(root, filename)
+                if path.is_symlink():
+                    continue
                 if params.glob and not path.match(params.glob):
                     continue
                 selected.append(path)

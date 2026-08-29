@@ -427,11 +427,13 @@ class RunBashTool(BaseTool):
 
     name: ClassVar[str] = "run_bash"
     description: ClassVar[str] = (
-        "Run a shell command in the workspace and return its exit code, stdout, "
-        "and stderr. Use it to run tests, builds, and linters: a non-zero exit "
-        "comes back as output to read, not as a failure of the call. Long output "
-        "is truncated in the middle. Fill in description so the user reading the "
-        "approval prompt knows the intent."
+        "Run a shell command and return its exit code, stdout, and stderr. Shell "
+        "execution uses a Docker sandbox when active; otherwise it runs on the "
+        "unrestricted host with the current OS user's permissions. Use it to run "
+        "tests, builds, and linters: a non-zero exit comes back as output "
+        "to read, not as a failure of the call. Long output is truncated in the "
+        "middle. Fill in description so the user reading the approval prompt knows "
+        "the intent."
     )
     risk: ClassVar[RiskLevel] = RiskLevel.MUTATING
     Params: ClassVar[type] = RunBashParams
@@ -526,6 +528,7 @@ class RunBashTool(BaseTool):
             "exit_code": exit_code,
             "duration_s": round(duration, 3),
             "timeout": timed_out,
+            "shell_access": "container" if ctx.sandbox is not None else "host-unrestricted",
         }
         if ctx.sandbox is not None:
             metadata["sandbox"] = "docker"

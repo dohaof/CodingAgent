@@ -61,6 +61,7 @@ def config(tmp_path: Path) -> AgentConfig:
         base_url="https://api.test.invalid/v1",
         model="test-model",
         api_key="test-key",
+        sandbox_mode="off",
     )
 
 
@@ -88,6 +89,9 @@ def make_ctx(tmp_path: Path) -> Callable[..., ContextHarness]:
         **config_kwargs: object,
     ) -> ContextHarness:
         root = workspace or tmp_path
+        # Tool unit tests use the host explicitly. Automatic Docker selection
+        # has dedicated lifecycle tests and must not depend on the test host.
+        config_kwargs.setdefault("sandbox_mode", "off")
         cfg = AgentConfig(workspace=root, api_key="test-key", **config_kwargs)  # type: ignore[arg-type]
         harness = ContextHarness(ctx=None)  # type: ignore[arg-type]
 

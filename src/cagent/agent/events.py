@@ -54,6 +54,11 @@ class RunStarted:
 
     system_tokens: int
     tool_names: tuple[str, ...]
+    """Resolved execution status; empty for older/custom event producers."""
+
+    sandbox_status: str = ""
+    shell_access: str = ""
+    path_boundary: str = ""
 
 
 @dataclass(frozen=True, slots=True)

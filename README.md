@@ -130,6 +130,12 @@ offered), or `q` (`quit`) in the input box; an empty answer is the same as `y`.
 Model text streams into the conversation as it arrives, so it can be selected
 without waiting for the turn to finish.
 
+The transcript uses prominent `USER`, `ASSISTANT`, and `TOOL` labels. Tool
+results are grouped for scanning: a `read_file` result shows its path once,
+then indented line numbers and source; search results likewise show each path
+once with indented match lines. Added and removed diff lines remain green and
+red respectively.
+
 To continue a previous conversation, start an interactive session with `cagent`,
 then enter `/resume`. The agent lists saved conversations from the current
 workspace and lets you choose one by number. A short session ID or full JSONL
@@ -172,11 +178,11 @@ Conversation recovery is available only inside the session:
 /resume path/to/session.jsonl   # use an explicit path
 ```
 
-By default traces live in `<workspace>/.cagent/traces`; `/trace` prints the
-resolved directory. The picker shows the most recent sessions first, including
+By default traces live in `<workspace>/.cagent/traces`. The picker shows the most
+recent sessions first, including
 their timestamp, short ID, step count, status, and first request.
 Only sessions with at least one non-empty user request are saved and listed;
-commands such as `/help`, `/trace`, and `/exit` alone do not create a saved
+commands such as `/help` and `/exit` alone do not create a saved
 conversation. Restoring a conversation alone also does not create a new trace;
 the restored checkpoint is recorded only when you submit a new non-empty
 request. A partially interrupted session is listed only when its trace still
@@ -230,16 +236,31 @@ restore the old container, unsynchronised sandbox files, or approval state.
 可见。沙箱开启期间，文件工具操作临时快照，Shell 在 Linux 容器中运行；真实
 项目只有在同步时才会被修改，默认的工作目录边界和命令审批仍然有效。
 
-With `--workspace`, that directory is both the file/command sandbox and the
-location where the project `.cagent.toml` is read. The user-level
+默认 `sandbox_mode = "auto"` 会检查 Docker 服务和本地镜像；两者可用时自动启用
+隔离，否则回退到宿主机并显示警告。宿主机 `run_bash` 的进程权限始终是
+`SHELL host (unrestricted)`，因为 `cd ..`、绝对路径、重定向、符号链接和子进程
+都能绕过单纯的工作目录检查。`allow_outside_workspace = false` 仍让文件工具
+保持 `PATHS workspace-only`；设为 true 才允许文件工具访问工作区外路径。
+`/sandbox off` 是明确关闭 Docker，审批模式只决定确认流程，不提供进程隔离。
+
+With `--workspace`, that directory is the file-tool workspace and the
+location where the project `.cagent.toml` is read. File tools are workspace-only
+by default. Host shell execution remains available, but is unrestricted at the
+process level unless Docker isolation is active, and cagent warns about this.
+The user-level
 `%USERPROFILE%\.cagent.toml` remains available for shared endpoint settings.
 
 **Supervision.** `--approval suggest` confirms every change; `auto-edit` (the
 default) lets file edits through and confirms shell commands; `full-auto`
 confirms only destructive commands. Nothing auto-approves a destructive command.
 
-**Sandboxing.** Shell commands normally run in the project directory. For an
-isolated run, use `--sandbox docker --sandbox-sync ask` (or set the same fields
+These are separate from sandboxing. `full-auto` is an approval policy, not a
+"danger-full-access" switch.
+
+**Sandboxing.** The default `sandbox_mode = "auto"` checks whether Docker and
+the selected local image are available. If so, it automatically enables
+isolated shell execution. To require that behavior, use
+`--sandbox docker --sandbox-sync ask` (or set the same fields
 in `.cagent.toml`). The agent copies the project to a temporary snapshot and
 mounts only that snapshot into a constrained, network-disabled Docker
 container. The real project is never mounted into the container. One Agent
@@ -251,7 +272,9 @@ the Agent. The container is removed when the Agent closes; opening a new Agent
 creates a new container and a fresh snapshot. Docker reuses local image layers,
 so it does not reinstall image dependencies on every session.
 
-The image must already exist locally because pulls are disabled. For a project
+The image must already exist locally because pulls are disabled. In `auto`, a
+missing image or unavailable daemon causes a warning and host fallback. In
+explicit `docker` mode it fails closed instead. For a project
 with non-Python or heavier dependencies, create a project-specific image once:
 
 ```dockerfile
@@ -272,9 +295,18 @@ the example Dockerfile above does not need to copy the project into the image.
 The image build is an explicit user action because a Dockerfile can execute
 arbitrary installation scripts. At session end, `never` discards the snapshot,
 `ask` shows a bounded diff and requires a separate approval, and `always` copies
-it back after a concurrent-change check. Docker Desktop/Engine must be running;
-if it is unavailable, the sandbox command fails closed rather than falling back
-to the host.
+it back after a concurrent-change check. `--sandbox off` explicitly selects
+the host shell. A host process can escape its initial directory through `cd ..`,
+absolute paths, redirection, symlinks, or child interpreters; command
+classification and approval are not a process isolation boundary.
+
+The default `allow_outside_workspace = false` still makes file tools enforce the
+workspace boundary, shown as `PATHS workspace-only`. If Docker is unavailable,
+the status is therefore `PATHS workspace-only / SHELL host (unrestricted)` and a
+warning explains the risk. Set `allow_outside_workspace = true` only when file
+tools should also access paths outside the workspace; the status then shows
+`PATHS unrestricted`. This is the project's danger-full-access equivalent for
+file paths, using the current OS user's existing permissions.
 
 **Cost.** Token counts are always reported. Dollar figures require rates you
 supply, because a built-in price table goes stale and a stale price prints a
@@ -567,7 +599,7 @@ replaying half a completion would corrupt the transcript.
 
 **Command classification is a heuristic.** It decides what is worth interrupting
 the user for, not what is permitted; the approval mode is the real gate. The
-optional Docker mode adds a separate execution boundary, but it is still not a
+automatic/explicit Docker mode adds a separate execution boundary, but it is still not a
 kernel-grade security guarantee: Docker itself must be trusted and kept patched,
 and the host project is protected by never mounting it read/write into the
 container and by requiring a reviewed copy-back.

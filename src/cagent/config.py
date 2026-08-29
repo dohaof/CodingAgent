@@ -41,8 +41,8 @@ Wire = Literal["openai", "anthropic"]
 ApprovalMode = Literal["suggest", "auto-edit", "full-auto"]
 """How much the agent may do without asking. See :class:`AgentConfig`."""
 
-SandboxMode = Literal["off", "docker"]
-"""Where shell commands execute: on the host, or in a disposable Docker copy."""
+SandboxMode = Literal["auto", "off", "docker"]
+"""How shell commands are isolated: automatic Docker, host, or forced Docker."""
 
 SandboxSync = Literal["never", "ask", "always"]
 """What to do with changes in a disposable workspace when a run ends."""
@@ -129,10 +129,17 @@ class AgentConfig:
     approval_mode: ApprovalMode = "auto-edit"
     workspace: Path = field(default_factory=Path.cwd)
     allow_outside_workspace: bool = False
+    """Allow file tools to resolve paths outside the workspace.
+
+    Host ``run_bash`` is always unrestricted at the process level: a shell can
+    escape its initial directory through ``cd``, absolute paths, or children.
+    This flag therefore controls file tools only; Docker is the process boundary
+    for shell commands when it is available.
+    """
 
     # sandbox
-    sandbox_mode: SandboxMode = "off"
-    """Use Docker for shell execution against a disposable workspace copy."""
+    sandbox_mode: SandboxMode = "auto"
+    """Use Docker automatically when its daemon and image are available."""
 
     sandbox_sync: SandboxSync = "ask"
     """Copy sandbox changes back never, after a prompt, or automatically."""
@@ -279,9 +286,9 @@ class AgentConfig:
                 f"approval_mode must be one of suggest, auto-edit, full-auto; "
                 f"got {self.approval_mode!r}."
             )
-        if self.sandbox_mode not in ("off", "docker"):
+        if self.sandbox_mode not in ("auto", "off", "docker"):
             raise ConfigError(
-                f"sandbox_mode must be one of off, docker; got {self.sandbox_mode!r}."
+                f"sandbox_mode must be one of auto, off, docker; got {self.sandbox_mode!r}."
             )
         if self.sandbox_mode == "docker" and self.allow_outside_workspace:
             raise ConfigError(

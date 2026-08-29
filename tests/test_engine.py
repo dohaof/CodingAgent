@@ -91,6 +91,8 @@ def auto(project: Path, **kwargs: object) -> AgentConfig:
         base_url="https://api.test.invalid/v1",
         model="test-model",
         approval_mode="full-auto",
+        allow_outside_workspace=bool(kwargs.pop("allow_outside_workspace", False)),
+        sandbox_mode=kwargs.pop("sandbox_mode", "off"),  # type: ignore[arg-type]
         **kwargs,  # type: ignore[arg-type]
     )
 
@@ -124,7 +126,7 @@ class TestTheCycle:
         # The whole point of the project, end to end: the agent inspects, changes,
         # runs the real test suite, and reports.
         agent, sink, provider = make_agent(
-            auto(project),
+            auto(project, allow_outside_workspace=True),
             [
                 tool_turn("read_file", {"path": "calc.py"}) + [StreamFinished("tool_calls")],
                 tool_turn("run_bash", {"command": "python -m pytest -q"})
@@ -158,7 +160,7 @@ class TestTheCycle:
     def test_a_failing_command_is_handed_back_with_its_stderr(self, project: Path) -> None:
         # Without the traceback reaching the transcript there is no self-correction.
         agent, sink, provider = make_agent(
-            auto(project),
+            auto(project, allow_outside_workspace=True),
             [
                 tool_turn("run_bash", {"command": "python -m pytest -q"})
                 + [StreamFinished("tool_calls")],
@@ -265,6 +267,45 @@ class TestTheCycle:
 
 
 class TestFailureHandling:
+    def test_auto_sandbox_uses_a_local_image_when_docker_is_ready(
+        self, project: Path, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(sandbox_module, "docker_available", lambda: True)
+        monkeypatch.setattr(sandbox_module, "docker_image_available", lambda _image: True)
+        config = auto(
+            project,
+            sandbox_mode="auto",
+            sandbox_sync="never",
+        )
+        agent, sink, _ = make_agent(config, [text_turn("done")])
+        try:
+            assert agent.sandbox is not None
+            agent.announce("test isolation")
+            (started,) = sink.of_type(RunStarted)
+            assert started.shell_access == "container"
+            assert "docker" in started.sandbox_status
+            assert not sink.of_type(Warning)
+        finally:
+            agent.close()
+
+    def test_auto_sandbox_warns_before_falling_back_to_the_host(
+        self, project: Path, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(sandbox_module, "docker_available", lambda: False)
+        config = auto(project, sandbox_mode="auto")
+        agent, sink, _ = make_agent(config, [text_turn("done")])
+        try:
+            assert agent.sandbox is None
+            agent.announce("test fallback")
+            (started,) = sink.of_type(RunStarted)
+            assert started.path_boundary == "workspace-only"
+            assert started.shell_access == "host (unrestricted)"
+            (warning,) = sink.of_type(Warning)
+            assert "unrestricted process access" in warning.message
+            assert warning.detail is not None and "daemon is unavailable" in warning.detail
+        finally:
+            agent.close()
+
     def test_sandbox_changes_can_be_applied_or_discarded_mid_session(
         self, project: Path, monkeypatch
     ) -> None:
@@ -357,6 +398,7 @@ class TestFailureHandling:
             base_url="https://api.test.invalid/v1",
             model="test-model",
             approval_mode="auto-edit",
+            allow_outside_workspace=True,
         )
         asked: list[str] = []
 
@@ -399,7 +441,7 @@ class TestFailureHandling:
     ) -> None:
         config = AgentConfig(
             workspace=project, api_key="k", base_url="https://api.test.invalid/v1",
-            model="test-model", approval_mode="suggest"
+            model="test-model", approval_mode="suggest", allow_outside_workspace=True
         )
         policy = ApprovalPolicy(config, prompter=lambda request: Decision(approved=False))
         before = (project / "calc.py").read_bytes()
@@ -427,7 +469,7 @@ class TestFailureHandling:
     def test_the_approval_prompt_carries_the_real_diff(self, project: Path) -> None:
         config = AgentConfig(
             workspace=project, api_key="k", base_url="https://api.test.invalid/v1",
-            model="test-model", approval_mode="suggest"
+            model="test-model", approval_mode="suggest", allow_outside_workspace=True
         )
         policy = ApprovalPolicy(config, prompter=lambda request: Decision(approved=True))
         agent, sink, _ = make_agent(
@@ -450,7 +492,7 @@ class TestFailureHandling:
     def test_an_abort_from_the_prompt_stops_the_turn(self, project: Path) -> None:
         config = AgentConfig(
             workspace=project, api_key="k", base_url="https://api.test.invalid/v1",
-            model="test-model", approval_mode="suggest"
+            model="test-model", approval_mode="suggest", allow_outside_workspace=True
         )
         policy = ApprovalPolicy(
             config, prompter=lambda request: Decision(approved=False, abort=True)
@@ -624,6 +666,7 @@ class TestContextPressure:
         )
         config = auto(
             project,
+            allow_outside_workspace=True,
             context_window=4000,
             compact_threshold=0.5,
             keep_recent_turns=1,
@@ -646,7 +689,11 @@ class TestContextPressure:
             "for i in range(200): print('line', i, 'y' * 40)\n", encoding="utf-8"
         )
         config = auto(
-            project, context_window=4000, compact_threshold=0.5, keep_recent_turns=1
+            project,
+            allow_outside_workspace=True,
+            context_window=4000,
+            compact_threshold=0.5,
+            keep_recent_turns=1,
         )
         script = [
             tool_turn("run_bash", {"command": "python noisy.py"}) + [StreamFinished("tool_calls")]

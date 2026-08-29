@@ -133,19 +133,19 @@ def restored_history_renderables(
     call_names: dict[str, str] = {}
     for message in messages:
         if message.role == "user":
-            rendered.append(Text("user", style="bold cyan"))
+            rendered.append(Text("USER", style="bold cyan reverse"))
             if message.text:
                 rendered.append(Text(message.text))
             continue
 
         if message.role == "system":
-            rendered.append(Text("system", style="bold magenta"))
+            rendered.append(Text("SYSTEM", style="bold magenta reverse"))
             if message.text:
                 rendered.append(Text(message.text, style="dim"))
             continue
 
         if message.role == "assistant":
-            rendered.append(Text("assistant", style="bold green"))
+            rendered.append(Text("ASSISTANT", style="bold green reverse"))
             for part in message.parts:
                 if isinstance(part, TextPart) and part.text.strip():
                     rendered.append(Markdown(part.text.strip()))
@@ -156,7 +156,9 @@ def restored_history_renderables(
                     call_names[part.id] = part.name
                     arguments = _format_arguments(part)
                     suffix = f"({arguments})" if arguments else "()"
-                    rendered.append(Text(f"  tool call: {part.name}{suffix}", style="yellow"))
+                    rendered.append(
+                        Text(f"  TOOL CALL: {part.name}{suffix}", style="bold yellow")
+                    )
             continue
 
         for part in message.parts:
@@ -165,7 +167,7 @@ def restored_history_renderables(
             name = call_names.get(part.call_id, part.call_id)
             style = "red" if part.is_error else "dim"
             state = "error" if part.is_error else "result"
-            rendered.append(Text(f"tool {state}: {name}", style=style))
+            rendered.append(Text(f"TOOL {state.upper()}: {name}", style=style))
             if part.content.strip():
                 rendered.extend(_restored_detail(part.content, style=style))
 
@@ -262,7 +264,24 @@ class ConsoleRenderer:
         header.add_row("approval", self.config.approval_mode)
         header.add_row(
             "sandbox",
-            f"{self.config.sandbox_mode} ({self.config.sandbox_sync})",
+            event.sandbox_status
+            or f"{self.config.sandbox_mode} ({self.config.sandbox_sync})",
+        )
+        header.add_row(
+            "paths",
+            event.path_boundary
+            or ("unrestricted" if self.config.allow_outside_workspace else "workspace-only"),
+        )
+        header.add_row(
+            "shell",
+            event.shell_access
+            or (
+                "container"
+                if self.config.sandbox_mode == "docker"
+                else "auto (container preferred; host fallback unrestricted)"
+                if self.config.sandbox_mode == "auto"
+                else "host (unrestricted)"
+            ),
         )
         header.add_row("tools", f"{len(event.tool_names)} · {', '.join(event.tool_names)}")
         header.add_row("system", f"{event.system_tokens} tokens")

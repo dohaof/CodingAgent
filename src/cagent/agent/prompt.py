@@ -166,6 +166,12 @@ class PromptBuilder:
             lines.append(
                 "- Paths outside the working directory are refused. Stay inside it."
             )
+            if not sandboxed:
+                lines.append(
+                    "- run_bash executes on the unrestricted host. Its initial directory "
+                    "is the workspace, but shell syntax and child processes can access "
+                    "outside it; prefer workspace-relative commands."
+                )
         markers = self._project_markers(workspace)
         if markers:
             lines.append(f"- Project markers: {', '.join(markers)}")

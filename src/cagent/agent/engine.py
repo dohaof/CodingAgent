@@ -129,9 +129,10 @@ class Agent:
     _system: str = ""
     _files_changed: bool = False
     sandbox: SandboxSession | None = field(init=False, default=None)
+    sandbox_warning: str | None = field(init=False, default=None)
 
     def __post_init__(self) -> None:
-        self.sandbox = SandboxSession.create(self.config)
+        self.sandbox, self.sandbox_warning = SandboxSession.create_with_status(self.config)
         self.prompt_builder = PromptBuilder(
             self.config, workspace=self.sandbox.workspace if self.sandbox is not None else None
         )
@@ -174,6 +175,8 @@ class Agent:
 
     def announce(self, task: str) -> None:
         """Emit the opening event for a session."""
+        shell_access = "container" if self.sandbox is not None else "host (unrestricted)"
+        path_boundary = "unrestricted" if self.config.allow_outside_workspace else "workspace-only"
         self._emit(
             RunStarted(
                 task=task,
@@ -181,8 +184,23 @@ class Agent:
                 endpoint=self.config.resolved_base_url,
                 system_tokens=self.context.system_tokens,
                 tool_names=tuple(sorted(self.registry.names())),
+                sandbox_status=self.sandbox_status(),
+                shell_access=shell_access,
+                path_boundary=path_boundary,
             )
         )
+        if self.sandbox_warning is not None:
+            self._emit(
+                Warning(
+                    "run_bash is using the host with unrestricted process access.",
+                    detail=(
+                        f"{self.sandbox_warning} File tools remain {path_boundary}; "
+                        "a host shell can access outside the workspace via cd, absolute "
+                        "paths, redirection, symlinks, or child processes. Use "
+                        "sandbox_mode = 'docker' or /sandbox on for isolation."
+                    ),
+                )
+            )
 
     def restore_history(self, messages: Sequence[Message]) -> None:
         """Replace the empty transcript with a validated resumed history.
@@ -526,6 +544,8 @@ class Agent:
     def sandbox_status(self) -> str:
         """Return a concise status line for the interactive CLI."""
         if self.sandbox is None:
+            if self.config.sandbox_mode == "auto":
+                return f"auto (host fallback; sync: {self.config.sandbox_sync})"
             return "off"
         container = self.sandbox.container_name or "not started"
         return f"docker (container: {container}; sync: {self.config.sandbox_sync})"
@@ -551,6 +571,7 @@ class Agent:
             raise
         assert sandbox is not None
         self.sandbox = sandbox
+        self.sandbox_warning = None
         self.prompt_builder.workspace = sandbox.workspace
         self.prompt_builder.invalidate_map()
         self._refresh_system_prompt()
@@ -571,6 +592,7 @@ class Agent:
         sandbox = self.sandbox
         if sandbox is None:
             self.config.sandbox_mode = "off"
+            self.sandbox_warning = "Docker sandboxing was explicitly disabled."
             return
         try:
             self._finish_sandbox()
@@ -578,6 +600,7 @@ class Agent:
             sandbox.close()
             self.sandbox = None
             self.config.sandbox_mode = "off"
+            self.sandbox_warning = "Docker sandboxing was explicitly disabled."
             self.prompt_builder.workspace = None
             self.prompt_builder.invalidate_map()
             self._refresh_system_prompt()

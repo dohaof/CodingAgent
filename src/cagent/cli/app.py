@@ -44,7 +44,7 @@ __all__ = ["main"]
 
 _BANNER_HELP = """\
 Commands: /help <instruct>  /tools  /cost  /context  /approve <mode>
-          /sandbox  /resume [ID|PATH]  /clear  /trace  /exit
+          /sandbox  /resume [ID|PATH]  /clear  /exit
 Use /help <instruct> for details about one command.
 Full-screen TTY: Ctrl+C copies a selection or interrupts; Ctrl+R resumes;
 F1 helps; Ctrl+Q exits.
@@ -73,8 +73,10 @@ metadata or interrupted traces with no restorable user turn are hidden."""
 _SANDBOX_HELP = """\
 Docker sandbox - one disposable container per Agent conversation
 
-Before enabling: Docker Desktop/Engine must be running and the selected image
-must exist locally. Pull or build it explicitly; the agent never pulls images.
+By default `sandbox_mode = "auto"` checks Docker Desktop/Engine and the selected
+local image. When both exist, cagent creates an isolated project snapshot and
+uses one container for this conversation. It never pulls images automatically.
+If either check fails, it falls back to the host and prints a warning.
 
   /sandbox                         show status, image, and sync policy
   /sandbox on [IMAGE]              copy the project and enable Docker isolation
@@ -89,6 +91,14 @@ real project is unchanged until /sandbox apply, or until /sandbox off/exit
 syncs it according to the selected policy. The normal workspace path boundary
 and command approvals still apply. The container starts on the first shell
 command, is reused for this conversation, and is removed when it closes.
+
+`/sandbox off` explicitly selects the host shell. A host process can escape its
+initial workspace with cd, absolute paths, redirection, symlinks, or children;
+approval and risk classification are not an isolation boundary.
+
+`allow_outside_workspace = false` remains the default and confines file tools,
+so host fallback normally shows `PATHS workspace-only / SHELL host
+(unrestricted)`. Set it true only to allow file tools outside the workspace.
 
 Examples:
   /sandbox image my-project-agent:latest
@@ -157,12 +167,13 @@ def build_parser() -> argparse.ArgumentParser:
     safety.add_argument(
         "--allow-outside-workspace",
         action="store_true",
-        help="permit reads and writes outside the workspace",
+        help="grant unrestricted file and host-shell access outside the workspace",
     )
     safety.add_argument(
         "--sandbox",
-        choices=("off", "docker"),
-        help="run against a disposable Docker workspace snapshot (default: off)",
+        choices=("auto", "off", "docker"),
+        help="run shell commands in a disposable Docker snapshot "
+        "when available (default: auto; host fallback is unrestricted)",
     )
     safety.add_argument(
         "--sandbox-sync",
@@ -453,8 +464,6 @@ def _command(console: Console, agent: Agent, config: AgentConfig, line: str) -> 
                 console.print(f"[dim]approval mode: {arguments[0]}[/dim]")
             else:
                 console.print(f"approval mode: {config.approval_mode}")
-        case "/trace":
-            console.print(str(config.trace_dir or "tracing disabled"))
         case _:
             console.print(f"[dim]unknown command {name}; try /help[/dim]")
     return False
@@ -494,11 +503,6 @@ _HELP_TOPICS = {
     "clear": (
         "Clear",
         "Discard the current conversation history. This cannot restore unsaved context.",
-        "dim",
-    ),
-    "trace": (
-        "Trace",
-        "Show the directory where this session's JSONL trace is written.",
         "dim",
     ),
     "exit": (
@@ -670,8 +674,20 @@ def _sandbox_command(console: Console, agent: Agent, arguments: list[str]) -> No
     action = arguments[0].lower() if arguments else "status"
     try:
         if action in ("status", "show"):
+            path_policy = (
+                "unrestricted"
+                if agent.config.allow_outside_workspace and agent.sandbox is None
+                else "workspace-only"
+            )
+            shell_policy = (
+                "container"
+                if agent.sandbox is not None
+                else "host (unrestricted)"
+            )
             console.print(
                 f"sandbox: {agent.sandbox_status()}\n"
+                f"paths: {path_policy}\n"
+                f"shell: {shell_policy}\n"
                 f"image: {agent.config.sandbox_image}\n"
                 f"sync: {agent.config.sandbox_sync}"
             )
@@ -681,7 +697,10 @@ def _sandbox_command(console: Console, agent: Agent, arguments: list[str]) -> No
             console.print(f"[dim]sandbox enabled: {agent.sandbox_status()}[/dim]")
         elif action == "off":
             agent.disable_sandbox()
-            console.print("[dim]sandbox disabled; tools now use the real workspace[/dim]")
+            console.print(
+                "[bold yellow]WARNING:[/bold yellow] sandbox disabled; "
+                "run_bash now uses the unrestricted host"
+            )
         elif action == "apply" and len(arguments) == 1:
             applied = agent.apply_sandbox_changes()
             if applied:
@@ -728,6 +747,13 @@ def _show_config(console: Console, config: AgentConfig) -> int:
     else:
         key_state = "[red]not set[/red] (api_key in .cagent.toml)"
 
+    shell_execution = (
+        "host (unrestricted)"
+        if config.allow_outside_workspace or config.sandbox_mode == "off"
+        else "auto (container if available; host (unrestricted) fallback)"
+        if config.sandbox_mode == "auto"
+        else "container"
+    )
     rows = {
         "base_url": config.base_url or "[red]not set[/red] (base_url in .cagent.toml)",
         "model": config.model or "[red]not set[/red] (model in .cagent.toml)",
@@ -736,6 +762,8 @@ def _show_config(console: Console, config: AgentConfig) -> int:
         "workspace": str(config.workspace),
         "approval mode": config.approval_mode,
         "sandbox": f"{config.sandbox_mode} ({config.sandbox_sync})",
+        "path boundary": "unrestricted" if config.allow_outside_workspace else "workspace-only",
+        "shell execution": shell_execution,
         "context window": f"{config.context_window:,}",
         "compact at": f"{config.compact_at_tokens:,} tokens",
         "token budget": str(config.token_budget or "unlimited"),
@@ -747,6 +775,18 @@ def _show_config(console: Console, config: AgentConfig) -> int:
     for key, value in rows.items():
         table.add_row(key, value)
     console.print(Panel(table, title="resolved configuration", border_style="cyan", expand=False))
+
+    if config.sandbox_mode == "auto" and not config.allow_outside_workspace:
+        console.print(
+            "[bold yellow]WARNING:[/bold yellow] Docker/image availability is checked "
+            "when the Agent starts; auto mode falls back to host (unrestricted) if "
+            "either prerequisite is missing."
+        )
+    elif config.sandbox_mode == "off":
+        console.print(
+            "[bold yellow]WARNING:[/bold yellow] sandbox is off; run_bash uses the "
+            "host with unrestricted process access."
+        )
 
     if config.base_url and config.model:
         console.print(

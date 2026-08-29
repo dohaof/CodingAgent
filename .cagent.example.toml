@@ -78,10 +78,17 @@ fuzzy_threshold = 0.86           # similarity floor for fuzzy edit matching
 # --- safety ----------------------------------------------------------------
 approval_mode = "auto-edit"      # "suggest" | "auto-edit" | "full-auto"
 # workspace = "."                # unset means the working directory
+# false confines file tools to the workspace. Host run_bash is still an
+# unrestricted process when Docker is unavailable, so cagent prints a warning.
+# true allows file tools outside the workspace; it is the danger-full-access
+# equivalent for file paths.
 allow_outside_workspace = false
 
-# --- disposable Docker sandbox (optional) ----------------------------------
-# sandbox_mode = "docker"           # "off" (default) | "docker"
+# --- disposable Docker sandbox ---------------------------------------------
+# sandbox_mode = "auto"             # "auto" (default) | "off" | "docker"
+# auto uses Docker when the daemon and image are available, otherwise warns
+# and falls back to the unrestricted host shell. docker fails closed if either
+# prerequisite is unavailable; off explicitly selects the host shell.
 # sandbox_sync = "ask"               # "never" | "ask" | "always"
 # sandbox_image = "python:3.12-slim" # local image; build Dockerfile.agent for project deps
 # sandbox_memory_mb = 1024

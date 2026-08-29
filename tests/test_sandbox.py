@@ -30,6 +30,21 @@ def test_docker_is_required_and_fails_closed(tmp_path: Path, monkeypatch) -> Non
         SandboxSession.create(_config(tmp_path))
 
 
+def test_auto_falls_back_when_the_local_image_is_missing(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(sandbox_module, "docker_available", lambda: True)
+    monkeypatch.setattr(sandbox_module, "docker_image_available", lambda _image: False)
+    config = AgentConfig(workspace=tmp_path, api_key="k", sandbox_mode="auto")
+
+    session, reason = SandboxSession.create_with_status(config)
+
+    assert session is None
+    assert reason is not None and "not available locally" in reason
+
+
+def test_default_sandbox_mode_is_auto(tmp_path: Path) -> None:
+    assert AgentConfig(workspace=tmp_path, api_key="k").sandbox_mode == "auto"
+
+
 def test_snapshot_changes_do_not_touch_real_project(tmp_path: Path, monkeypatch) -> None:
     (tmp_path / "app.py").write_text("old\n", encoding="utf-8")
     monkeypatch.setattr(sandbox_module, "docker_available", lambda: True)

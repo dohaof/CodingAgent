@@ -366,7 +366,7 @@ class ListDirTool(BaseTool):
 
         lines: list[str] = [f"{ctx.rel(root)}/"]
         budget = max(params.max_entries, 1)
-        shown, omitted = self._walk(root, max(params.depth, 1), 1, budget, lines)
+        shown, omitted = self._walk(root, max(params.depth, 1), 1, budget, lines, ctx)
         if omitted:
             lines.append(f"... [{omitted} more entries omitted]")
 
@@ -383,12 +383,13 @@ class ListDirTool(BaseTool):
         level: int,
         budget: int,
         lines: list[str],
+        ctx: ToolContext,
     ) -> tuple[int, int]:
         """Append one directory level; return (entries shown, entries omitted)."""
         try:
             entries = sorted(
                 directory.iterdir(),
-                key=lambda p: (not p.is_dir(), p.name.lower()),
+                key=lambda p: (p.is_symlink() or not p.is_dir(), p.name.lower()),
             )
         except OSError as exc:
             lines.append(f"{'  ' * level}[unreadable: {exc.strerror or exc}]")
@@ -401,7 +402,20 @@ class ListDirTool(BaseTool):
             if shown >= budget:
                 omitted += 1
                 continue
-            is_dir = entry.is_dir()
+            try:
+                ctx.resolve_path(str(entry))
+            except ToolError:
+                lines.append(f"{indent}{entry.name}@ [outside workspace]")
+                shown += 1
+                continue
+            # ``is_dir`` follows symlinks. Treat links as leaf entries so a
+            # workspace link cannot make list_dir traverse an outside tree.
+            is_link = entry.is_symlink()
+            is_dir = not is_link and entry.is_dir()
+            if is_link:
+                lines.append(f"{indent}{entry.name}@")
+                shown += 1
+                continue
             if is_dir and entry.name in IGNORED_DIRS:
                 lines.append(f"{indent}{entry.name}/ …")
                 shown += 1
@@ -410,7 +424,7 @@ class ListDirTool(BaseTool):
             shown += 1
             if is_dir and level < depth:
                 sub_shown, sub_omitted = self._walk(
-                    entry, depth, level + 1, budget - shown, lines
+                    entry, depth, level + 1, budget - shown, lines, ctx
                 )
                 shown += sub_shown
                 omitted += sub_omitted

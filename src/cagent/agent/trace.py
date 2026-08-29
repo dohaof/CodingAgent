@@ -258,6 +258,9 @@ class TraceWriter:
                     "endpoint": event.endpoint,
                     "system_tokens": event.system_tokens,
                     "tools": list(event.tool_names),
+                    "sandbox_status": event.sandbox_status,
+                    "shell_access": event.shell_access,
+                    "path_boundary": event.path_boundary,
                 }
             case UserMessage():
                 return {"type": "user", "text": _clip(event.text)}

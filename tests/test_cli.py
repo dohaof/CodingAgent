@@ -7,6 +7,7 @@ code, the cost — and not about escape codes.
 
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 from collections.abc import Callable
@@ -15,7 +16,8 @@ from pathlib import Path
 import pytest
 from rich.console import Console
 from rich.text import Text
-from textual.widgets import TextArea
+from textual.events import MouseDown
+from textual.widgets import Input, TextArea
 
 from cagent.agent.approval import Decision
 from cagent.agent.events import (
@@ -33,7 +35,7 @@ from cagent.agent.events import (
 from cagent.cli.app import _command, _overrides, _print_help, build_parser, main
 from cagent.cli.pricing import Price, estimate_cost, parse_prices, price_for
 from cagent.cli.render import ConsoleRenderer, prompt_for_approval
-from cagent.cli.tui import CagentTui, TranscriptTextArea, _ApprovalWaiter
+from cagent.cli.tui import CagentTui, ComposerInput, TranscriptTextArea, _ApprovalWaiter
 from cagent.config import AgentConfig
 from cagent.tools.base import ApprovalRequest, ToolOutcome
 from cagent.types import Message, RiskLevel, TextPart, ToolCallPart, Usage
@@ -97,6 +99,10 @@ class TestArgumentParsing:
     def test_an_explicit_approval_mode_is_honoured(self) -> None:
         args = build_parser().parse_args(["--approval", "suggest", "task"])
         assert _overrides(args)["approval_mode"] == "suggest"
+
+    def test_outside_workspace_flag_enables_unrestricted_paths(self) -> None:
+        args = build_parser().parse_args(["--allow-outside-workspace", "task"])
+        assert _overrides(args)["allow_outside_workspace"] is True
 
     def test_docker_sandbox_flags_map_to_config(self) -> None:
         args = build_parser().parse_args(
@@ -181,6 +187,16 @@ class TestInformationalCommands:
         assert "/resume" in out and "list saved conversations" in out
         assert "/resume ID" in out and "/resume PATH" in out
         assert "current Agent" in out
+
+    def test_trace_instruction_is_not_exposed(self, captured, tmp_path: Path) -> None:
+        console, buffer = captured
+        _print_help(console)
+        assert "/trace" not in buffer.getvalue()
+
+        buffer.seek(0)
+        buffer.truncate(0)
+        _command(console, object(), AgentConfig(workspace=tmp_path), "/trace")  # type: ignore[arg-type]
+        assert "unknown command /trace" in buffer.getvalue()
 
     def test_resume_command_restores_trace_into_current_agent(
         self, captured, tmp_path: Path
@@ -360,6 +376,33 @@ class TestInformationalCommands:
         assert "https://api.example.com/v1" in out
         assert "file-model" in out
         assert "set" in out
+
+    def test_show_config_reports_unrestricted_path_access(self, capsys, tmp_path) -> None:
+        assert (
+            main(
+                [
+                    "--show-config",
+                    "--workspace",
+                    str(tmp_path),
+                    "--allow-outside-workspace",
+                ]
+            )
+            == 0
+        )
+        out = capsys.readouterr().out
+        assert "path boundary" in out
+        assert "unrestricted" in out
+        assert "shell execution" in out
+        assert "host (unrestricted)" in out
+
+    def test_show_config_reports_automatic_sandbox_policy_by_default(
+        self, capsys, tmp_path
+    ) -> None:
+        assert main(["--show-config", "--workspace", str(tmp_path)]) == 0
+        out = capsys.readouterr().out
+        assert "path boundary" in out and "workspace-only" in out
+        assert "shell execution" in out and "host (unrestricted)" in out and "auto" in out
+        assert "WARNING" in out
 
     def test_explicit_workspace_loads_its_project_config(self, capsys, tmp_path) -> None:
         project = tmp_path / "project"
@@ -768,7 +811,10 @@ class TestTui:
                 transcript = self.query_one("#conversation", TextArea)
                 assert "test-model" in transcript.text
                 assert "https://api.test.invalid/v1" in transcript.text
-                assert "workspace" in transcript.text
+                assert "WORKSPACE" in transcript.text
+                assert "PATHS" in transcript.text
+                assert "SHELL" in transcript.text
+                assert "host (unrestricted)" in transcript.text
                 assert "read_file" in transcript.text
                 self.exit(result=0)
 
@@ -780,12 +826,12 @@ class TestTui:
 
     def test_transcript_preserves_semantic_colors_for_roles_tools_and_diffs(self) -> None:
         transcript = TranscriptTextArea(
-            "user\nassistant\ntool: edit_file(path)\n--- a/app.py\n+++ b/app.py\n-old\n+new",
+            "USER\nASSISTANT\nTOOL: EDIT_FILE(path)\n--- a/app.py\n+++ b/app.py\n-old\n+new",
             read_only=True,
         )
-        assert str(transcript.get_line(0).spans[0].style) == "bold cyan"
-        assert str(transcript.get_line(1).spans[0].style) == "bold green"
-        assert str(transcript.get_line(2).spans[0].style) == "bold yellow"
+        assert str(transcript.get_line(0).spans[0].style) == "bold cyan reverse"
+        assert str(transcript.get_line(1).spans[0].style) == "bold green reverse"
+        assert str(transcript.get_line(2).spans[0].style) == "bold yellow reverse"
         assert str(transcript.get_line(3).spans[0].style) == "red"
         assert str(transcript.get_line(4).spans[0].style) == "green"
         assert str(transcript.get_line(5).spans[0].style) == "red"
@@ -806,19 +852,24 @@ class TestTui:
                     )
                 )
                 conversation = self.query_one("#conversation", TextArea)
-                assert "tool: read_file(add.py)" in conversation.text
-                assert str(conversation.get_line(0).spans[0].style) == "bold yellow"
+                assert "TOOL: READ_FILE" in conversation.text
+                assert str(conversation.get_line(0).spans[0].style) == "bold yellow reverse"
                 self._render_event(
                     ToolFinished(
                         call=ToolCallPart(
                             id="call-1", name="read_file", arguments={"path": "add.py"}
                         ),
-                        outcome=ToolOutcome.ok("content"),
+                        outcome=ToolOutcome.ok(
+                            "     1\tcontent",
+                            metadata={"path": "add.py", "lines_shown": 1, "total_lines": 1},
+                        ),
                         duration_s=0.01,
                     )
                 )
-                assert "tool result: content" in conversation.text
-                assert str(conversation.get_line(1).spans[0].style) == "bold green"
+                assert "TOOL RESULT: 1 of 1 lines" in conversation.text
+                assert conversation.text.count("add.py") == 1
+                assert "\n    1  content" in conversation.text
+                assert str(conversation.get_line(1).spans[0].style) == "bold green reverse"
                 self.exit(result=0)
 
         app = ToolApp(config)
@@ -841,8 +892,8 @@ class TestTui:
                 )
                 self._show_approval(request, self.waiter)
                 transcript = self.query_one("#conversation", TextArea)
-                assert "mutating · edit_file" in transcript.text
-                assert "[y]es  [n]o  [a]lways  [q]uit" in transcript.text
+                assert "APPROVAL · MUTATING · EDIT_FILE" in transcript.text
+                assert "[Y]ES  [N]O  [A]LWAYS  [Q]UIT" in transcript.text
                 assert not self.query("ApprovalScreen")
                 self._handle_approval_input("always")
                 assert self.waiter.ready.is_set()
@@ -850,6 +901,35 @@ class TestTui:
                 self.exit(result=0)
 
         app = ApprovalApp(config)
+        try:
+            assert app.run(headless=True, size=(100, 30)) == 0
+        finally:
+            app.emergency_close()
+
+    def test_shell_approval_separates_purpose_command_and_directory(
+        self, config: AgentConfig
+    ) -> None:
+        class ShellApprovalApp(CagentTui):
+            waiter = _ApprovalWaiter()
+
+            def on_mount(self) -> None:
+                super().on_mount()
+                request = ApprovalRequest(
+                    tool="run_bash",
+                    risk=RiskLevel.MUTATING,
+                    summary="run: python -m pytest — Run the focused tests",
+                    detail="$ python -m pytest\nin .",
+                )
+                self._show_approval(request, self.waiter)
+                transcript = self.query_one("#conversation", TextArea).text
+                assert "PURPOSE\n  Run the focused tests" in transcript
+                assert "COMMAND\n  $ python -m pytest" in transcript
+                assert "WORKING DIRECTORY\n  ." in transcript
+                assert transcript.count("python -m pytest") == 1
+                self._handle_approval_input("n")
+                self.exit(result=0)
+
+        app = ShellApprovalApp(config)
         try:
             assert app.run(headless=True, size=(100, 30)) == 0
         finally:
@@ -882,6 +962,15 @@ class TestTui:
         finally:
             app.emergency_close()
 
+    def test_search_results_group_repeated_paths(self) -> None:
+        grouped = CagentTui._group_search_results(
+            "add.py:18- old\nadd.py:19: def shortest():\nother.py:2: call()"
+        )
+        assert grouped == (
+            "add.py\n    18- old\n    19: def shortest():\n\n"
+            "other.py\n    2: call()"
+        )
+
     def test_conversation_is_selectable_and_ctrl_c_copies_selection(
         self, config: AgentConfig
     ) -> None:
@@ -894,7 +983,7 @@ class TestTui:
                 super().on_mount()
                 conversation = self.query_one("#conversation", TextArea)
                 self._write(Text("selectable transcript"))
-                conversation.focus()
+                self.screen.set_focus(None)
                 conversation.select_all()
                 self.action_interrupt()
                 self.copied = self.clipboard
@@ -908,6 +997,84 @@ class TestTui:
             assert "selectable transcript" in app.copied
             assert app.read_only
             assert not app.has_topbar
+        finally:
+            app.emergency_close()
+
+    def test_clicking_and_selecting_transcript_clears_keyboard_input_focus(
+        self, config: AgentConfig
+    ) -> None:
+        app = CagentTui(config)
+
+        async def exercise_transcript() -> None:
+            async with app.run_test(size=(100, 30)) as pilot:
+                conversation = app.query_one("#conversation", TranscriptTextArea)
+                composer = app.query_one("#composer", Input)
+                app._write(Text("selectable transcript"))
+
+                assert not conversation.focusable
+                assert app.focused is composer
+                input_cursor_position = app.cursor_position
+                await pilot.mouse_down(conversation, offset=(3, 1))
+                await pilot.hover(conversation, offset=(12, 1))
+                await pilot.mouse_up(conversation, offset=(12, 1))
+
+                assert app.focused is None
+                assert app.cursor_position == input_cursor_position
+                assert not conversation._cursor_visible
+                assert conversation.selected_text
+                await pilot.press("x")
+                assert composer.value == ""
+
+        try:
+            asyncio.run(exercise_transcript())
+        finally:
+            app.emergency_close()
+
+    def test_composer_hides_prompt_while_focused_for_ime_preedit(self, config: AgentConfig) -> None:
+        app = CagentTui(config)
+
+        async def exercise_composer() -> None:
+            async with app.run_test(size=(100, 30)) as pilot:
+                composer = app.query_one("#composer", ComposerInput)
+                await pilot.pause()
+                assert app.focused is composer
+                assert composer.placeholder == ""
+
+                composer.set_prompt_hint("Approval: y/n/a/q (Enter = yes)")
+                assert composer.placeholder == ""
+                app.screen.set_focus(None)
+                await pilot.pause()
+                assert composer.placeholder == "Approval: y/n/a/q (Enter = yes)"
+
+        try:
+            asyncio.run(exercise_composer())
+        finally:
+            app.emergency_close()
+
+    def test_right_click_copies_selected_transcript(self, config: AgentConfig) -> None:
+        app = CagentTui(config)
+
+        async def exercise_context_copy() -> None:
+            async with app.run_test(size=(100, 30)):
+                conversation = app.query_one("#conversation", TranscriptTextArea)
+                app._write(Text("copy from context menu"))
+                conversation.select_all()
+                event = MouseDown(
+                    conversation,
+                    x=3,
+                    y=1,
+                    delta_x=0,
+                    delta_y=0,
+                    button=3,
+                    shift=False,
+                    meta=False,
+                    ctrl=False,
+                )
+                await conversation._on_mouse_down(event)
+                assert "copy from context menu" in app.clipboard
+
+        try:
+            asyncio.run(exercise_context_copy())
         finally:
             app.emergency_close()
 

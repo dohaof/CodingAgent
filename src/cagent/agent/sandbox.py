@@ -31,7 +31,12 @@ from pathlib import Path
 from ..config import AgentConfig
 from ..errors import CagentError
 
-__all__ = ["SandboxError", "SandboxSession"]
+__all__ = [
+    "SandboxError",
+    "SandboxSession",
+    "docker_available",
+    "docker_image_available",
+]
 
 _MAX_DIFF_FILE_BYTES = 200_000
 _MAX_DIFF_CHARS = 24_000
@@ -220,6 +225,21 @@ def docker_available() -> bool:
     return result.returncode == 0 and bool(result.stdout.strip())
 
 
+def docker_image_available(image: str) -> bool:
+    """Return whether ``image`` exists locally without pulling it."""
+    try:
+        result = subprocess.run(
+            ["docker", "image", "inspect", "--format", "{{.Id}}", image],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0 and bool(result.stdout.strip())
+
+
 def _remove(path: Path) -> None:
     try:
         info = path.lstat()
@@ -275,19 +295,44 @@ class SandboxSession:
 
     @classmethod
     def create(cls, config: AgentConfig) -> SandboxSession | None:
-        """Create a snapshot when Docker sandboxing is enabled."""
+        """Create the selected snapshot, discarding automatic fallback detail."""
+        session, _fallback_reason = cls.create_with_status(config)
+        return session
+
+    @classmethod
+    def create_with_status(
+        cls, config: AgentConfig
+    ) -> tuple[SandboxSession | None, str | None]:
+        """Create a snapshot and report why ``auto`` selected the host shell."""
         if config.sandbox_mode == "off":
-            return None
-        if config.sandbox_mode != "docker":
+            return None, "Docker sandboxing was explicitly disabled."
+        if config.sandbox_mode not in ("auto", "docker"):
             raise SandboxError(f"Unsupported sandbox mode: {config.sandbox_mode!r}")
         if config.allow_outside_workspace:
-            raise SandboxError(
-                "allow_outside_workspace cannot be combined with Docker sandboxing."
+            if config.sandbox_mode == "docker":
+                raise SandboxError(
+                    "allow_outside_workspace cannot be combined with Docker sandboxing."
+                )
+            return (
+                None,
+                "Automatic Docker isolation was skipped because "
+                "allow_outside_workspace = true requests unrestricted file access.",
             )
         if not docker_available():
+            detail = "The Docker CLI or daemon is unavailable."
+            if config.sandbox_mode == "auto":
+                return None, detail
             raise SandboxError(
                 "Docker sandbox requested, but the Docker daemon is unavailable. "
                 "Start Docker Desktop/Engine or set sandbox_mode = 'off'."
+            )
+        if config.sandbox_mode == "auto" and not docker_image_available(
+            config.sandbox_image.strip()
+        ):
+            return (
+                None,
+                f"Sandbox image {config.sandbox_image!r} is not available locally; "
+                "cagent never pulls images automatically.",
             )
         real = config.workspace
         if not real.is_dir():
@@ -309,7 +354,7 @@ class SandboxSession:
             raise SandboxError(
                 f"Workspace snapshot exceeds sandbox_workspace_mb={config.sandbox_workspace_mb}."
             )
-        return session
+        return session, None
 
     def ensure_container(self, config: AgentConfig) -> str:
         """Start the session container once and return its stable name.
