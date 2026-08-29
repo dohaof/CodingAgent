@@ -324,7 +324,11 @@ class ContextManager:
         if not summary.strip():
             return False
 
-        note = Message(role="user", parts=[TextPart(f"{_SUMMARY_HEADER}\n{summary.strip()}")])
+        note = Message(
+            role="user",
+            parts=[TextPart(f"{_SUMMARY_HEADER}\n{summary.strip()}")],
+            synthetic=True,
+        )
         if estimate_message(note, model=self.config.model_for_tokens) >= original_tokens:
             return False
 
@@ -351,6 +355,7 @@ class ContextManager:
                     "window. Re-read any file you need instead of relying on memory of it.]"
                 )
             ],
+            synthetic=True,
         )
         first, *recent = protected
         self._rebuild([first, Block([marker]), *recent])

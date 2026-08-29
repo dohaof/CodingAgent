@@ -16,6 +16,8 @@ import contextlib
 import datetime as dt
 import signal
 import sys
+from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from types import FrameType
 from typing import NoReturn
@@ -33,6 +35,7 @@ from ..agent.trace import TraceWriter, history_from_trace, read_trace
 from ..config import AgentConfig, load_config
 from ..errors import CagentError, ConfigError
 from ..tools.registry import default_registry
+from ..types import Message
 from .render import ConsoleRenderer, prompt_for_approval, render_restored_history
 from .resume import TraceChoice as _TraceChoice
 from .resume import find_trace_choices as _find_trace_choices
@@ -44,11 +47,11 @@ __all__ = ["main"]
 
 _BANNER_HELP = """\
 Commands: /help <instruct>  /tools  /cost  /context  /approve <mode>
-          /sandbox  /resume [ID|PATH]  /clear  /exit
+          /sandbox  /resume [ID|PATH]  /undo  /clear  /exit
 Use /help <instruct> for details about one command.
-Full-screen TTY: Ctrl+C copies a selection or interrupts; Ctrl+R resumes;
-F1 helps; Ctrl+Q exits.
-Ctrl-C again at the prompt exits in the line-oriented fallback."""
+Ctrl+C interrupts active work or exits while idle.
+Full-screen TTY: selected idle text is copied; Ctrl+R resumes; F1 helps;
+Ctrl+Q exits."""
 
 _RESUME_HELP = """\
 Conversation recovery
@@ -69,6 +72,16 @@ another project is accepted as conversation context, but the current workspace
 is used for tools and a warning is shown. Only traces with at least one
 non-empty user request and provider-valid history appear in the picker; startup
 metadata or interrupted traces with no restorable user turn are hidden."""
+
+_UNDO_HELP = """\
+Undo the latest conversation turn
+
+  /undo
+
+Removes the most recent user message and every assistant/tool message that
+answered it. Tool calls and results are removed as one unit so the remaining
+history stays valid for the model. This changes conversation context only: it
+does not revert files, commands, installed packages, or other side effects."""
 
 _SANDBOX_HELP = """\
 Docker sandbox - one disposable container per Agent conversation
@@ -349,15 +362,19 @@ def _run_session(
         if trace.error:
             console.print(f"[yellow]![/yellow] tracing disabled: {trace.error}")
 
-    _install_interrupt_handler(agent, console)
+    interrupt_state = _install_interrupt_handler(agent, console)
     agent.announce(task or "(interactive)")
 
     exit_code = 0
     try:
         if interactive:
-            exit_code = _repl(console, agent, config)
+            exit_code = _repl(console, agent, config, interrupt_state)
         else:
-            result = agent.run_turn(task)
+            interrupt_state.busy = True
+            try:
+                result = agent.run_turn(task)
+            finally:
+                interrupt_state.busy = False
             exit_code = 0 if result.completed else 1
     finally:
         trace_path = (
@@ -377,20 +394,21 @@ def _run_session(
     return exit_code
 
 
-def _install_interrupt_handler(agent: Agent, console: Console) -> None:
-    """Make Ctrl-C interrupt the task rather than kill the process.
+@dataclass(slots=True)
+class _InterruptState:
+    """Whether the foreground agent turn is currently running."""
 
-    A run that is killed outright loses the summary and the trace's closing
-    record, so the first interrupt asks the loop to stop at its next safe point
-    and the second is left to Python's default behaviour.
-    """
-    interrupted = {"count": 0}
+    busy: bool = False
+
+
+def _install_interrupt_handler(agent: Agent, console: Console) -> _InterruptState:
+    """Interrupt an active turn; let Ctrl-C at an idle prompt exit."""
+    state = _InterruptState()
 
     def handler(signum: int, frame: FrameType | None) -> None:
-        interrupted["count"] += 1
-        if interrupted["count"] == 1:
+        if state.busy:
             agent.interrupt()
-            console.print("\n[yellow]Interrupting… (Ctrl-C again to force quit)[/yellow]")
+            console.print("\n[yellow]Interrupting current turn...[/yellow]")
             return
         raise KeyboardInterrupt
 
@@ -398,10 +416,17 @@ def _install_interrupt_handler(agent: Agent, console: Console) -> None:
     # handler stays, which is a degraded but working session.
     with contextlib.suppress(ValueError, OSError):
         signal.signal(signal.SIGINT, handler)
+    return state
 
 
-def _repl(console: Console, agent: Agent, config: AgentConfig) -> int:
+def _repl(
+    console: Console,
+    agent: Agent,
+    config: AgentConfig,
+    interrupt_state: _InterruptState | None = None,
+) -> int:
     """Read tasks from the user until they leave."""
+    state = interrupt_state or _InterruptState()
     console.print(Panel(Text(_BANNER_HELP), border_style="dim", expand=False))
     while True:
         try:
@@ -420,12 +445,11 @@ def _repl(console: Console, agent: Agent, config: AgentConfig) -> int:
             continue
 
         agent.reset_interrupt()
-        result = agent.run_turn(text)
-        # A Ctrl+C during a turn requests a graceful session exit. The agent
-        # has already appended the partial history; the caller's finally
-        # block now writes the closing trace record before returning.
-        if agent.abort.is_set():
-            return 0
+        state.busy = True
+        try:
+            result = agent.run_turn(text)
+        finally:
+            state.busy = False
         if not result.completed:
             console.print(f"[dim](turn ended: {result.stopped_by})[/dim]")
 
@@ -459,6 +483,16 @@ def _command(console: Console, agent: Agent, config: AgentConfig, line: str) -> 
             agent.context.history.clear()
             agent.guard.note_progress()
             console.print("[dim]history cleared[/dim]")
+        case "/undo":
+            removed = agent.undo_last_turn()
+            if not removed:
+                console.print("[dim]nothing to undo[/dim]")
+            else:
+                _record_history_checkpoint(agent)
+                console.print(
+                    f"[dim]removed the latest user turn ({removed} message(s)); "
+                    "files and command effects were not reverted[/dim]"
+                )
         case "/sandbox":
             _sandbox_command(console, agent, arguments)
         case "/resume":
@@ -478,11 +512,12 @@ _HELP_TOPICS = {
     "help": (
         "Help",
         "Use /help for the command list, or /help <instruct> for one command's details.\n\n"
-        "In a terminal, Ctrl+C copies selected conversation text or interrupts, "
-        "Ctrl+R resumes, F1 opens this help, and Ctrl+Q exits.",
+        "In a terminal, Ctrl+C interrupts active work or exits while idle; an idle "
+        "selection is copied instead. Ctrl+R resumes, F1 opens this help, and Ctrl+Q exits.",
         "dim",
     ),
     "resume": ("Resume", _RESUME_HELP, "green"),
+    "undo": ("Undo", _UNDO_HELP, "yellow"),
     "sandbox": ("Sandbox", _SANDBOX_HELP, "cyan"),
     "tools": (
         "Tools",
@@ -605,12 +640,22 @@ def _resume_command(
         )
 
     agent.restore_history(history)
-    for sink in getattr(getattr(agent, "sink", None), "sinks", ()):
-        if isinstance(sink, TraceWriter):
-            sink.record_history(history)
-            break
+    _record_history_checkpoint(agent, history)
     render_restored_history(console, history, session_id=path.stem)
     console.print(f"[dim]resumed {len(history)} message(s) from {path}[/dim]")
+
+
+def _record_history_checkpoint(
+    agent: Agent, messages: Sequence[Message] | None = None
+) -> None:
+    """Persist context replacement in the active append-only trace, if any."""
+    sink = getattr(agent, "sink", None)
+    candidates = (sink, *getattr(sink, "sinks", ()))
+    for candidate in candidates:
+        if isinstance(candidate, TraceWriter):
+            history = messages if messages is not None else agent.context.history
+            candidate.record_history(history)
+            return
 
 
 def _pick_trace(

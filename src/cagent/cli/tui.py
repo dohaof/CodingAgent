@@ -10,6 +10,7 @@ from __future__ import annotations
 import contextlib
 import datetime as dt
 import io
+import re
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -17,7 +18,9 @@ from typing import Any
 
 from rich import box
 from rich.console import Console
+from rich.markdown import Markdown
 from rich.panel import Panel
+from rich.segment import Segment
 from rich.syntax import Syntax
 from rich.table import Table
 from rich.text import Text
@@ -27,6 +30,7 @@ from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.message import Message as TextualMessage
 from textual.screen import ModalScreen
+from textual.strip import Strip
 from textual.widgets import Button, Footer, Input, Label, ListItem, ListView, Static, TextArea
 
 from ..agent.approval import ApprovalPolicy, Decision
@@ -229,13 +233,178 @@ class ComposerInput(Input):
 
 
 class TranscriptTextArea(TextArea):
-    """Selectable transcript with lightweight semantic line highlighting."""
+    """Selectable transcript with semantic and Markdown line highlighting.
+
+    ``TextArea`` keeps the source text, which is what makes selection and
+    clipboard support reliable.  Rich renderables cannot be inserted into a
+    ``TextArea`` directly, so Markdown is parsed while each line is painted
+    and its styles are mapped back onto the original source characters.  The
+    Markdown markers remain in the underlying document (and in copied text),
+    while the visible prose receives the same emphasis and code styling as
+    the regular console renderer.
+    """
 
     # Keep the transcript selectable with the mouse, but never make it the
     # keyboard target. In particular, this prevents IMEs from activating when
     # the user clicks or drags in the read-only conversation history.
     can_focus = False
     _right_button_selecting = False
+    _rendering_markdown = False
+
+    _fence_re = re.compile(r"^\s*(`{3,}|~{3,})")
+
+    def _in_code_fence(self, line_index: int) -> tuple[bool, bool]:
+        """Return ``(inside, fence_marker)`` for a source line.
+
+        Rich's Markdown parser needs the complete block to understand fenced
+        code.  The transcript is edited incrementally, so a small source scan
+        is both more predictable and cheaper than reparsing the whole
+        conversation on every repaint.
+        """
+        inside = False
+        marker: str | None = None
+        for index in range(line_index):
+            line = self.document.get_line(index)
+            match = self._fence_re.match(line)
+            if match is None:
+                continue
+            token = match.group(1)
+            if not inside:
+                inside = True
+                marker = token[0]
+            elif marker == token[0]:
+                inside = False
+                marker = None
+        current = self.document.get_line(line_index)
+        is_fence_marker = self._fence_re.match(current) is not None
+        return inside or is_fence_marker, is_fence_marker
+
+    @staticmethod
+    def _is_semantic_line(plain: str) -> bool:
+        """Lines whose explicit transcript style must take precedence."""
+        return (
+            # Rich Panel output is already laid out in terminal cells.  Do not
+            # feed its borders or contents through the Markdown parser again.
+            plain.startswith(("┌", "│", "└"))
+            or plain in {
+                "USER",
+                "ASSISTANT",
+                "SYSTEM",
+                "THINKING",
+                "COMMAND",
+                "WORKING DIRECTORY",
+                "PURPOSE",
+            }
+            or plain.startswith((
+                "TOOL ERROR:",
+                "TOOL RESULT:",
+                "TOOL:",
+                "  TOOL CALL:",
+                "APPROVAL 路",
+                "[Y]ES",
+                "+++ ",
+                "--- ",
+            ))
+            or (plain.startswith("+") and not plain.startswith(("+++", "+ ")))
+            or (plain.startswith("-") and not plain.startswith(("---", "- ")))
+        )
+
+    def _apply_markdown_styles(self, line: Text, line_index: int) -> None:
+        """Apply Rich Markdown styles without changing source coordinates."""
+        plain = line.plain
+        if not plain:
+            return
+
+        inside_fence, is_fence_marker = self._in_code_fence(line_index)
+        if inside_fence:
+            line.stylize("bold cyan" if is_fence_marker else "cyan")
+            if self._rendering_markdown:
+                self._replace_markdown_markers(line)
+            return
+
+        # A wide, non-wrapping console gives us one rendered line while still
+        # preserving Rich's inline parser (strong/emphasis/code/link styles).
+        console = Console(
+            width=max(len(plain) + 16, 120),
+            color_system="truecolor",
+            highlight=False,
+            soft_wrap=False,
+        )
+        segments = list(console.render(Markdown(plain), console.options))
+        rendered_lines = Segment.split_lines(segments)
+        if not rendered_lines:
+            return
+
+        search_from = 0
+        for segment_line in rendered_lines:
+            for segment in segment_line:
+                rendered = segment.text.rstrip()
+                style = segment.style
+                if not rendered or style is None:
+                    continue
+                position = plain.find(rendered, search_from)
+                if position < 0:
+                    # Bullets and quote bars are generated by Rich and are not
+                    # present in the source.  Continue looking for the actual
+                    # content instead of losing all following styles.
+                    position = plain.find(rendered)
+                if position < 0:
+                    continue
+                line.stylize(style, position, position + len(rendered))
+                search_from = position + len(rendered)
+
+        for match in re.finditer(r"^\s{0,3}[-+*](?=\s)", plain):
+            line.stylize("bold cyan", match.start(), match.end())
+
+        if self._rendering_markdown:
+            self._replace_markdown_markers(line)
+
+    @staticmethod
+    def _replace_markdown_markers(line: Text) -> None:
+        """Make Markdown delimiters zero-width in the visual line.
+
+        Replacing a marker with a zero-width code point keeps the original
+        Python string length, so TextArea selection offsets still refer to the
+        same source characters.  Unlike the terminal ``conceal`` style this
+        does not leave a variable number of blank columns around formatted
+        prose.
+        """
+        plain = line.plain
+        hidden: set[int] = set()
+
+        for pattern in (
+            r"(?<!\*)\*\*|(?<!_)__|(?<!`)`+|`+(?!`)",
+            r"(?<!\*)\*(?=\S)|(?<=\S)\*(?!\*)",
+            r"(?<!_)_(?=\S)|(?<=\S)_(?!_)",
+            r"~~",
+            r"(?m)^\s{0,3}#{1,6}(?=\s)",
+            r"(?m)^\s{0,3}>\s",
+        ):
+            for match in re.finditer(pattern, plain):
+                hidden.update(range(match.start(), match.end()))
+
+        for match in re.finditer(r"\[([^\]\n]+)\]\(([^)\n]+)\)", plain):
+            hidden.update(range(match.start(0), match.start(1)))
+            hidden.update(range(match.end(1), match.end(1) + 2))
+            hidden.update(range(match.start(2), match.end(2)))
+            hidden.update(range(match.end(2), match.end(0)))
+
+        fence = TranscriptTextArea._fence_re.match(plain)
+        if fence is not None:
+            hidden.update(range(fence.start(1), len(plain)))
+
+        if hidden:
+            line.plain = "".join(
+                "\u200b" if index in hidden else char for index, char in enumerate(plain)
+            )
+
+    def render_line(self, y: int) -> Strip:
+        """Render a line with zero-width Markdown syntax delimiters."""
+        self._rendering_markdown = True
+        try:
+            return super().render_line(y)
+        finally:
+            self._rendering_markdown = False
 
     def _watch_selection(self, previous_selection: Any, selection: Any) -> None:
         """Keep mouse selection from moving the terminal's input cursor.
@@ -285,6 +454,8 @@ class TranscriptTextArea(TextArea):
     def get_line(self, line_index: int) -> Text:
         line = super().get_line(line_index)
         plain = line.plain
+        if not self._is_semantic_line(plain):
+            self._apply_markdown_styles(line, line_index)
         if plain in {"USER", "ASSISTANT", "SYSTEM"}:
             styles = {
                 "USER": "bold cyan reverse",
@@ -293,15 +464,15 @@ class TranscriptTextArea(TextArea):
             }
             line.stylize(styles[plain])
         elif plain.startswith("TOOL ERROR:"):
-            line.stylize("bold red reverse")
+            line.stylize("bold bright_red")
         elif plain.startswith("TOOL RESULT:"):
-            line.stylize("bold green reverse")
+            line.stylize("bold bright_green")
         elif plain.startswith("TOOL:") or plain.startswith("  TOOL CALL:"):
-            line.stylize("bold yellow reverse")
+            line.stylize("bold bright_yellow")
         elif plain.startswith("APPROVAL · DANGEROUS"):
-            line.stylize("bold red reverse")
+            line.stylize("bold bright_red")
         elif plain.startswith("APPROVAL ·") or plain.startswith("[Y]ES"):
-            line.stylize("bold yellow reverse")
+            line.stylize("bold bright_yellow")
         elif plain == "THINKING":
             line.stylize("dim italic")
         elif plain in {"COMMAND", "WORKING DIRECTORY", "PURPOSE"}:
@@ -312,12 +483,12 @@ class TranscriptTextArea(TextArea):
             if separator and number.isdigit():
                 start = len(plain) - len(stripped)
                 line.stylize("cyan", start, start + len(number))
-        elif plain.startswith("+++") or (
-            plain.startswith("+") and not plain.startswith("+++")
+        elif plain.startswith("+++ ") or (
+            plain.startswith("+") and not plain.startswith(("+++", "+ "))
         ):
             line.stylize("green")
-        elif plain.startswith("---") or (
-            plain.startswith("-") and not plain.startswith("---")
+        elif plain.startswith("--- ") or (
+            plain.startswith("-") and not plain.startswith(("---", "- "))
         ):
             line.stylize("red")
         return line
@@ -368,7 +539,7 @@ class CagentTui(App[int]):
     """
 
     BINDINGS = [
-        Binding("ctrl+c", "interrupt", "Copy / interrupt", priority=True),
+        Binding("ctrl+c", "interrupt", "Copy / stop / quit", priority=True),
         Binding("ctrl+q", "quit_session", "Quit", priority=True),
         Binding("ctrl+r", "resume", "Resume", priority=True),
         Binding("f1", "help", "Help"),
@@ -528,7 +699,11 @@ class CagentTui(App[int]):
                     style = "red" if event.risk is RiskLevel.DANGEROUS else "yellow"
                     if event.call.name == "read_file":
                         suffix = ""
-                    self._write_label(f"TOOL: {event.call.name.upper()}{suffix}", style)
+                    self._write_label(
+                        f"TOOL: {event.call.name.upper()}{suffix}",
+                        style,
+                        reverse=False,
+                    )
             case ToolFinished():
                 self._render_tool_result(event)
             case CompactionDone():
@@ -676,12 +851,15 @@ class CagentTui(App[int]):
             values.append(text if key in ("path", "command", "pattern") else f"{key}={text}")
         return ", ".join(values)
 
-    def _write_label(self, label: str, color: str) -> None:
+    def _write_label(self, label: str, color: str, *, reverse: bool = True) -> None:
         """Write a prominent semantic label with spacing for quick scanning."""
         transcript = self.query_one("#conversation", TextArea)
         if transcript.text:
             self._append_transcript("\n")
-        self._write(Text(label.upper(), style=f"bold {color} reverse"))
+        if label.upper().startswith(("TOOL:", "APPROVAL ")):
+            reverse = False
+        style = f"bold {color}" + (" reverse" if reverse else "")
+        self._write(Text(label.upper(), style=style))
 
     def _handle_command(self, line: str) -> None:
         parts = line.split()
@@ -695,6 +873,27 @@ class CagentTui(App[int]):
             self.agent.guard.note_progress()
             self.query_one("#conversation", TextArea).load_text("")
             self._write(Text("Conversation context cleared.", style="dim"))
+            self._update_status()
+        elif name == "/undo":
+            before = len(self.agent.context.history)
+            output, error = self._capture_line_command_text(line)
+            if len(self.agent.context.history) < before:
+                transcript = self.query_one("#conversation", TextArea)
+                transcript.load_text("")
+                for renderable in restored_history_renderables(
+                    self.agent.context.history,
+                    session_id=self.agent.session_id,
+                    title="Conversation after /undo",
+                    description=(
+                        "The latest user turn was removed from model context. "
+                        "Filesystem and command effects were not reverted."
+                    ),
+                ):
+                    self._write(renderable)
+            if output.strip():
+                self._write(Text(output.rstrip()))
+            if error:
+                self._write(Text(error, style="red"))
             self._update_status()
         elif name == "/sandbox":
             self._run_line_command(line, background=True)
@@ -905,13 +1104,15 @@ class CagentTui(App[int]):
 
     def action_interrupt(self) -> None:
         conversation = self.query_one("#conversation", TextArea)
-        if conversation.selected_text and (self.focused is conversation or not self._busy):
+        if not self._busy and conversation.selected_text:
             conversation.action_copy()
             self.notify("Selected text copied", timeout=1.5)
             return
-        # Treat Ctrl+C as a session exit while a turn is running. The
-        # cancellation is still graceful: the worker records its partial
-        # response, then ``_finish_session`` flushes the trace.
+        if self._busy:
+            self._abort_pending_approval()
+            self.agent.interrupt()
+            self._set_activity("Interrupting current turn")
+            return
         self._request_close()
 
     def action_quit_session(self) -> None:
@@ -1070,10 +1271,24 @@ class CagentTui(App[int]):
         """Render without ANSI escapes so terminal selection copies clean text."""
         if isinstance(renderable, str):
             return renderable.rstrip("\n")
+        if isinstance(renderable, Markdown):
+            # Keep the source markup in the selectable document.  The
+            # TranscriptTextArea applies Rich's styles while painting it.
+            return renderable.markup.rstrip("\n")
+        # TextArea reserves two columns for its border/padding and one for the
+        # vertical scrollbar.  Rendering a panel at the full content width
+        # makes its right border wrap onto the next visual line.
+        if isinstance(renderable, Panel):
+            # TextArea adds one cursor column while rendering each source
+            # line, so leave that column free as well.
+            available_width = max(self.size.width - 7, 1)
+            width = min(available_width, 120)
+        else:
+            width = max(min(self.size.width - 4, 120), 40)
         buffer = io.StringIO()
         console = Console(
             file=buffer,
-            width=max(min(self.size.width - 4, 120), 40),
+            width=width,
             color_system=None,
             force_terminal=False,
             highlight=False,

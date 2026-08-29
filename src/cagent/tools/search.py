@@ -47,6 +47,8 @@ boundary — that rules out the otherwise obvious record separator ``\\x1e``,
 which would be swallowed as a newline before the parse ever saw it. The output
 is split on ``\\n`` explicitly for the same reason."""
 
+_RESULT_LINE_RE = re.compile(r"^(.+):(\d+)([:-])\s(.*)$")
+
 
 def _parse_ripgrep_line(raw: str) -> tuple[str, str, str, bool] | None:
     """Split one ripgrep output line into path, line number, text, and kind.
@@ -109,6 +111,31 @@ def _clip(line: str) -> str:
     if len(text) > _LINE_CLIP_CHARS:
         return text[:_LINE_CLIP_CHARS] + "…"
     return text
+
+
+def _group_search_lines(lines: list[str]) -> list[str]:
+    """Show each matched file once, followed by its numbered excerpts.
+
+    Keeping the path on a heading makes a long search result substantially
+    easier to scan while preserving ``:`` for matching lines and ``-`` for
+    surrounding context.  Non-result lines (for example the capped notice)
+    stay where the search engine emitted them.
+    """
+    grouped: list[str] = []
+    current_path: str | None = None
+    for line in lines:
+        match = _RESULT_LINE_RE.match(line)
+        if match is None:
+            grouped.append(line)
+            continue
+        path, number, separator, text = match.groups()
+        if path != current_path:
+            if grouped and grouped[-1] != "":
+                grouped.append("")
+            grouped.append(path)
+            current_path = path
+        grouped.append(f"    {number}{separator} {text}")
+    return grouped
 
 
 @dataclass
@@ -216,8 +243,9 @@ class GrepSearchTool(BaseTool):
     name: ClassVar[str] = "grep_search"
     description: ClassVar[str] = (
         "Search file contents with a regular expression and return matching "
-        "lines as path:line: text. Use it to find a symbol, a call site, or a "
-        "string before reading any file. Results are capped, so narrow the "
+        "lines grouped by file with line numbers and text. Use it to find a "
+        "symbol, a call site, or a string before reading any file. "
+        "Results are capped, so narrow the "
         "pattern or pass glob to focus the search."
     )
     risk: ClassVar[RiskLevel] = RiskLevel.SAFE
@@ -263,7 +291,7 @@ class GrepSearchTool(BaseTool):
                 metadata={"engine": engine, "matches": 0},
             )
 
-        body = "\n".join(hits.lines)
+        body = "\n".join(_group_search_lines(hits.lines))
         if hits.capped:
             body += f"\n[capped at {limit} results — refine the pattern or add a glob filter]"
 

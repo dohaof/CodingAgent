@@ -811,6 +811,22 @@ class TestTrace:
 
         assert [message.text for message in history] == ["old", "answer", "continue"]
 
+    def test_empty_history_checkpoint_keeps_an_undone_turn_removed(
+        self, config: AgentConfig
+    ) -> None:
+        config.trace_dir = config.workspace / "traces"
+        writer = TraceWriter.create(config, session_id="undo")
+        assert writer is not None
+        writer.handle(UserMessage("remove me"))
+        writer.record_history([])
+        writer.close()
+
+        records = read_trace(writer.path)
+
+        assert records[-1]["type"] == "history_checkpoint"
+        assert records[-1]["messages"] == []
+        assert history_from_trace(records) == []
+
     def test_restored_history_alone_is_discarded_as_an_empty_new_session(
         self, config: AgentConfig
     ) -> None:

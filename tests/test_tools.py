@@ -286,10 +286,13 @@ class TestListDirSymlinkSafety:
 
 
 class TestGrepSearch:
-    def test_matches_are_path_line_text(self, make_ctx, tree: Path, python_engine) -> None:
+    def test_matches_are_grouped_by_file(self, make_ctx, tree: Path, python_engine) -> None:
         harness = make_ctx(workspace=tree)
         outcome = GrepSearchTool().invoke({"pattern": r"def \w+\(", "path": "src"}, harness.ctx)
-        assert "a.py:1: def alpha():" in outcome.content
+        assert outcome.content == (
+            "a.py\n    1: def alpha():\n\n"
+            "b.py\n    4: def beta():"
+        )
         assert outcome.metadata["engine"] == "python"
 
     def test_generated_directories_are_skipped(self, make_ctx, tree: Path, python_engine) -> None:
@@ -327,8 +330,8 @@ class TestGrepSearch:
         outcome = GrepSearchTool().invoke(
             {"pattern": "return 1", "path": "src", "context": 1}, harness.ctx
         )
-        assert "a.py:1- def alpha():" in outcome.content
-        assert "a.py:2: " in outcome.content
+        assert "a.py\n    1- def alpha():" in outcome.content
+        assert "    2:     return 1" in outcome.content
 
     def test_no_matches_is_a_plain_answer_not_an_error(
         self, make_ctx, tree: Path, python_engine
@@ -355,7 +358,7 @@ class TestGrepSearch:
     def test_a_single_file_can_be_searched(self, make_ctx, tree: Path, python_engine) -> None:
         harness = make_ctx(workspace=tree)
         outcome = GrepSearchTool().invoke({"pattern": "alpha", "path": "src/a.py"}, harness.ctx)
-        assert "a.py:1:" in outcome.content
+        assert outcome.content == "a.py\n    1: def alpha():"
 
     def test_ripgrep_output_is_parsed_identically(self, make_ctx, tree: Path, monkeypatch) -> None:
         # The two engines must be interchangeable, so the same query is run

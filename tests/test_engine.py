@@ -44,7 +44,14 @@ from cagent.llm.base import (
 from cagent.llm.base import TextDelta as WireTextDelta
 from cagent.tools.base import ApprovalRequest, ToolOutcome
 from cagent.tools.registry import ToolRegistry, default_registry, tool
-from cagent.types import Message, RiskLevel, TextPart, Usage
+from cagent.types import (
+    Message,
+    RiskLevel,
+    TextPart,
+    ToolCallPart,
+    ToolResultPart,
+    Usage,
+)
 from tests.conftest import ScriptedProvider, text_turn, tool_turn
 
 
@@ -98,6 +105,41 @@ def auto(project: Path, **kwargs: object) -> AgentConfig:
 
 
 class TestTheCycle:
+    def test_undo_removes_a_whole_user_turn_including_tool_pairs(
+        self, project: Path
+    ) -> None:
+        agent, _, _ = make_agent(auto(project), [])
+        calls = [
+            ToolCallPart("a", "read_file", {"path": "a.py"}),
+            ToolCallPart("b", "read_file", {"path": "b.py"}),
+        ]
+        agent.context.history = [
+            Message.user("first request"),
+            Message.assistant(TextPart("first answer")),
+            Message.user("second request"),
+            Message(
+                role="user",
+                parts=[TextPart("internal compaction note")],
+                synthetic=True,
+            ),
+            Message.assistant(*calls),
+            Message.from_tool_results(
+                [ToolResultPart("a", "A"), ToolResultPart("b", "B")]
+            ),
+            Message.assistant(TextPart("second answer")),
+        ]
+
+        removed = agent.undo_last_turn()
+
+        assert removed == 5
+        assert [message.text for message in agent.context.history] == [
+            "first request",
+            "first answer",
+        ]
+        assert agent.undo_last_turn() == 2
+        assert agent.context.history == []
+        assert agent.undo_last_turn() == 0
+
     def test_restored_history_is_sent_before_the_next_turn(self, project: Path) -> None:
         agent, _, provider = make_agent(auto(project), [text_turn("continued")])
         agent.restore_history(
@@ -655,7 +697,9 @@ class TestTermination:
         agent, _, _ = make_agent(auto(project), [text_turn("ignored"), text_turn("second")])
         agent.interrupt()
         assert agent.run_turn("one").stopped_by == "aborted"
+        agent.policy.aborted = True
         agent.reset_interrupt()
+        assert not agent.policy.aborted
         assert agent.run_turn("two").completed
 
 

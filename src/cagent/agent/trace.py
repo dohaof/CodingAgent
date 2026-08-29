@@ -93,7 +93,10 @@ def _encode_message(message: Message) -> dict[str, Any]:
                     "is_error": part.is_error,
                 }
             )
-    return {"role": message.role, "parts": parts}
+    encoded: dict[str, Any] = {"role": message.role, "parts": parts}
+    if message.synthetic:
+        encoded["synthetic"] = True
+    return encoded
 
 
 def _jsonable(value: object) -> Any:
@@ -181,9 +184,12 @@ class TraceWriter:
             self._write(record)
 
     def record_history(self, messages: Sequence[Message]) -> None:
-        """Queue a history checkpoint for the next real turn in a resumed session."""
-        if not any(message.role == "user" and message.text.strip() for message in messages):
-            return
+        """Record the history that future events continue from.
+
+        An empty checkpoint is meaningful: commands such as ``/undo`` may
+        remove the only user turn, and replay must not resurrect it from older
+        append-only events.
+        """
         self._pending_history = list(messages)
         if self._handle is None:
             return
@@ -437,7 +443,11 @@ def _decode_message(raw: object) -> Message | None:
                 parts.append(
                     ToolResultPart(call_id, content, bool(item.get("is_error", False)))
                 )
-    return Message(role=role, parts=parts) if parts else None
+    return (
+        Message(role=role, parts=parts, synthetic=bool(raw.get("synthetic", False)))
+        if parts
+        else None
+    )
 
 
 def history_from_trace(records: Sequence[Mapping[str, Any]]) -> list[Message]:
@@ -482,7 +492,10 @@ def history_from_trace(records: Sequence[Mapping[str, Any]]) -> list[Message]:
                     for raw_message in raw_messages
                     if (message := _decode_message(raw_message)) is not None
                 ]
-                if restored:
+                # An explicitly empty checkpoint clears history. If a non-empty
+                # checkpoint is entirely malformed, retain the earlier valid
+                # history instead of treating corruption as an undo.
+                if restored or not raw_messages:
                     history = restored
                     pending.clear()
         elif kind == "user":

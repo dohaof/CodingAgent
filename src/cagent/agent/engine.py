@@ -216,6 +216,26 @@ class Agent:
         self.context.compactions = 0
         self.guard.note_progress()
 
+    def undo_last_turn(self) -> int:
+        """Remove the latest user turn and everything that answered it.
+
+        Tool calls and their results are deliberately removed together. This
+        only changes model context; filesystem edits and command side effects
+        from the turn have already happened and cannot be undone here.
+
+        Returns:
+            The number of messages removed, or zero when there is no user turn.
+        """
+        for index in range(len(self.context.history) - 1, -1, -1):
+            message = self.context.history[index]
+            if message.role != "user" or message.synthetic:
+                continue
+            removed = len(self.context.history) - index
+            del self.context.history[index:]
+            self.guard.note_progress()
+            return removed
+        return 0
+
     def finish(self, reason: str, *, trace_path: str | None = None) -> RunFinished:
         """Emit and return the closing event."""
         self._finalize_sandbox()
@@ -591,6 +611,7 @@ class Agent:
     def reset_interrupt(self) -> None:
         """Clear a previous interrupt so the session can continue."""
         self.abort.clear()
+        self.policy.aborted = False
 
     def sandbox_status(self) -> str:
         """Return a concise status line for the interactive CLI."""

@@ -10,8 +10,10 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import signal
 from collections.abc import Callable
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from rich.console import Console
@@ -20,6 +22,7 @@ from textual.events import MouseDown
 from textual.widgets import Input, TextArea
 
 from cagent.agent.approval import Decision
+from cagent.agent.engine import Agent, TurnResult
 from cagent.agent.events import (
     ApprovalDecided,
     CompactionDone,
@@ -30,15 +33,25 @@ from cagent.agent.events import (
     TextDelta,
     ToolFinished,
     ToolStarted,
+    UserMessage,
     Warning,
 )
-from cagent.cli.app import _command, _overrides, _print_help, build_parser, main
+from cagent.agent.trace import TraceWriter, history_from_trace, read_trace
+from cagent.cli.app import (
+    _command,
+    _install_interrupt_handler,
+    _overrides,
+    _print_help,
+    _repl,
+    build_parser,
+    main,
+)
 from cagent.cli.pricing import Price, estimate_cost, parse_prices, price_for
-from cagent.cli.render import ConsoleRenderer, prompt_for_approval
+from cagent.cli.render import ConsoleRenderer, _restored_detail, prompt_for_approval
 from cagent.cli.tui import CagentTui, ComposerInput, TranscriptTextArea, _ApprovalWaiter
 from cagent.config import AgentConfig
 from cagent.tools.base import ApprovalRequest, ToolOutcome
-from cagent.types import Message, RiskLevel, TextPart, ToolCallPart, Usage
+from cagent.types import Message, RiskLevel, TextPart, ToolCallPart, ToolResultPart, Usage
 
 
 @pytest.fixture
@@ -187,6 +200,47 @@ class TestInformationalCommands:
         assert "/resume" in out and "list saved conversations" in out
         assert "/resume ID" in out and "/resume PATH" in out
         assert "current Agent" in out
+
+    def test_help_undo_explains_context_only_scope(self, captured) -> None:
+        console, buffer = captured
+        _print_help(console, "undo")
+        out = buffer.getvalue()
+        assert "/undo" in out
+        assert "Tool calls and results are removed as one unit" in out
+        assert "does not revert files" in out
+
+    def test_undo_checkpoints_the_remaining_history(
+        self, captured, config: AgentConfig
+    ) -> None:
+        console, buffer = captured
+        config.trace_dir = config.workspace / "traces"
+        writer = TraceWriter.create(config, session_id="undo-command")
+        assert writer is not None
+        writer.handle(UserMessage("stale trace history"))
+
+        class StubAgent:
+            def __init__(self) -> None:
+                self.context = SimpleNamespace(
+                    history=[
+                        Message.user("keep request"),
+                        Message.assistant(TextPart("keep answer")),
+                        Message.user("remove request"),
+                        Message.assistant(TextPart("remove answer")),
+                    ]
+                )
+                self.guard = SimpleNamespace(note_progress=lambda: None)
+                self.sink = SimpleNamespace(sinks=[writer])
+
+            def undo_last_turn(self) -> int:
+                return Agent.undo_last_turn(self)  # type: ignore[arg-type]
+
+        agent = StubAgent()
+        _command(console, agent, config, "/undo")  # type: ignore[arg-type]
+        writer.close()
+
+        restored = history_from_trace(read_trace(writer.path))
+        assert [message.text for message in restored] == ["keep request", "keep answer"]
+        assert "command effects were not reverted" in buffer.getvalue()
 
     def test_trace_instruction_is_not_exposed(self, captured, tmp_path: Path) -> None:
         console, buffer = captured
@@ -642,6 +696,25 @@ class TestRendering:
         assert "more lines" in out
         assert "line 199" not in out
 
+    def test_numbered_tool_output_keeps_the_first_line_aligned(self, config, captured) -> None:
+        console, buffer = captured
+        renderer = ConsoleRenderer(config, console=console)
+        renderer._print_result_body(
+            '     1\t"""Basic arithmetic helpers."""\n     2\t\n     3\tdef add(a, b):',
+            style="dim",
+        )
+        lines = buffer.getvalue().splitlines()
+        assert lines[0].startswith("         1")
+        assert lines[1].startswith("         2")
+        assert lines[2].startswith("         3")
+
+    def test_restored_numbered_detail_keeps_the_first_line_aligned(self) -> None:
+        rendered = _restored_detail("     1\tfirst\n     2\tsecond")
+        assert [item.plain for item in rendered] == [
+            "         1\tfirst",
+            "         2\tsecond",
+        ]
+
     def test_a_step_reports_its_share_of_the_window(self, config, captured) -> None:
         console, buffer = captured
         renderer = ConsoleRenderer(config, console=console)
@@ -774,7 +847,83 @@ class TestRendering:
         assert buffer.getvalue().count("The answer is 42.") == 1
 
 
+class TestInterruptHandling:
+    def test_ctrl_c_interrupts_a_busy_line_turn_but_idle_ctrl_c_exits(
+        self, captured, monkeypatch
+    ) -> None:
+        console, _ = captured
+
+        class StubAgent:
+            def __init__(self) -> None:
+                self.interruptions = 0
+                self.abort = SimpleNamespace(is_set=lambda: False)
+
+            def interrupt(self) -> None:
+                self.interruptions += 1
+
+            def reset_interrupt(self) -> None:
+                pass
+
+            def run_turn(self, text: str) -> TurnResult:
+                assert text == "first task"
+                handler = signal.getsignal(signal.SIGINT)
+                assert callable(handler)
+                handler(signal.SIGINT, None)  # type: ignore[call-arg]
+                return TurnResult("", 1, Usage(1, 1), "aborted")
+
+        agent = StubAgent()
+        previous = signal.getsignal(signal.SIGINT)
+        try:
+            state = _install_interrupt_handler(agent, console)
+            commands = iter(("first task", "/exit"))
+            monkeypatch.setattr("builtins.input", lambda: next(commands))
+            assert _repl(console, agent, SimpleNamespace(), state) == 0
+            assert agent.interruptions == 1
+            assert not state.busy
+
+            handler = signal.getsignal(signal.SIGINT)
+            assert callable(handler)
+            with pytest.raises(KeyboardInterrupt):
+                handler(signal.SIGINT, None)  # type: ignore[call-arg]
+        finally:
+            signal.signal(signal.SIGINT, previous)
+
+
 class TestTui:
+    def test_undo_rebuilds_the_transcript_without_the_latest_user_turn(
+        self, config: AgentConfig
+    ) -> None:
+        app = CagentTui(config)
+
+        async def exercise_undo() -> None:
+            async with app.run_test(size=(100, 30)):
+                app.agent.context.history = [
+                    Message.user("keep this request"),
+                    Message.assistant(TextPart("keep this answer")),
+                    Message.user("remove this request"),
+                    Message.assistant(
+                        ToolCallPart("call", "read_file", {"path": "a.py"})
+                    ),
+                    Message.from_tool_results([ToolResultPart("call", "contents")]),
+                    Message.assistant(TextPart("remove this answer")),
+                ]
+                app._handle_command("/undo")
+
+                history = app.agent.context.history
+                transcript = app.query_one("#conversation", TextArea).text
+                assert [message.text for message in history] == [
+                    "keep this request",
+                    "keep this answer",
+                ]
+                assert "keep this request" in transcript
+                assert "remove this request" not in transcript
+                assert "command effects were not reverted" in transcript.lower()
+
+        try:
+            asyncio.run(exercise_undo())
+        finally:
+            app.emergency_close()
+
     def test_full_screen_app_mounts_headlessly(self, config: AgentConfig) -> None:
         class SmokeApp(CagentTui):
             mounted_ok = False
@@ -816,11 +965,55 @@ class TestTui:
                 assert "SHELL" in transcript.text
                 assert "host (unrestricted)" in transcript.text
                 assert "read_file" in transcript.text
+                panel_lines = transcript.text.splitlines()
+                assert len({len(line) for line in panel_lines}) == 1
                 self.exit(result=0)
 
         app = StartupApp(config)
         try:
             assert app.run(headless=True, size=(100, 30)) == 0
+        finally:
+            app.emergency_close()
+
+    def test_startup_panel_right_border_stays_in_one_visual_column(
+        self, config: AgentConfig
+    ) -> None:
+        app = CagentTui(config)
+
+        async def inspect_rendered_panel() -> None:
+            async with app.run_test(size=(120, 30)) as pilot:
+                transcript = app.query_one("#conversation", TranscriptTextArea)
+                transcript.load_text("")
+                app._render_event(
+                    RunStarted(
+                        task="(interactive)",
+                        model="test-model",
+                        endpoint="https://api.test.invalid/v1",
+                        system_tokens=1200,
+                        tool_names=("read_file", "edit_file"),
+                    )
+                )
+                await pilot.pause()
+
+                source_lines = transcript.text.splitlines()
+                rendered_lines = [
+                    "".join(segment.text for segment in transcript.render_line(index)._segments)
+                    for index in range(len(source_lines))
+                ]
+                right_borders = [
+                    max(
+                        index
+                        for index, character in enumerate(line)
+                        if character in {"┐", "│", "┘"}
+                    )
+                    for line in rendered_lines
+                ]
+
+                assert len(set(right_borders)) == 1
+                assert any("read_file" in line for line in rendered_lines)
+
+        try:
+            asyncio.run(inspect_rendered_panel())
         finally:
             app.emergency_close()
 
@@ -831,11 +1024,38 @@ class TestTui:
         )
         assert str(transcript.get_line(0).spans[0].style) == "bold cyan reverse"
         assert str(transcript.get_line(1).spans[0].style) == "bold green reverse"
-        assert str(transcript.get_line(2).spans[0].style) == "bold yellow reverse"
+        assert str(transcript.get_line(2).spans[0].style) == "bold bright_yellow"
         assert str(transcript.get_line(3).spans[0].style) == "red"
         assert str(transcript.get_line(4).spans[0].style) == "green"
         assert str(transcript.get_line(5).spans[0].style) == "red"
         assert str(transcript.get_line(6).spans[0].style) == "green"
+
+    def test_transcript_renders_markdown_while_retaining_selectable_source(self) -> None:
+        transcript = TranscriptTextArea(
+            "**bold**\n*italic*\n***both***\n~~strike~~\n# heading\n```python\nprint(1)\n```",
+            read_only=True,
+        )
+
+        assert transcript.document.get_line(0) == "**bold**"
+        assert transcript.document.get_line(1) == "*italic*"
+        assert transcript.document.get_line(2) == "***both***"
+        assert transcript.document.get_line(3) == "~~strike~~"
+
+        prose = transcript.get_line(0)
+        assert any(str(span.style) == "bold" for span in prose.spans)
+        assert any(str(span.style) == "italic" for span in transcript.get_line(1).spans)
+        assert any(
+            "bold" in str(span.style) and "italic" in str(span.style)
+            for span in transcript.get_line(2).spans
+        )
+        assert any("strike" in str(span.style) for span in transcript.get_line(3).spans)
+        assert any("underline" in str(span.style) for span in transcript.get_line(4).spans)
+
+        visual = prose.copy()
+        TranscriptTextArea._replace_markdown_markers(visual)
+        assert visual.plain.replace("\u200b", "") == "bold"
+        assert "\u200b" in visual.plain
+        assert str(transcript.get_line(6).spans[0].style) == "cyan"
 
     def test_tool_events_are_written_with_distinguishable_transcript_labels(
         self, config: AgentConfig
@@ -853,7 +1073,7 @@ class TestTui:
                 )
                 conversation = self.query_one("#conversation", TextArea)
                 assert "TOOL: READ_FILE" in conversation.text
-                assert str(conversation.get_line(0).spans[0].style) == "bold yellow reverse"
+                assert str(conversation.get_line(0).spans[0].style) == "bold bright_yellow"
                 self._render_event(
                     ToolFinished(
                         call=ToolCallPart(
@@ -869,7 +1089,7 @@ class TestTui:
                 assert "TOOL RESULT: 1 of 1 lines" in conversation.text
                 assert conversation.text.count("add.py") == 1
                 assert "\n    1  content" in conversation.text
-                assert str(conversation.get_line(1).spans[0].style) == "bold green reverse"
+                assert str(conversation.get_line(1).spans[0].style) == "bold bright_green"
                 self.exit(result=0)
 
         app = ToolApp(config)
@@ -997,6 +1217,24 @@ class TestTui:
             assert "selectable transcript" in app.copied
             assert app.read_only
             assert not app.has_topbar
+        finally:
+            app.emergency_close()
+
+    def test_ctrl_c_interrupts_busy_turn_without_closing_session(
+        self, config: AgentConfig
+    ) -> None:
+        app = CagentTui(config)
+
+        async def exercise_interrupt() -> None:
+            async with app.run_test(size=(100, 30)):
+                app._set_busy(True, "Working")
+                app.action_interrupt()
+                assert app.agent.abort.is_set()
+                assert not app._closing_session
+                assert not app._exit_after_turn
+
+        try:
+            asyncio.run(exercise_interrupt())
         finally:
             app.emergency_close()
 

@@ -87,6 +87,8 @@ class Message:
     parts: list[ContentPart] = field(default_factory=list)
     token_estimate: int | None = None
     """Cached token count, filled in by the context manager. ``None`` = stale."""
+    synthetic: bool = False
+    """Whether this is an internal context-management message, not a real turn."""
 
     @classmethod
     def user(cls, text: str) -> Message:
@@ -187,4 +189,3 @@ class RiskLevel(enum.IntEnum):
 
     DANGEROUS = 2
     """Destructive or irreversible; requires explicit typed approval."""
-

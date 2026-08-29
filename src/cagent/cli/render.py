@@ -97,7 +97,11 @@ def _format_arguments(call: ToolCallPart) -> str:
 def _restored_detail(text: str, *, style: str = "dim") -> list[Text]:
     """Build a bounded tool/thinking excerpt without hiding that it was clipped."""
     rendered: list[Text] = []
-    lines = text.strip().splitlines()
+    lines = text.splitlines()
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    while lines and not lines[-1].strip():
+        lines.pop()
     shown = lines[:_MAX_RESTORED_DETAIL_LINES]
     for line in shown:
         clipped = (
@@ -120,14 +124,13 @@ def restored_history_renderables(
     messages: Sequence[Message],
     *,
     session_id: str,
+    title: str | None = None,
+    description: str = "The transcript below now replaces the active conversation context.",
 ) -> list[Text | Markdown | Rule]:
     """Build the transcript that replaces the active model context."""
     rendered: list[Text | Markdown | Rule] = [
-        Rule(Text(f"Restored context: {session_id}", style="bold green"), style="green"),
-        Text(
-            "The transcript below now replaces the active conversation context.",
-            style="dim",
-        ),
+        Rule(Text(title or f"Restored context: {session_id}", style="bold green"), style="green"),
+        Text(description, style="dim"),
     ]
 
     call_names: dict[str, str] = {}
@@ -387,10 +390,13 @@ class ConsoleRenderer:
 
     def _print_result_body(self, content: str, *, style: str) -> None:
         """Show a bounded excerpt of a tool result, indented under its call."""
-        text = content.strip()
-        if not text:
+        lines = content.splitlines()
+        while lines and not lines[0].strip():
+            lines.pop(0)
+        while lines and not lines[-1].strip():
+            lines.pop()
+        if not lines:
             return
-        lines = text.split("\n")
         shown = lines[:_MAX_RESULT_LINES]
         for line in shown:
             self.console.print(Text("    " + line[:200], style=style))
