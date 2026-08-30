@@ -537,7 +537,7 @@ than guessing.
 
 ## Testing
 
-581 tests, hermetic: no network, no real sleeps, no dependence on the machine's
+610 tests, hermetic: no network, no real sleeps, no dependence on the machine's
 PATH. `mypy` clean, `ruff` clean, 86% line coverage.
 
 The interesting choices are in what gets tested. A scripted provider records the
@@ -613,10 +613,14 @@ kernel-grade security guarantee: Docker itself must be trusted and kept patched,
 and the host project is protected by never mounting it read/write into the
 container and by requiring a reviewed copy-back.
 
-**The repo map is signatures only, and can go stale.** It is an index that tells
-the model a symbol exists so it can search for it — never a substitute for reading
-the file, which the system prompt says explicitly. It is rebuilt after the agent
-writes, because a map that still describes the old tree is worse than none.
+**The repo map is a task-aware structural index, not source code.** It keeps
+paths for every supported source file, extracts declarations plus imports and
+exports, and ranks them against the current task. Python uses the standard AST;
+other languages use a locally cached Tree-sitter grammar when available and a
+conservative fallback otherwise. A layered token budget preserves many paths
+before adding detail, and an incremental index reparses only changed files.
+The map is a navigation aid, never a substitute for reading the file before
+editing it. Grammar downloads are never triggered implicitly during startup.
 
 **Parallel tool calls execute sequentially.** The model may request several in one
 step and all of them run, but in order. Concurrency would help on independent

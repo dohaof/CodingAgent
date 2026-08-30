@@ -31,11 +31,13 @@ from textual.containers import Horizontal, Vertical
 from textual.message import Message as TextualMessage
 from textual.screen import ModalScreen
 from textual.strip import Strip
+from textual.timer import Timer
 from textual.widgets import Button, Footer, Input, Label, ListItem, ListView, Static, TextArea
 
 from ..agent.approval import ApprovalPolicy, Decision
 from ..agent.engine import Agent, TurnResult
 from ..agent.events import (
+    Activity,
     AgentEvent,
     ApprovalDecided,
     ApprovalRequested,
@@ -84,6 +86,12 @@ class TurnCompleted(TextualMessage):
     def __init__(self, result: TurnResult | None, error: str | None = None) -> None:
         super().__init__()
         self.result = result
+        self.error = error
+
+
+class SessionInitialized(TextualMessage):
+    def __init__(self, error: str | None = None) -> None:
+        super().__init__()
         self.error = error
 
 
@@ -557,6 +565,10 @@ class CagentTui(App[int]):
         self.quiet = quiet
         self.show_thinking = show_thinking
         self._busy = False
+        self._initializing = False
+        self._activity_base = "Ready"
+        self._activity_frame = 0
+        self._activity_timer: Timer | None = None
         self._closing_session = False
         self._closed_session = False
         self._exit_after_turn = False
@@ -576,6 +588,7 @@ class CagentTui(App[int]):
             sink=self.sink,
             policy=self.policy,
             registry=default_registry(),
+            defer_initial_prompt=True,
         )
         self.trace = TraceWriter.create(config, session_id=self.agent.session_id)
         if self.trace is not None:
@@ -594,11 +607,55 @@ class CagentTui(App[int]):
         yield Footer()
 
     def on_mount(self) -> None:
-        self.query_one("#composer", Input).focus()
-        self.agent.announce("(interactive)")
-        self._update_status()
+        composer = self.query_one("#composer", ComposerInput)
+        self._initializing = True
+        composer.disabled = True
+        self._set_activity(
+            "Building repo map" if self.config.repo_map_enabled else "Preparing context",
+            animate=True,
+        )
+        composer.set_prompt_hint("Starting agent · Ctrl+C stops")
+        self.call_after_refresh(self._start_initialization)
+
+    def _start_initialization(self) -> None:
+        """Initialize after the first paint so startup progress is visible."""
+        self.run_worker(
+            self._initialize_session,
+            name="initialize-session",
+            group="agent",
+            thread=True,
+            exclusive=True,
+            exit_on_error=False,
+        )
+
+    def _initialize_session(self) -> None:
+        try:
+            self.agent.initialize()
+        except Exception as exc:  # noqa: BLE001  # keep startup errors inside the TUI
+            self.post_message(SessionInitialized(f"{type(exc).__name__}: {exc}"))
+        else:
+            self.post_message(SessionInitialized())
+
+    @on(SessionInitialized)
+    def on_session_initialized(self, message: SessionInitialized) -> None:
+        if not self.query("#composer"):
+            return
+        self._initializing = False
+        composer = self.query_one("#composer", ComposerInput)
+        composer.disabled = False
+        self._set_busy(False, "Ready")
+        if message.error is not None:
+            self._write(Text(f"Agent initialization failed: {message.error}", style="red"))
+            self._set_activity("Initialization failed", animate=False)
+        else:
+            self.agent.announce("(interactive)")
+            self._update_status()
+        composer.focus()
+        if self._exit_after_turn:
+            self._begin_close()
 
     def on_unmount(self) -> None:
+        self._stop_activity_animation()
         if self._approval_waiter is not None:
             self._approval_waiter.resolve(Decision(False, abort=True))
             self._approval_waiter = None
@@ -613,7 +670,7 @@ class CagentTui(App[int]):
             return
         if not text:
             return
-        if self._busy:
+        if self._busy or self._initializing:
             self._write(Text("The agent is busy. Press Ctrl+C to interrupt it.", style="yellow"))
             return
         if text.startswith("/"):
@@ -654,10 +711,14 @@ class CagentTui(App[int]):
 
     @on(AgentEventArrived)
     def on_agent_event_arrived(self, message: AgentEventArrived) -> None:
+        if not self.query("#conversation"):
+            return
         self._render_event(message.event)
 
     def _render_event(self, event: AgentEvent) -> None:
         match event:
+            case Activity():
+                self._set_activity(event.message, animate=True)
             case RunStarted():
                 self._write(self._session_panel(event))
                 self._update_status()
@@ -671,8 +732,9 @@ class CagentTui(App[int]):
                 self._stream_kind = None
                 self._stream_start_offset = None
                 self._set_activity(
-                    f"Working · step {event.step} · "
-                    f"{event.prompt_tokens_estimate:,} tokens ({pressure:.0%})"
+                    f"Waiting for agent response · step {event.step} · "
+                    f"{event.prompt_tokens_estimate:,} tokens ({pressure:.0%})",
+                    animate=True,
                 )
             case ThinkingDelta():
                 if self.show_thinking and not self.quiet:
@@ -687,12 +749,14 @@ class CagentTui(App[int]):
             case ApprovalRequested():
                 self._set_activity(f"Waiting for approval · {event.request.tool}")
             case ApprovalDecided():
+                self._stop_activity_animation()
                 if not event.automatic:
                     verdict = "Approved" if event.approved else "Declined"
                     note = " for this session" if event.remembered else ""
                     style = "green" if event.approved else "red"
                     self._write(Text(verdict + note, style=style))
             case ToolStarted():
+                self._set_activity(f"Running tool: {event.call.name}", animate=True)
                 if not self.quiet:
                     arguments = self._format_arguments(event.call.arguments)
                     suffix = f"({arguments})" if arguments else "()"
@@ -719,7 +783,7 @@ class CagentTui(App[int]):
                 if event.detail:
                     self._write(Text(event.detail, style="dim"))
             case TurnFinished():
-                self._set_activity("Ready")
+                self._set_activity("Ready", animate=False)
             case RunFinished():
                 self._write(
                     Text(
@@ -1104,7 +1168,7 @@ class CagentTui(App[int]):
 
     def action_interrupt(self) -> None:
         conversation = self.query_one("#conversation", TextArea)
-        if not self._busy and conversation.selected_text:
+        if conversation.selected_text and not self._busy:
             conversation.action_copy()
             self.notify("Selected text copied", timeout=1.5)
             return
@@ -1119,7 +1183,7 @@ class CagentTui(App[int]):
         self._request_close()
 
     def action_resume(self) -> None:
-        if self._busy:
+        if self._busy or self._initializing:
             self._write(
                 Text("Finish or interrupt the current turn before resuming.", style="yellow")
             )
@@ -1127,13 +1191,13 @@ class CagentTui(App[int]):
             self._open_resume()
 
     def action_help(self) -> None:
-        if not self._busy:
+        if not self._busy and not self._initializing:
             self._run_line_command("/help", background=False)
 
     def _request_close(self) -> None:
         if self._closing_session:
             return
-        if self._busy:
+        if self._busy or self._initializing:
             self._exit_after_turn = True
             self._abort_pending_approval()
             self.agent.interrupt()
@@ -1297,22 +1361,52 @@ class CagentTui(App[int]):
         console.print(renderable)
         return buffer.getvalue().rstrip("\n")
 
-    def _set_activity(self, text: str) -> None:
-        self.query_one("#activity", Static).update(text)
+    def _render_activity(self) -> None:
+        """Render the current phase and its local progress animation."""
+        suffix = "." * self._activity_frame if self._activity_timer is not None else ""
+        self.query_one("#activity", Static).update(self._activity_base + suffix)
+
+    def _tick_activity(self) -> None:
+        """Advance the four-frame activity indicator."""
+        if self._activity_timer is None:
+            return
+        self._activity_frame = self._activity_frame % 4 + 1
+        self._render_activity()
+
+    def _stop_activity_animation(self) -> None:
+        timer, self._activity_timer = self._activity_timer, None
+        if timer is not None:
+            timer.stop()
+
+    def _set_activity(self, text: str, *, animate: bool | None = None) -> None:
+        """Set the status text, optionally keeping a four-frame dot indicator."""
+        self._stop_activity_animation()
+        self._activity_base = text
+        self._activity_frame = 0
+        if animate is None:
+            animate = self._busy
+        if animate:
+            self._activity_frame = 1
+            self._activity_timer = self.set_interval(
+                0.35, self._tick_activity, name="activity indicator"
+            )
+        self._render_activity()
 
     def _set_busy(self, busy: bool, activity: str) -> None:
         self._busy = busy
-        self._set_activity(activity)
+        self._set_activity(activity, animate=busy)
         composer = self.query_one("#composer", ComposerInput)
         composer.set_prompt_hint(
             "Agent is working · Ctrl+C interrupts" if busy else "Ask cagent or enter /help"
         )
 
     def _update_status(self) -> None:
+        if self._busy or self._initializing:
+            return
         tokens = self.agent.context.token_count()
         sandbox = self.agent.sandbox_status()
         restored = f" · resumed {self._restored_from}" if self._restored_from else ""
-        self.query_one("#activity", Static).update(
+        self._set_activity(
             f"{'Working' if self._busy else 'Ready'} · {self.config.approval_mode} · "
             f"sandbox {sandbox} · shell {self._shell_execution_status()} · "
             f"paths {self._path_boundary_status()} · "

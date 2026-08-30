@@ -23,7 +23,7 @@ from pathlib import Path
 from ..config import AgentConfig
 from ..llm.tokens import estimate_text
 from ..types import ToolSpec
-from .repomap import RepoMap, build_repo_map
+from .repomap import RepoMap, RepoMapIndex
 
 __all__ = ["PromptBuilder", "SystemPrompt"]
 
@@ -91,6 +91,7 @@ class PromptBuilder:
     workspace: Path | None = None
     _cached_map: RepoMap | None = None
     _map_built: bool = False
+    _index: RepoMapIndex | None = None
 
     def build(
         self,
@@ -98,6 +99,7 @@ class PromptBuilder:
         tools: tuple[ToolSpec, ...] = (),
         refresh_map: bool = False,
         extra_context: str = "",
+        query: str = "",
     ) -> SystemPrompt:
         """Render the prompt.
 
@@ -107,6 +109,7 @@ class PromptBuilder:
                 in prose wastes tokens and invites contradiction.
             refresh_map: Rebuild the repo map even if one is cached.
             extra_context: Project-specific instructions to append verbatim.
+            query: The current user task, used to rank relevant files.
         """
         sections = [_IDENTITY, self._environment(), _WORKFLOW, _OUTPUT_RULES]
 
@@ -114,7 +117,7 @@ class PromptBuilder:
             names = ", ".join(spec.name for spec in tools)
             sections.append(f"Tools available: {names}.")
 
-        repo_map = self._repo_map(refresh=refresh_map)
+        repo_map = self._repo_map(refresh=refresh_map, query=query)
         if repo_map is not None and not repo_map.is_empty():
             sections.append(self._render_map(repo_map))
 
@@ -206,17 +209,24 @@ class PromptBuilder:
                 continue
         return found
 
-    def _repo_map(self, *, refresh: bool) -> RepoMap | None:
+    def _repo_map(self, *, refresh: bool, query: str = "") -> RepoMap | None:
         """The cached map, building or rebuilding it when asked."""
         if not self.config.repo_map_enabled:
             return None
+        workspace = self.workspace or self.config.workspace
+        if self._index is None or self._index.workspace != workspace:
+            # Sandbox toggles replace the visible tree. Do not reuse outlines
+            # parsed from the previous host/snapshot workspace.
+            self._index = RepoMapIndex(workspace)
+            self._map_built = False
         if refresh or not self._map_built:
-            self._cached_map = build_repo_map(
-                self.workspace or self.config.workspace,
-                token_budget=self.config.repo_map_token_budget,
-                model=self.config.model_for_tokens,
-            )
+            self._index.refresh()
             self._map_built = True
+        self._cached_map = self._index.render(
+            token_budget=self.config.repo_map_token_budget,
+            model=self.config.model_for_tokens,
+            query=query,
+        )
         return self._cached_map
 
     @staticmethod
@@ -224,7 +234,7 @@ class PromptBuilder:
         """Wrap the map in enough framing that the model trusts it correctly."""
         header = (
             f"Project map ({repo_map.files_included} of {repo_map.files_total} source files, "
-            "declarations only — read a file before editing it):"
+            "structure only - read a file before editing it):"
         )
         body = repo_map.text
         if repo_map.notes:

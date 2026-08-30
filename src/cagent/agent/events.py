@@ -18,6 +18,7 @@ from ..tools.base import ApprovalRequest, ToolOutcome
 from ..types import Message, RiskLevel, ToolCallPart, Usage
 
 __all__ = [
+    "Activity",
     "AgentEvent",
     "ApprovalDecided",
     "ApprovalRequested",
@@ -40,6 +41,18 @@ __all__ = [
 
 
 _E = TypeVar("_E")
+
+
+@dataclass(frozen=True, slots=True)
+class Activity:
+    """A transient human-facing phase of the current operation.
+
+    Activity events are intentionally not persisted in traces. They describe
+    what a renderer should show while work is in progress; the renderer owns
+    any local animation or other presentation details.
+    """
+
+    message: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -176,7 +189,8 @@ class RunFinished:
 
 
 AgentEvent = (
-    RunStarted
+    Activity
+    | RunStarted
     | UserMessage
     | StepStarted
     | ThinkingDelta

@@ -35,6 +35,7 @@ from rich.text import Text
 
 from ..agent.approval import Decision
 from ..agent.events import (
+    Activity,
     AgentEvent,
     ApprovalDecided,
     ApprovalRequested,
@@ -224,6 +225,8 @@ class ConsoleRenderer:
 
     def _dispatch(self, event: AgentEvent) -> None:
         match event:
+            case Activity():
+                pass  # transient TUI status; line-oriented output stays quiet
             case RunStarted():
                 self._on_run_started(event)
             case UserMessage():

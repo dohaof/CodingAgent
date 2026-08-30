@@ -52,6 +52,7 @@ from ..types import Message, RiskLevel, ToolCallPart, ToolResultPart, Usage
 from .approval import ApprovalPolicy
 from .context import ContextManager
 from .events import (
+    Activity,
     AgentEvent,
     ApprovalDecided,
     ApprovalRequested,
@@ -122,6 +123,7 @@ class Agent:
     registry: ToolRegistry
     policy: ApprovalPolicy
     sink: EventSink
+    defer_initial_prompt: bool = False
     context: ContextManager = field(init=False)
     prompt_builder: PromptBuilder = field(init=False)
     guard: LoopGuard = field(init=False)
@@ -130,7 +132,9 @@ class Agent:
     usage: Usage = field(default_factory=Usage)
     started: float = field(default_factory=time.monotonic)
     _system: str = ""
+    _current_task: str = ""
     _files_changed: bool = False
+    _initialized: bool = field(init=False, default=False)
     sandbox: SandboxSession | None = field(init=False, default=None)
     sandbox_warning: str | None = field(init=False, default=None)
 
@@ -141,7 +145,8 @@ class Agent:
         )
         self.guard = LoopGuard(self.config)
         self.context = ContextManager(self.config, summarizer=self._summarise)
-        self._refresh_system_prompt()
+        if not self.defer_initial_prompt:
+            self.initialize()
 
     @classmethod
     def create(
@@ -152,6 +157,7 @@ class Agent:
         policy: ApprovalPolicy | None = None,
         registry: ToolRegistry | None = None,
         provider: LLMProvider | None = None,
+        defer_initial_prompt: bool = False,
     ) -> Agent:
         """Build an agent with the default provider, tools, and policy."""
         from ..llm.factory import build_provider
@@ -162,6 +168,7 @@ class Agent:
             registry=registry or default_registry(),
             policy=policy or ApprovalPolicy(config),
             sink=sink,
+            defer_initial_prompt=defer_initial_prompt,
         )
 
     # ---------------------------------------------------------------- lifecycle
@@ -169,15 +176,31 @@ class Agent:
     def _emit(self, event: AgentEvent) -> None:
         self.sink.handle(event)
 
-    def _refresh_system_prompt(self) -> None:
+    def initialize(self) -> None:
+        """Build the initial system prompt once.
+
+        The TUI defers this work until after its first paint so repo-map
+        construction can be reported instead of freezing an empty terminal.
+        Other frontends keep the default eager initialization.
+        """
+        if self._initialized:
+            return
+        self._refresh_system_prompt()
+        self._initialized = True
+
+    def _refresh_system_prompt(self, *, query: str | None = None) -> None:
         """Rebuild the system prompt and re-cost the request overhead."""
         specs = tuple(self.registry.specs())
-        prompt = self.prompt_builder.build(tools=specs)
+        prompt = self.prompt_builder.build(
+            tools=specs,
+            query=self._current_task if query is None else query,
+        )
         self._system = prompt.text
         self.context.set_overhead(system_tokens=prompt.tokens, tools=specs)
 
     def announce(self, task: str) -> None:
         """Emit the opening event for a session."""
+        self.initialize()
         shell_access = "container" if self.sandbox is not None else "host (unrestricted)"
         path_boundary = "unrestricted" if self.config.allow_outside_workspace else "workspace-only"
         self._emit(
@@ -262,6 +285,11 @@ class Agent:
             than raised: a provider failure or a spent budget is information for
             the user, and the session survives it.
         """
+        if not self._initialized:
+            self._emit(Activity(self._initialization_activity()))
+            self.initialize()
+        self._current_task = task
+        self._prepare_task_context(task)
         self.context.append(Message.user(task))
         self._emit(UserMessage(task))
         self.guard.note_progress()
@@ -317,6 +345,7 @@ class Agent:
             self.guard.before_step()
 
             step = self.guard.steps
+            self._emit(Activity("Waiting for agent response"))
             self._emit(
                 StepStarted(
                     step=step,
@@ -533,6 +562,7 @@ class Agent:
     def _compact_if_needed(self) -> None:
         """Compact history before a request that would otherwise overflow."""
         if self._files_changed:
+            self._emit(Activity(self._refresh_activity()))
             self.prompt_builder.invalidate_map()
             self._refresh_system_prompt()
             self._files_changed = False
@@ -561,6 +591,27 @@ class Agent:
             "--context-window and retry, or start a new session."
         )
         raise ContextWindowTooSmall(message)
+
+    def _prepare_task_context(self, task: str) -> None:
+        """Rank cached context for ``task``, rebuilding a stale map first."""
+        if self._files_changed:
+            self._emit(Activity(self._refresh_activity()))
+            self.prompt_builder.invalidate_map()
+            self._files_changed = False
+        else:
+            activity = (
+                "Preparing task context"
+                if self.config.repo_map_enabled
+                else "Preparing context"
+            )
+            self._emit(Activity(activity))
+        self._refresh_system_prompt(query=task)
+
+    def _initialization_activity(self) -> str:
+        return "Building repo map" if self.config.repo_map_enabled else "Preparing context"
+
+    def _refresh_activity(self) -> str:
+        return "Refreshing repo map" if self.config.repo_map_enabled else "Preparing context"
 
     def _summarise(self, messages: Sequence[Message]) -> str:
         """Condense history with a separate, tool-free model call.
@@ -646,6 +697,7 @@ class Agent:
         self.sandbox_warning = None
         self.prompt_builder.workspace = sandbox.workspace
         self.prompt_builder.invalidate_map()
+        self._emit(Activity(self._refresh_activity()))
         self._refresh_system_prompt()
 
     def set_sandbox_image(self, image: str) -> None:
@@ -675,6 +727,7 @@ class Agent:
             self.sandbox_warning = "Docker sandboxing was explicitly disabled."
             self.prompt_builder.workspace = None
             self.prompt_builder.invalidate_map()
+            self._emit(Activity(self._refresh_activity()))
             self._refresh_system_prompt()
 
     def apply_sandbox_changes(self) -> tuple[str, ...]:
@@ -688,6 +741,7 @@ class Agent:
         applied = self.sandbox.apply()
         self._emit(Warning(f"Copied {len(applied)} sandbox change(s) back to the project."))
         self.prompt_builder.invalidate_map()
+        self._emit(Activity(self._refresh_activity()))
         self._refresh_system_prompt()
         return applied
 
@@ -702,6 +756,7 @@ class Agent:
         else:
             self._emit(Warning("No pending sandbox changes."))
         self.prompt_builder.invalidate_map()
+        self._emit(Activity(self._refresh_activity()))
         self._refresh_system_prompt()
 
     def close(self) -> None:

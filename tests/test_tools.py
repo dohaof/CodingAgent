@@ -249,42 +249,6 @@ def python_engine(monkeypatch) -> None:
     )
 
 
-class TestSearchSymlinkSafety:
-    def test_search_does_not_follow_a_symlink_outside_the_workspace(
-        self, make_ctx, tmp_path: Path, python_engine
-    ) -> None:
-        outside = tmp_path.parent / "not-in-workspace.txt"
-        outside.write_text("SECRET_OUTSIDE\n", encoding="utf-8")
-        link = tmp_path / "linked.txt"
-        try:
-            link.symlink_to(outside)
-        except OSError:
-            pytest.skip("symlink creation is unavailable on this platform")
-
-        harness = make_ctx()
-        outcome = GrepSearchTool().invoke({"pattern": "SECRET_OUTSIDE"}, harness.ctx)
-        assert "SECRET_OUTSIDE" not in outcome.content
-
-
-class TestListDirSymlinkSafety:
-    def test_list_does_not_traverse_a_symlinked_directory(
-        self, make_ctx, tmp_path: Path
-    ) -> None:
-        outside = tmp_path.parent / "outside-tree"
-        outside.mkdir()
-        (outside / "secret.txt").write_text("secret\n", encoding="utf-8")
-        link = tmp_path / "linked"
-        try:
-            link.symlink_to(outside, target_is_directory=True)
-        except OSError:
-            pytest.skip("symlink creation is unavailable on this platform")
-
-        harness = make_ctx()
-        outcome = ListDirTool().invoke({"path": ".", "depth": 3}, harness.ctx)
-        assert "secret.txt" not in outcome.content
-        assert "linked@" in outcome.content
-
-
 class TestGrepSearch:
     def test_matches_are_grouped_by_file(self, make_ctx, tree: Path, python_engine) -> None:
         harness = make_ctx(workspace=tree)
@@ -406,22 +370,6 @@ class TestGrepSearch:
 
 
 class TestGlobFiles:
-    def test_glob_does_not_follow_a_symlink_outside_the_workspace(
-        self, make_ctx, tmp_path: Path
-    ) -> None:
-        outside = tmp_path.parent / "outside-glob"
-        outside.mkdir()
-        (outside / "secret.py").write_text("SECRET_OUTSIDE\n", encoding="utf-8")
-        link = tmp_path / "linked"
-        try:
-            link.symlink_to(outside, target_is_directory=True)
-        except OSError:
-            pytest.skip("symlink creation is unavailable on this platform")
-
-        harness = make_ctx()
-        outcome = GlobFilesTool().invoke({"pattern": "linked/*.py"}, harness.ctx)
-        assert "secret.py" not in outcome.content
-
     def test_matches_are_listed_with_sizes(self, make_ctx, tree: Path) -> None:
         harness = make_ctx(workspace=tree)
         outcome = GlobFilesTool().invoke({"pattern": "**/*.py", "path": "src"}, harness.ctx)

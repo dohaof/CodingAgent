@@ -19,6 +19,7 @@ from cagent.agent import sandbox as sandbox_module
 from cagent.agent.approval import ApprovalPolicy, Decision
 from cagent.agent.engine import Agent
 from cagent.agent.events import (
+    Activity,
     ApprovalRequested,
     CollectingSink,
     CompactionDone,
@@ -105,6 +106,28 @@ def auto(project: Path, **kwargs: object) -> AgentConfig:
 
 
 class TestTheCycle:
+    def test_initial_prompt_can_be_deferred_for_an_interactive_frontend(
+        self, project: Path
+    ) -> None:
+        config = auto(project)
+        sink = CollectingSink()
+        agent = Agent(
+            config=config,
+            provider=ScriptedProvider(config, []),
+            registry=default_registry(),
+            policy=ApprovalPolicy(config),
+            sink=sink,
+            defer_initial_prompt=True,
+        )
+
+        assert agent.context.system_tokens == 0
+        assert agent.prompt_builder._index is None
+
+        agent.initialize()
+
+        assert agent.context.system_tokens > 0
+        assert agent.prompt_builder._index is not None
+
     def test_undo_removes_a_whole_user_turn_including_tool_pairs(
         self, project: Path
     ) -> None:
@@ -251,6 +274,21 @@ class TestTheCycle:
         assert all(system for system in provider.systems)
         assert all("read_file" in {s.name for s in specs} for specs in provider.tool_specs)
 
+    def test_the_current_task_ranks_the_repo_map_sent_to_the_provider(
+        self, project: Path
+    ) -> None:
+        target = project / "deep" / "transport"
+        target.mkdir(parents=True)
+        (target / "stream_controller.py").write_text(
+            "def cancel_provider_stream(): pass\n", encoding="utf-8"
+        )
+        agent, _, provider = make_agent(auto(project), [text_turn("done")])
+
+        agent.run_turn("repair provider stream cancellation")
+
+        system = provider.systems[0]
+        assert system.index("deep/transport/stream_controller.py") < system.index("calc.py")
+
     def test_the_transcript_grows_by_assistant_and_tool_turns(self, project: Path) -> None:
         agent, _, provider = make_agent(
             auto(project),
@@ -279,6 +317,32 @@ class TestTheCycle:
         assert kinds.index("UserMessage") < kinds.index("StepStarted")
         assert kinds.index("ToolStarted") < kinds.index("ToolFinished")
         assert kinds[-1] == "RunFinished"
+
+    def test_activity_events_identify_task_context_and_model_wait(self, project: Path) -> None:
+        agent, sink, _ = make_agent(auto(project), [text_turn("done")])
+
+        agent.run_turn("read it")
+
+        assert [event.message for event in sink.of_type(Activity)] == [
+            "Preparing task context",
+            "Waiting for agent response",
+        ]
+        kinds = [type(event).__name__ for event in sink.events]
+        assert kinds.index("Activity") < kinds.index("UserMessage")
+        assert kinds.index("UserMessage") < kinds.index("StepStarted")
+
+    def test_activity_reports_context_preparation_when_repo_map_is_disabled(
+        self, project: Path
+    ) -> None:
+        config = auto(project, repo_map_enabled=False)
+        agent, sink, _ = make_agent(config, [text_turn("done")])
+
+        agent.run_turn("read it")
+
+        assert [event.message for event in sink.of_type(Activity)] == [
+            "Preparing context",
+            "Waiting for agent response",
+        ]
 
     def test_streamed_text_is_republished_for_the_ui(self, project: Path) -> None:
         agent, sink, _ = make_agent(
@@ -716,17 +780,18 @@ class TestContextPressure:
             keep_recent_turns=1,
         )
         script = [
-            tool_turn("run_bash", {"command": "python noisy.py"}) + [StreamFinished("tool_calls")]
-            for _ in range(8)
+            tool_turn("run_bash", {"command": f"python noisy.py {index}"})
+            + [StreamFinished("tool_calls")]
+            for index in range(8)
         ] + [text_turn("done")]
 
         agent, sink, provider = make_agent(config, script)
+        agent.context.summarizer = None
         result = agent.run_turn("generate a lot of output")
 
         compactions = sink.of_type(CompactionDone)
-        assert not compactions
-        assert result.stopped_by == "context_window"
-        assert any("Increase --context-window" in event.message for event in sink.of_type(Warning))
+        assert compactions
+        assert result.completed
         assert provider.pairing_is_valid(), "compaction broke call/result pairing"
 
     def test_the_task_survives_compaction(self, project: Path) -> None:
@@ -741,18 +806,20 @@ class TestContextPressure:
             keep_recent_turns=1,
         )
         script = [
-            tool_turn("run_bash", {"command": "python noisy.py"}) + [StreamFinished("tool_calls")]
-            for _ in range(8)
+            tool_turn("run_bash", {"command": f"python noisy.py {index}"})
+            + [StreamFinished("tool_calls")]
+            for index in range(8)
         ] + [text_turn("done")]
 
         agent, _, provider = make_agent(config, script)
+        agent.context.summarizer = None
         result = agent.run_turn("REMEMBER THIS TASK: tidy the noisy output")
-        assert result.stopped_by == "context_window"
+        assert result.completed
         assert "REMEMBER THIS TASK" in agent.context.history[0].text
 
     def test_the_repo_map_is_rebuilt_after_the_agent_writes(self, project: Path) -> None:
         # A map that still describes the tree as it was is worse than none.
-        agent, _, provider = make_agent(
+        agent, sink, provider = make_agent(
             auto(project),
             [
                 tool_turn(
@@ -766,6 +833,12 @@ class TestContextPressure:
         agent.run_turn("create a module")
         assert "freshly_added" not in provider.systems[0]
         assert "freshly_added" in provider.systems[-1]
+        assert [event.message for event in sink.of_type(Activity)] == [
+            "Preparing task context",
+            "Waiting for agent response",
+            "Refreshing repo map",
+            "Waiting for agent response",
+        ]
 
 
 class TestReporting:

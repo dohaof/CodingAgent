@@ -9,11 +9,14 @@ assumed.
 from __future__ import annotations
 
 import json
+import sys
 from dataclasses import replace
 from pathlib import Path
+from types import ModuleType
 
 import pytest
 
+from cagent.agent import repomap as repomap_module
 from cagent.agent.approval import ApprovalPolicy, Decision
 from cagent.agent.context import ContextManager
 from cagent.agent.events import (
@@ -29,7 +32,7 @@ from cagent.agent.events import (
 )
 from cagent.agent.guards import LoopGuard, call_signature
 from cagent.agent.prompt import PromptBuilder
-from cagent.agent.repomap import build_repo_map
+from cagent.agent.repomap import RepoMapIndex, build_repo_map
 from cagent.agent.trace import TraceWriter, history_from_trace, read_trace
 from cagent.config import AgentConfig
 from cagent.errors import RepetitionDetected, TokenBudgetExceeded
@@ -503,6 +506,151 @@ class TestRepoMap:
         assert "go" in result.text and "Shape" in result.text
         assert "Handle" in result.text and "Server" in result.text
 
+    @pytest.mark.parametrize(
+        ("filename", "source", "declaration"),
+        [
+            ("service.cs", "public class Worker {}\n", "Worker"),
+            ("worker.swift", "struct Worker {}\n", "Worker"),
+            ("worker.ex", "defmodule Demo.Worker do\nend\n", "Demo.Worker"),
+            ("worker.lua", "function worker.run()\nend\n", "worker.run"),
+            ("schema.sql", "CREATE TABLE widgets (id INT);\n", "CREATE TABLE"),
+            ("panel.vue", "<script>\nfunction openPanel() {}\n</script>\n", "openPanel"),
+        ],
+    )
+    def test_fallback_parser_covers_multiple_language_families(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        filename: str,
+        source: str,
+        declaration: str,
+    ) -> None:
+        monkeypatch.setattr(repomap_module, "_tree_sitter_parser", lambda language: None)
+        (tmp_path / filename).write_text(source, encoding="utf-8")
+
+        result = build_repo_map(tmp_path, token_budget=1000)
+
+        assert filename in result.text
+        assert declaration in result.text
+        assert result.outlines[0].parser == "fallback"
+
+    def test_a_file_without_declarations_still_contributes_its_path(
+        self, tmp_path: Path
+    ) -> None:
+        (tmp_path / "settings.ts").write_text("const timeout = 30;\n", encoding="utf-8")
+
+        result = build_repo_map(tmp_path, token_budget=1000)
+
+        assert "settings.ts" in result.text
+        assert result.files_included == 1
+
+    def test_a_large_file_keeps_metadata_without_loading_its_body(
+        self, tmp_path: Path
+    ) -> None:
+        large = tmp_path / "bundle.js"
+        large.write_bytes((b"x = 1;\n" * 60_000) + b"tail")
+
+        result = build_repo_map(tmp_path, token_budget=1000)
+
+        assert "bundle.js (60001 lines, javascript)" in result.text
+        assert result.outlines[0].parser == "metadata"
+
+    def test_the_current_task_ranks_matching_paths_and_symbols_first(
+        self, tmp_path: Path
+    ) -> None:
+        (tmp_path / "main.py").write_text(
+            "".join(f"def generic_{index}(): pass\n" for index in range(20)),
+            encoding="utf-8",
+        )
+        target = tmp_path / "deep" / "transport"
+        target.mkdir(parents=True)
+        (target / "stream_controller.ts").write_text(
+            "export function cancelProviderStream() {}\n",
+            encoding="utf-8",
+        )
+
+        result = build_repo_map(
+            tmp_path,
+            token_budget=1000,
+            query="repair provider stream cancellation",
+        )
+
+        assert result.outlines[0].path == "deep/transport/stream_controller.ts"
+
+    def test_a_small_budget_preserves_paths_then_adds_relevant_detail(
+        self, tmp_path: Path
+    ) -> None:
+        for index in range(12):
+            (tmp_path / f"module_{index}.py").write_text(
+                "".join(f"def helper_{index}_{item}(): pass\n" for item in range(10)),
+                encoding="utf-8",
+            )
+        (tmp_path / "interrupt_handler.py").write_text(
+            "def cancel_stream(): pass\n", encoding="utf-8"
+        )
+
+        result = build_repo_map(
+            tmp_path,
+            token_budget=240,
+            query="cancel stream interrupt",
+        )
+
+        assert result.tokens <= 240
+        assert len(result.outlines) > 1
+        assert "def cancel_stream" in result.text
+        assert any(
+            block.count("\n") == 0
+            for block in result.text.split("\nmodule_")
+            if ".py (" in block
+        )
+
+    def test_incremental_refresh_only_reparses_changed_files(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        first = tmp_path / "first.py"
+        second = tmp_path / "second.py"
+        first.write_text("def first(): pass\n", encoding="utf-8")
+        second.write_text("def second(): pass\n", encoding="utf-8")
+        original = repomap_module._outline_file
+        parsed: list[str] = []
+
+        def tracking_outline(path: Path, workspace: Path, language: str):
+            parsed.append(path.name)
+            return original(path, workspace, language)
+
+        monkeypatch.setattr(repomap_module, "_outline_file", tracking_outline)
+        index = RepoMapIndex(tmp_path)
+        index.refresh()
+        assert sorted(parsed) == ["first.py", "second.py"]
+
+        parsed.clear()
+        index.refresh()
+        assert parsed == []
+
+        first.write_text("def first_changed(value): pass\n", encoding="utf-8")
+        index.refresh()
+        assert parsed == ["first.py"]
+        assert "first_changed" in index.render(token_budget=1000).text
+
+    def test_missing_tree_sitter_grammar_never_calls_get_parser(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        fake_pack = ModuleType("tree_sitter_language_pack")
+        fake_pack.downloaded_languages = lambda: []  # type: ignore[attr-defined]
+        calls: list[str] = []
+
+        def get_parser(language: str) -> object:
+            calls.append(language)
+            raise AssertionError("get_parser may download a grammar")
+
+        fake_pack.get_parser = get_parser  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "tree_sitter_language_pack", fake_pack)
+        repomap_module._tree_sitter_parser.cache_clear()
+
+        assert repomap_module._tree_sitter_parser("typescript") is None
+        assert calls == []
+        repomap_module._tree_sitter_parser.cache_clear()
+
     def test_generated_directories_are_skipped(self, tmp_path: Path) -> None:
         (tmp_path / "real.py").write_text("def kept(): pass\n", encoding="utf-8")
         vendored = tmp_path / "node_modules"
@@ -572,6 +720,24 @@ class TestPromptBuilder:
 
         builder.invalidate_map()
         assert "second" in builder.build().text
+
+    def test_the_map_follows_a_workspace_switch(self, config: AgentConfig, tmp_path: Path) -> None:
+        host_file = config.workspace / "host.py"
+        host_file.write_text("def host_symbol(): pass\n", encoding="utf-8")
+        builder = PromptBuilder(config)
+        assert "host_symbol" in builder.build().text
+
+        snapshot = tmp_path / "snapshot"
+        snapshot.mkdir()
+        (snapshot / "snapshot.py").write_text(
+            "def snapshot_symbol(): pass\n", encoding="utf-8"
+        )
+        builder.workspace = snapshot
+        builder.invalidate_map()
+
+        prompt = builder.build()
+        assert "snapshot_symbol" in prompt.text
+        assert "host_symbol" not in prompt.text
 
     def test_project_markers_are_advertised(self, config: AgentConfig) -> None:
         (config.workspace / "pyproject.toml").write_text("[project]\n", encoding="utf-8")
@@ -711,6 +877,19 @@ class TestTrace:
         assert by_kind["tool_finished"]["metadata"] == {"path": "a.py"}
         assert by_kind["tool_finished"]["is_error"] is False
         assert by_kind["run_finished"]["usage"]["prompt"] == 10
+
+    def test_activity_events_are_transient_and_not_recorded(self, config: AgentConfig) -> None:
+        from cagent.agent.events import Activity
+
+        config.trace_dir = config.workspace / "traces"
+        writer = TraceWriter.create(config, session_id="activity")
+        assert writer is not None
+        writer.handle(Activity("Building repo map"))
+        writer.handle(UserMessage("a real task"))
+        writer.close()
+
+        records = read_trace(writer.path)
+        assert all(record.get("type") != "activity" for record in records)
 
     def test_the_api_key_never_reaches_the_trace(self, config: AgentConfig) -> None:
         config.trace_dir = config.workspace / "traces"

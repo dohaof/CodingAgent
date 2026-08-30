@@ -11,6 +11,7 @@ import asyncio
 import io
 import json
 import signal
+import threading
 from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
@@ -19,11 +20,12 @@ import pytest
 from rich.console import Console
 from rich.text import Text
 from textual.events import MouseDown
-from textual.widgets import Input, TextArea
+from textual.widgets import Input, Static, TextArea
 
 from cagent.agent.approval import Decision
 from cagent.agent.engine import Agent, TurnResult
 from cagent.agent.events import (
+    Activity,
     ApprovalDecided,
     CompactionDone,
     RunFinished,
@@ -890,6 +892,44 @@ class TestInterruptHandling:
 
 
 class TestTui:
+    def test_repo_map_build_starts_after_mount_and_gates_input(
+        self, config: AgentConfig, monkeypatch
+    ) -> None:
+        started = threading.Event()
+        release = threading.Event()
+        original_initialize = Agent.initialize
+
+        def delayed_initialize(agent: Agent) -> None:
+            started.set()
+            assert release.wait(timeout=2)
+            original_initialize(agent)
+
+        monkeypatch.setattr(Agent, "initialize", delayed_initialize)
+        app = CagentTui(config)
+
+        async def inspect_startup() -> None:
+            async with app.run_test(size=(100, 30)) as pilot:
+                await pilot.pause()
+                assert started.is_set()
+                composer = app.query_one("#composer", ComposerInput)
+                activity = app.query_one("#activity", Static)
+                assert composer.disabled
+                assert str(activity.renderable).startswith("Building repo map")
+
+                release.set()
+                for _ in range(10):
+                    await pilot.pause()
+                    if not composer.disabled:
+                        break
+                assert not composer.disabled
+                assert app.agent.context.system_tokens > 0
+
+        try:
+            asyncio.run(inspect_startup())
+        finally:
+            release.set()
+            app.emergency_close()
+
     def test_undo_rebuilds_the_transcript_without_the_latest_user_turn(
         self, config: AgentConfig
     ) -> None:
@@ -983,6 +1023,12 @@ class TestTui:
         async def inspect_rendered_panel() -> None:
             async with app.run_test(size=(120, 30)) as pilot:
                 transcript = app.query_one("#conversation", TranscriptTextArea)
+                composer = app.query_one("#composer", ComposerInput)
+                for _ in range(20):
+                    if not composer.disabled:
+                        break
+                    await pilot.pause()
+                await pilot.pause()
                 transcript.load_text("")
                 app._render_event(
                     RunStarted(
@@ -1238,6 +1284,31 @@ class TestTui:
         finally:
             app.emergency_close()
 
+    def test_activity_status_animates_and_stops(self, config: AgentConfig) -> None:
+        app = CagentTui(config)
+
+        async def exercise_activity() -> None:
+            async with app.run_test(size=(100, 30)):
+                app._render_event(Activity("Building repo map"))
+                activity = app.query_one("#activity", Static)
+                assert activity.renderable == "Building repo map."
+                app._tick_activity()
+                assert activity.renderable == "Building repo map.."
+                app._tick_activity()
+                assert activity.renderable == "Building repo map..."
+                app._tick_activity()
+                assert activity.renderable == "Building repo map...."
+                app._tick_activity()
+                assert activity.renderable == "Building repo map."
+                app._set_busy(False, "Ready")
+                assert app._activity_timer is None
+                assert activity.renderable == "Ready"
+
+        try:
+            asyncio.run(exercise_activity())
+        finally:
+            app.emergency_close()
+
     def test_clicking_and_selecting_transcript_clears_keyboard_input_focus(
         self, config: AgentConfig
     ) -> None:
@@ -1247,9 +1318,14 @@ class TestTui:
             async with app.run_test(size=(100, 30)) as pilot:
                 conversation = app.query_one("#conversation", TranscriptTextArea)
                 composer = app.query_one("#composer", Input)
+                for _ in range(20):
+                    if not composer.disabled:
+                        break
+                    await pilot.pause()
                 app._write(Text("selectable transcript"))
 
                 assert not conversation.focusable
+                assert not composer.disabled
                 assert app.focused is composer
                 input_cursor_position = app.cursor_position
                 await pilot.mouse_down(conversation, offset=(3, 1))

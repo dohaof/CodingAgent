@@ -17,7 +17,10 @@ dependencies = [
 
 [project.optional-dependencies]
 tokens = ["tiktoken>=0.7"]
-treesitter = ["tree-sitter-language-pack>=0.2"]
+treesitter = [
+    "tree-sitter>=0.23",
+    "tree-sitter-language-pack>=1.0",
+]
 dev = [
     "pytest-cov>=5",
     "mypy>=1.11",
