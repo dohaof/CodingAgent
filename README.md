@@ -622,9 +622,10 @@ before adding detail, and an incremental index reparses only changed files.
 The map is a navigation aid, never a substitute for reading the file before
 editing it. Grammar downloads are never triggered implicitly during startup.
 
-**Parallel tool calls execute sequentially.** The model may request several in one
-step and all of them run, but in order. Concurrency would help on independent
-reads and would need care around the approval prompt and shared file state.
+**Parallel execution is opt-in.** Independent `read_file`, `list_dir`,
+`glob_files`, and `grep_search` calls may run concurrently. Writes, shell
+commands, mixed batches, and tools without an explicit concurrency marker remain
+serial so approval and shared workspace state stay deterministic.
 
 **Fuzzy matching has a floor and no AST validation.** Below the similarity
 threshold an edit is refused rather than guessed. Validating the result against a

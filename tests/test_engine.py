@@ -11,6 +11,7 @@ exception, because that is the mechanism by which the agent corrects itself.
 
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 
 import pytest
@@ -46,6 +47,7 @@ from cagent.llm.base import TextDelta as WireTextDelta
 from cagent.tools.base import ApprovalRequest, ToolOutcome
 from cagent.tools.registry import ToolRegistry, default_registry, tool
 from cagent.types import (
+    FinishReason,
     Message,
     RiskLevel,
     TextPart,
@@ -236,16 +238,73 @@ class TestTheCycle:
         (fed,) = provider.last_tool_results
         assert "assert" in fed.lower() and "exit code: 1" in fed
 
-    def test_parallel_calls_in_one_step_all_run(self, project: Path) -> None:
-        (project / "other.py").write_text("x = 1\n", encoding="utf-8")
+    def test_explicit_read_only_calls_run_concurrently_in_result_order(
+        self, project: Path
+    ) -> None:
+        lock = threading.Lock()
+        both_running = threading.Event()
+        active = 0
+        peak = 0
+
+        @tool(risk=RiskLevel.SAFE, parallel_safe=True)
+        def probe(value: str) -> str:
+            """Observe concurrent execution."""
+            nonlocal active, peak
+            with lock:
+                active += 1
+                peak = max(peak, active)
+                if active == 2:
+                    both_running.set()
+            both_running.wait(timeout=2)
+            with lock:
+                active -= 1
+            return value
+
+        registry = ToolRegistry()
+        registry.register_class(probe)
         turn = (
-            tool_turn("read_file", {"path": "calc.py"}, index=0)
-            + tool_turn("read_file", {"path": "other.py"}, index=1)
+            tool_turn("probe", {"value": "first"}, index=0)
+            + tool_turn("probe", {"value": "second"}, index=1)
             + [StreamFinished("tool_calls")]
         )
-        agent, sink, provider = make_agent(auto(project), [turn, text_turn("read both")])
-        agent.run_turn("read both files")
+        agent, sink, provider = make_agent(
+            auto(project), [turn, text_turn("done")], registry=registry
+        )
+
+        agent.run_turn("probe twice")
+
+        assert peak == 2
         assert len(sink.of_type(ToolFinished)) == 2
+        assert provider.last_tool_results == ["first", "second"]
+        assert provider.pairing_is_valid()
+
+    def test_default_parallel_tools_are_explicitly_read_only(self) -> None:
+        registry = default_registry()
+        parallel = {tool.name for tool in registry if tool.parallel_safe}
+
+        assert parallel == {"read_file", "list_dir", "glob_files", "grep_search"}
+
+    def test_a_batch_mixing_reads_and_writes_remains_serial(self, project: Path) -> None:
+        turn = (
+            tool_turn("read_file", {"path": "calc.py"}, index=0)
+            + tool_turn("write_file", {"path": "note.txt", "content": "done\n"}, index=1)
+            + [StreamFinished("tool_calls")]
+        )
+        agent, sink, provider = make_agent(auto(project), [turn, text_turn("done")])
+
+        agent.run_turn("read and write")
+
+        lifecycle = [
+            (type(event).__name__, event.call.name)
+            for event in sink.events
+            if isinstance(event, ToolStarted | ToolFinished)
+        ]
+        assert lifecycle == [
+            ("ToolStarted", "read_file"),
+            ("ToolFinished", "read_file"),
+            ("ToolStarted", "write_file"),
+            ("ToolFinished", "write_file"),
+        ]
         assert provider.pairing_is_valid()
 
     def test_usage_accumulates_across_steps(self, project: Path) -> None:
@@ -698,8 +757,34 @@ class TestFailureHandling:
         agent, sink, _ = make_agent(
             auto(project), [[WireTextDelta("half a thought"), StreamFinished("length")]]
         )
-        agent.run_turn("write an essay")
+        result = agent.run_turn("write an essay")
+        assert not result.completed and result.stopped_by == "length"
         assert any("output token limit" in event.message for event in sink.of_type(Warning))
+
+    @pytest.mark.parametrize("reason", ["content_filter", "error"])
+    def test_abnormal_model_stops_are_not_reported_as_complete(
+        self, project: Path, reason: FinishReason
+    ) -> None:
+        agent, sink, _ = make_agent(
+            auto(project), [[WireTextDelta("partial"), StreamFinished(reason)]]
+        )
+
+        result = agent.run_turn("answer carefully")
+
+        assert not result.completed and result.stopped_by == reason
+        assert sink.of_type(Warning)
+
+    def test_a_partial_tool_call_does_not_pollute_history(self, project: Path) -> None:
+        partial_call = tool_turn("read_file", {"path": "calc.py"}) + [
+            StreamFinished("length")
+        ]
+        agent, _, provider = make_agent(auto(project), [partial_call, text_turn("continued")])
+
+        first = agent.run_turn("inspect it")
+        second = agent.run_turn("continue")
+
+        assert first.stopped_by == "length" and second.completed
+        assert provider.pairing_is_valid()
 
     def test_paths_outside_the_workspace_are_refused(self, project: Path) -> None:
         agent, _, provider = make_agent(
@@ -744,6 +829,8 @@ class TestTermination:
             if "identical arguments" in (content := part.content)
         ]
         assert nudged, "the model was stopped without ever being told it was looping"
+        agent.run_turn("continue")
+        assert provider.pairing_is_valid()
 
     def test_an_interrupt_ends_the_turn_at_the_next_step(self, project: Path) -> None:
         agent, _, _ = make_agent(

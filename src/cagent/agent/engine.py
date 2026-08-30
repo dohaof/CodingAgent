@@ -29,6 +29,7 @@ import threading
 import time
 import uuid
 from collections.abc import Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -45,7 +46,7 @@ from ..errors import (
 from ..llm.base import LLMProvider
 from ..llm.base import TextDelta as WireTextDelta
 from ..llm.base import ThinkingDelta as WireThinkingDelta
-from ..tools.base import ApprovalRequest, BaseTool, ToolContext
+from ..tools.base import ApprovalRequest, BaseTool, ToolContext, ToolOutcome
 from ..tools.registry import ToolRegistry, default_registry
 from ..tools.schema import parse_object
 from ..types import Message, RiskLevel, ToolCallPart, ToolResultPart, Usage
@@ -92,6 +93,8 @@ _REFUSED_FEEDBACK = """\
 The user declined to run this. Do not retry it. Either continue with a different \
 approach, or explain what you need permission for and stop."""
 
+_MAX_PARALLEL_TOOLS = 4
+
 
 @dataclass(frozen=True, slots=True)
 class TurnResult:
@@ -107,6 +110,15 @@ class TurnResult:
     @property
     def completed(self) -> bool:
         return self.stopped_by == "model"
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedCall:
+    call: ToolCallPart
+    tool: BaseTool
+    context: ToolContext
+    risk: RiskLevel
+    nudge: str | None
 
 
 @dataclass(slots=True)
@@ -300,7 +312,7 @@ class Agent:
         stopped_by = "model"
 
         try:
-            reply = self._loop()
+            reply, stopped_by = self._loop()
         except LoopGuardError as exc:
             stopped_by = type(exc).__name__
             reply = self._explain_stop(exc)
@@ -331,10 +343,10 @@ class Agent:
         self._emit(TurnFinished(reply=reply, steps=result.steps, usage=result.usage))
         return result
 
-    def _loop(self) -> str:
+    def _loop(self) -> tuple[str, str]:
         """Alternate between asking the model and running what it asked for.
 
-        Returns the model's final prose once it stops requesting tools.
+        Returns the final prose and the reason the turn stopped.
         """
         overflow_retries = 0
         while True:
@@ -410,24 +422,39 @@ class Agent:
                 )
             )
 
-            if result.finish_reason == "aborted":
-                raise UserAbort("Interrupted.")
-
             calls = result.message.tool_calls
-            if not calls:
-                if result.finish_reason == "length":
-                    # The reply was cut off mid-sentence. Saying so beats
-                    # returning a truncated answer as if it were complete.
-                    self._emit(
-                        Warning(
-                            "The model's reply hit the output token limit and may be "
-                            "incomplete."
-                        )
-                    )
-                return result.message.text
+            if result.finish_reason in ("aborted", "length", "content_filter", "error"):
+                # A stopped stream may contain a partial tool call. Do not run it
+                # or retain an assistant turn that providers would require us to
+                # answer with a tool result.
+                if calls:
+                    self.context.history.pop()
+                if result.finish_reason == "aborted":
+                    raise UserAbort("Interrupted.")
+                messages = {
+                    "length": "The model's reply hit the output token limit and may be incomplete.",
+                    "content_filter": (
+                        "The provider stopped the model's response with a content filter; "
+                        "the reply may be incomplete."
+                    ),
+                    "error": (
+                        "The provider ended the response with an error; "
+                        "the reply may be incomplete."
+                    ),
+                }
+                self._emit(Warning(messages[result.finish_reason]))
+                return result.message.text, result.finish_reason
 
-            results = self._dispatch(calls)
+            if not calls:
+                return result.message.text, (
+                    "model" if result.finish_reason == "stop" else result.finish_reason
+                )
+
+            results, dispatch_error = self._dispatch(calls)
             self.context.append(Message.from_tool_results(results))
+
+            if dispatch_error is not None:
+                raise dispatch_error
 
             if self.policy.aborted:
                 raise UserAbort("Stopped at your request.")
@@ -441,24 +468,130 @@ class Agent:
 
     # ------------------------------------------------------------------- tools
 
-    def _dispatch(self, calls: Sequence[ToolCallPart]) -> list[ToolResultPart]:
-        """Execute a batch of calls, returning exactly one result per call.
+    def _dispatch(
+        self, calls: Sequence[ToolCallPart]
+    ) -> tuple[list[ToolResultPart], LoopGuardError | None]:
+        """Execute a batch, returning one result per call and any stop reason.
 
         The one-result-per-call guarantee is what keeps the transcript valid, so
-        every early exit in here still produces a result part.
+        every early exit in here still produces a result part. A loop-guard
+        failure is returned after the results are assembled, allowing the caller
+        to append the complete tool turn before stopping.
         """
+        if len(calls) > 1 and self._parallel_safe(calls):
+            return self._dispatch_parallel(calls)
+
         results: list[ToolResultPart] = []
-        for call in calls:
-            if self.abort.is_set():
+        for index, call in enumerate(calls):
+            if self.abort.is_set() or self.policy.aborted:
+                reason = (
+                    "the user interrupted"
+                    if self.abort.is_set()
+                    else "the user stopped the turn"
+                )
                 results.append(
-                    ToolResultPart(call.id, "Not run: the user interrupted.", is_error=True)
+                    ToolResultPart(call.id, f"Not run: {reason}.", is_error=True)
                 )
                 continue
-            results.append(self._run_one(call))
-        return results
+            try:
+                results.append(self._run_one(call))
+            except LoopGuardError as exc:
+                results.append(ToolResultPart(call.id, f"Not run: {exc}", is_error=True))
+                results.extend(
+                    ToolResultPart(
+                        pending.id,
+                        "Not run: the loop guard stopped this turn.",
+                        is_error=True,
+                    )
+                    for pending in calls[index + 1 :]
+                )
+                return results, exc
+        return results, None
+
+    def _parallel_safe(self, calls: Sequence[ToolCallPart]) -> bool:
+        """Whether every call explicitly opts into read-only concurrency."""
+        try:
+            tools = [self.registry.get(call.name) for call in calls]
+        except CagentError:
+            return False
+        return all(tool.parallel_safe and tool.risk is RiskLevel.SAFE for tool in tools)
+
+    def _dispatch_parallel(
+        self, calls: Sequence[ToolCallPart]
+    ) -> tuple[list[ToolResultPart], LoopGuardError | None]:
+        """Prepare serially, invoke concurrently, and preserve result order."""
+        slots: list[ToolResultPart | _PreparedCall] = []
+        for index, call in enumerate(calls):
+            if self.abort.is_set() or self.policy.aborted:
+                reason = (
+                    "the user interrupted"
+                    if self.abort.is_set()
+                    else "the user stopped the turn"
+                )
+                slots.append(ToolResultPart(call.id, f"Not run: {reason}.", is_error=True))
+                continue
+            try:
+                slots.append(self._prepare_call(call))
+            except LoopGuardError as exc:
+                results = [
+                    slot
+                    if isinstance(slot, ToolResultPart)
+                    else ToolResultPart(
+                        slot.call.id,
+                        "Not run: the loop guard stopped this turn.",
+                        is_error=True,
+                    )
+                    for slot in slots
+                ]
+                results.append(ToolResultPart(call.id, f"Not run: {exc}", is_error=True))
+                results.extend(
+                    ToolResultPart(
+                        pending.id,
+                        "Not run: the loop guard stopped this turn.",
+                        is_error=True,
+                    )
+                    for pending in calls[index + 1 :]
+                )
+                return results, exc
+
+        prepared = [slot for slot in slots if isinstance(slot, _PreparedCall)]
+        if any(item.risk is not RiskLevel.SAFE for item in prepared):
+            return [
+                slot if isinstance(slot, ToolResultPart) else self._execute_call(slot)
+                for slot in slots
+            ], None
+
+        for item in prepared:
+            self._emit(ToolStarted(call=item.call, risk=item.risk))
+
+        completed: list[tuple[ToolOutcome, float]] = []
+        if prepared:
+            with ThreadPoolExecutor(max_workers=min(len(prepared), _MAX_PARALLEL_TOOLS)) as pool:
+                completed = list(pool.map(self._invoke_call, prepared))
+
+        completed_iter = iter(completed)
+        results = [
+            slot
+            if isinstance(slot, ToolResultPart)
+            else self._finish_call(slot, *next(completed_iter))
+            for slot in slots
+        ]
+        return results, None
 
     def _run_one(self, call: ToolCallPart) -> ToolResultPart:
         """Authorise and execute a single call."""
+        prepared = self._prepare_call(call)
+        if isinstance(prepared, ToolResultPart):
+            return prepared
+        return self._execute_call(prepared)
+
+    def _execute_call(self, prepared: _PreparedCall) -> ToolResultPart:
+        """Execute one prepared call synchronously."""
+        self._emit(ToolStarted(call=prepared.call, risk=prepared.risk))
+        return self._finish_call(prepared, *self._invoke_call(prepared))
+
+    def _prepare_call(self, call: ToolCallPart) -> ToolResultPart | _PreparedCall:
+        """Validate and authorise a call without executing it."""
         if call.raw_arguments and not call.arguments:
             return ToolResultPart(call.id, _MALFORMED_ARGS_FEEDBACK, is_error=True)
 
@@ -483,23 +616,31 @@ class Agent:
             return ToolResultPart(call.id, _REFUSED_FEEDBACK, is_error=True)
 
         risk = request.risk if request is not None else tool.risk
-        self._emit(ToolStarted(call=call, risk=risk))
+        return _PreparedCall(call, tool, ctx, risk, nudge)
 
+    @staticmethod
+    def _invoke_call(prepared: _PreparedCall) -> tuple[ToolOutcome, float]:
+        """Run only the tool body; safe to call from a worker thread."""
         started = time.perf_counter()
-        outcome = tool.invoke(call.arguments, ctx)
+        outcome = prepared.tool.invoke(prepared.call.arguments, prepared.context)
         duration = time.perf_counter() - started
+        return outcome, duration
 
-        self._emit(ToolFinished(call=call, outcome=outcome, duration_s=duration))
+    def _finish_call(
+        self, prepared: _PreparedCall, outcome: ToolOutcome, duration: float
+    ) -> ToolResultPart:
+        """Publish one completed invocation and build its model-facing result."""
+        self._emit(ToolFinished(call=prepared.call, outcome=outcome, duration_s=duration))
 
-        if not outcome.is_error and risk >= RiskLevel.MUTATING:
+        if not outcome.is_error and prepared.risk >= RiskLevel.MUTATING:
             # The repo map described the tree as it was; a mutation makes it
             # stale, so the next prompt rebuild rescans.
             self._files_changed = True
 
         content = outcome.content
-        if nudge:
-            content = f"{content}\n\n{nudge}"
-        return ToolResultPart(call.id, content, is_error=outcome.is_error)
+        if prepared.nudge:
+            content = f"{content}\n\n{prepared.nudge}"
+        return ToolResultPart(prepared.call.id, content, is_error=outcome.is_error)
 
     @staticmethod
     def _plan_call(

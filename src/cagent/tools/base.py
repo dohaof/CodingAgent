@@ -174,7 +174,7 @@ class ToolContext:
 class BaseTool(ABC):
     """A single capability exposed to the model.
 
-    Subclasses set the four class variables and implement :meth:`run`. The
+    Subclasses set the class variables and implement :meth:`run`. The
     schema advertised to the provider is derived from :attr:`Params`, so the
     arguments a tool declares and the arguments it receives cannot drift apart.
     """
@@ -182,6 +182,8 @@ class BaseTool(ABC):
     name: ClassVar[str] = ""
     description: ClassVar[str] = ""
     risk: ClassVar[RiskLevel] = RiskLevel.SAFE
+    parallel_safe: ClassVar[bool] = False
+    """Whether independent calls may run concurrently in the same workspace."""
     Params: ClassVar[type]
     """The dataclass of model-supplied arguments."""
 

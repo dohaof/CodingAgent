@@ -137,6 +137,7 @@ def tool(
     name: str | None = None,
     description: str | None = None,
     risk: RiskLevel = RiskLevel.SAFE,
+    parallel_safe: bool = False,
 ) -> Callable[[Callable[..., ToolOutcome | str]], type[BaseTool]]:
     """Turn an annotated function into a :class:`BaseTool` subclass.
 
@@ -152,6 +153,7 @@ def tool(
         name: Overrides the function name.
         description: Overrides the docstring summary.
         risk: Approval class for the synthesised tool.
+        parallel_safe: Whether independent calls may run concurrently.
     """
 
     def decorate(fn: Callable[..., ToolOutcome | str]) -> type[BaseTool]:
@@ -169,6 +171,7 @@ def tool(
             "name": name or fn_name,
             "description": (description or summary or f"Run {fn_name}.").strip(),
             "risk": risk,
+            "parallel_safe": parallel_safe,
             "Params": params_cls,
             "__doc__": fn.__doc__ or f"Tool wrapper around {fn_name}.",
             "__module__": getattr(fn, "__module__", __name__),

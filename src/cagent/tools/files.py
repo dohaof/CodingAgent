@@ -158,6 +158,7 @@ class ReadFileTool(BaseTool):
         "copied against."
     )
     risk: ClassVar[RiskLevel] = RiskLevel.SAFE
+    parallel_safe: ClassVar[bool] = True
     Params: ClassVar[type] = ReadFileParams
 
     def run(self, params: ReadFileParams, ctx: ToolContext) -> ToolOutcome:
@@ -349,6 +350,7 @@ class ListDirTool(BaseTool):
         "but not expanded. Use this to orient in an unfamiliar project."
     )
     risk: ClassVar[RiskLevel] = RiskLevel.SAFE
+    parallel_safe: ClassVar[bool] = True
     Params: ClassVar[type] = ListDirParams
 
     def run(self, params: ListDirParams, ctx: ToolContext) -> ToolOutcome:

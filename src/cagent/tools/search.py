@@ -156,6 +156,7 @@ class GlobFilesTool(BaseTool):
         "Generated directories such as .git and node_modules are skipped."
     )
     risk: ClassVar[RiskLevel] = RiskLevel.SAFE
+    parallel_safe: ClassVar[bool] = True
     Params: ClassVar[type] = GlobFilesParams
 
     def run(self, params: GlobFilesParams, ctx: ToolContext) -> ToolOutcome:
@@ -249,6 +250,7 @@ class GrepSearchTool(BaseTool):
         "pattern or pass glob to focus the search."
     )
     risk: ClassVar[RiskLevel] = RiskLevel.SAFE
+    parallel_safe: ClassVar[bool] = True
     Params: ClassVar[type] = GrepSearchParams
 
     def run(self, params: GrepSearchParams, ctx: ToolContext) -> ToolOutcome:
