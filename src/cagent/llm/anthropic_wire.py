@@ -196,6 +196,7 @@ class AnthropicProvider(LLMProvider):
         return headers
 
     def _send(self, payload: dict[str, object]) -> httpx.Response:
+        self._ensure_client()
         request = self._client.build_request(
             "POST",
             f"{self.config.resolved_base_url}/messages",

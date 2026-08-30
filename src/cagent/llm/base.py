@@ -280,6 +280,10 @@ class LLMProvider(ABC):
         # while the worker is blocked in ``iter_lines``.
         self._active_response: httpx.Response | None = None
         self._active_response_lock = threading.Lock()
+        # Closing an owned client is also necessary when cancellation happens
+        # during connection setup, before httpx has produced a Response. Such
+        # a client cannot be reused by the next turn, so rebuild it lazily.
+        self._client_needs_rebuild = False
 
     def _set_active_response(self, response: httpx.Response) -> None:
         with self._active_response_lock:
@@ -289,6 +293,16 @@ class LLMProvider(ABC):
         with self._active_response_lock:
             if self._active_response is response:
                 self._active_response = None
+
+    def _ensure_client(self) -> None:
+        """Recreate an owned client invalidated while cancelling a request."""
+        if not self._owns_client:
+            return
+        with self._active_response_lock:
+            if not self._client_needs_rebuild:
+                return
+            self._client = self._build_client(self.config)
+            self._client_needs_rebuild = False
 
     def cancel(self) -> None:
         """Cancel the currently streamed response, if one is active.
@@ -309,6 +323,8 @@ class LLMProvider(ABC):
             # During DNS/connect, httpx has not produced a Response yet. The
             # owned client is disposable for this session, so closing it wakes
             # a blocked ``send`` just like closing an active response.
+            with self._active_response_lock:
+                self._client_needs_rebuild = True
             with suppress(Exception):
                 self._client.close()
 

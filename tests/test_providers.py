@@ -218,6 +218,39 @@ class TestOpenAIWire:
         assert seen[0]["stream"] is True
         assert seen[0]["stream_options"] == {"include_usage": True}
 
+    def test_cancelled_owned_client_is_recreated_for_the_next_turn(
+        self, config: AgentConfig, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        clients: list[httpx.Client] = []
+        seen: list[dict] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append(json.loads(request.content))
+            return httpx.Response(
+                200,
+                content=openai_stream(),
+                headers={"content-type": "text/event-stream"},
+            )
+
+        clients.extend((transport(handler), transport(handler)))
+        monkeypatch.setattr(
+            OpenAIProvider,
+            "_build_client",
+            staticmethod(lambda _config: clients.pop(0)),
+        )
+        provider = OpenAIProvider(config)
+        first_client = provider.client
+
+        # This is the race where Ctrl+C arrives after a turn has stopped
+        # streaming but before the next input is accepted.
+        provider.cancel()
+        assert first_client.is_closed
+
+        result = provider.complete([Message.user("continue")], system="")
+
+        assert result.message.text == "Looking."
+        assert len(seen) == 1
+
     def test_bearer_header_is_sent(self, config: AgentConfig) -> None:
         headers: list[httpx.Headers] = []
 
