@@ -50,7 +50,13 @@ from cagent.cli.app import (
 )
 from cagent.cli.pricing import Price, estimate_cost, parse_prices, price_for
 from cagent.cli.render import ConsoleRenderer, _restored_detail, prompt_for_approval
-from cagent.cli.tui import CagentTui, ComposerInput, TranscriptTextArea, _ApprovalWaiter
+from cagent.cli.tui import (
+    CagentTui,
+    ComposerInput,
+    TranscriptTextArea,
+    TurnCompleted,
+    _ApprovalWaiter,
+)
 from cagent.config import AgentConfig
 from cagent.tools.base import ApprovalRequest, ToolOutcome
 from cagent.types import Message, RiskLevel, TextPart, ToolCallPart, ToolResultPart, Usage
@@ -1228,6 +1234,90 @@ class TestTui:
         finally:
             app.emergency_close()
 
+    def test_busy_requests_are_queued_and_started_in_order(self, config: AgentConfig) -> None:
+        class QueueApp(CagentTui):
+            started: list[str] = []
+
+            def _start_turn(self, text: str) -> None:
+                self.started.append(text)
+
+        app = QueueApp(config)
+
+        async def exercise_queue() -> None:
+            async with app.run_test(size=(100, 30)):
+                app._set_busy(True, "Working")
+                composer = app.query_one("#composer", ComposerInput)
+                app.on_input_submitted(Input.Submitted(composer, "first queued"))
+                app.on_input_submitted(Input.Submitted(composer, "second queued"))
+
+                assert list(app._queued_turns) == ["first queued", "second queued"]
+                assert "Queued request (1): first queued" in app.query_one(
+                    "#conversation", TextArea
+                ).text
+
+                app.on_turn_completed(TurnCompleted(TurnResult("", 1, Usage(1, 1), "model")))
+                assert app.started == ["first queued"]
+                assert list(app._queued_turns) == ["second queued"]
+
+                app.on_turn_completed(TurnCompleted(TurnResult("", 1, Usage(1, 1), "model")))
+                assert app.started == ["first queued", "second queued"]
+                assert not app._queued_turns
+
+        try:
+            asyncio.run(exercise_queue())
+        finally:
+            app.emergency_close()
+
+    def test_approval_tokens_have_priority_while_other_busy_input_is_queued(
+        self, config: AgentConfig
+    ) -> None:
+        app = CagentTui(config)
+        waiter = _ApprovalWaiter()
+
+        async def exercise_approval() -> None:
+            async with app.run_test(size=(100, 30)):
+                request = ApprovalRequest(
+                    tool="edit_file",
+                    risk=RiskLevel.MUTATING,
+                    summary="update add.py",
+                    detail="",
+                )
+                app._set_busy(True, "Working")
+                app._show_approval(request, waiter)
+                composer = app.query_one("#composer", ComposerInput)
+
+                app.on_input_submitted(Input.Submitted(composer, "follow-up request"))
+                assert list(app._queued_turns) == ["follow-up request"]
+                assert not waiter.ready.is_set()
+
+                app.on_input_submitted(Input.Submitted(composer, "n"))
+                assert waiter.ready.is_set()
+                assert waiter.decision == Decision(False)
+
+        try:
+            asyncio.run(exercise_approval())
+        finally:
+            app.emergency_close()
+
+    def test_streaming_append_keeps_transcript_cursor_and_scroll_at_end(
+        self, config: AgentConfig
+    ) -> None:
+        app = CagentTui(config)
+
+        async def exercise_stream_scroll() -> None:
+            async with app.run_test(size=(70, 12)):
+                transcript = app.query_one("#conversation", TranscriptTextArea)
+                app._append_transcript("\n".join(f"line {index}" for index in range(80)))
+                await app.workers.wait_for_complete()
+
+                assert transcript.selection.end == transcript.document.end
+                assert transcript.scroll_offset.y == transcript.max_scroll_y
+
+        try:
+            asyncio.run(exercise_stream_scroll())
+        finally:
+            app.emergency_close()
+
     def test_search_results_group_repeated_paths(self) -> None:
         grouped = CagentTui._group_search_results(
             "add.py:18- old\nadd.py:19: def shortest():\nother.py:2: call()"
@@ -1281,6 +1371,42 @@ class TestTui:
 
         try:
             asyncio.run(exercise_interrupt())
+        finally:
+            app.emergency_close()
+
+    def test_ctrl_c_clears_composer_before_interrupting_or_closing(
+        self, config: AgentConfig
+    ) -> None:
+        class PriorityApp(CagentTui):
+            close_requests = 0
+
+            def _request_close(self) -> None:
+                self.close_requests += 1
+
+        app = PriorityApp(config)
+
+        async def exercise_priority() -> None:
+            async with app.run_test(size=(100, 30)):
+                composer = app.query_one("#composer", ComposerInput)
+                app._set_busy(True, "Working")
+                app.agent.reset_interrupt()
+                composer.value = "draft task"
+
+                app.action_interrupt()
+                assert composer.value == ""
+                assert not app.agent.abort.is_set()
+
+                app.action_interrupt()
+                assert app.agent.abort.is_set()
+                assert app.close_requests == 0
+
+                app._set_busy(False, "Ready")
+                app.agent.reset_interrupt()
+                app.action_interrupt()
+                assert app.close_requests == 1
+
+        try:
+            asyncio.run(exercise_priority())
         finally:
             app.emergency_close()
 

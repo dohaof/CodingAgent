@@ -12,6 +12,7 @@ import datetime as dt
 import io
 import re
 import threading
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -547,7 +548,7 @@ class CagentTui(App[int]):
     """
 
     BINDINGS = [
-        Binding("ctrl+c", "interrupt", "Copy / stop / quit", priority=True),
+        Binding("ctrl+c", "interrupt", "Clear / copy / stop / quit", priority=True),
         Binding("ctrl+q", "quit_session", "Quit", priority=True),
         Binding("ctrl+r", "resume", "Resume", priority=True),
         Binding("f1", "help", "Help"),
@@ -578,6 +579,7 @@ class CagentTui(App[int]):
         self._stream_start_offset: int | None = None
         self._approval_waiter: _ApprovalWaiter | None = None
         self._approval_request: ApprovalRequest | None = None
+        self._queued_turns: deque[str] = deque()
         self._restored_from: str | None = None
 
         self.event_sink = TuiEventSink(self)
@@ -653,6 +655,8 @@ class CagentTui(App[int]):
         composer.focus()
         if self._exit_after_turn:
             self._begin_close()
+        elif self._start_next_queued_turn():
+            self._update_status()
 
     def on_unmount(self) -> None:
         self._stop_activity_animation()
@@ -666,12 +670,30 @@ class CagentTui(App[int]):
         text = event.value.strip()
         event.input.value = ""
         if self._approval_waiter is not None:
-            self._handle_approval_input(text)
+            if self._handle_approval_input(text):
+                return
+            if text.startswith("/"):
+                self._write(
+                    Text(
+                        "Answer the current approval before running a command.",
+                        style="yellow",
+                    )
+                )
+            elif text:
+                self._queue_turn(text)
             return
         if not text:
             return
         if self._busy or self._initializing:
-            self._write(Text("The agent is busy. Press Ctrl+C to interrupt it.", style="yellow"))
+            if text.startswith("/"):
+                self._write(
+                    Text(
+                        "Finish or interrupt the current turn before running a command.",
+                        style="yellow",
+                    )
+                )
+            else:
+                self._queue_turn(text)
             return
         if text.startswith("/"):
             self._handle_command(text)
@@ -698,16 +720,35 @@ class CagentTui(App[int]):
         else:
             self.post_message(TurnCompleted(result))
 
+    def _queue_turn(self, text: str) -> None:
+        """Queue a normal user request for the next available turn."""
+        self._queued_turns.append(text)
+        position = len(self._queued_turns)
+        self._write(Text(f"Queued request ({position}): {text}", style="yellow"))
+
+    def _start_next_queued_turn(self) -> bool:
+        """Start the oldest queued request, if the session is still running."""
+        if self._closing_session or not self._queued_turns:
+            return False
+        self._start_turn(self._queued_turns.popleft())
+        return True
+
     @on(TurnCompleted)
     def on_turn_completed(self, message: TurnCompleted) -> None:
-        self._set_busy(False, "Ready")
         if message.error:
             self._write(Text(f"Agent error: {message.error}", style="red"))
         elif message.result is not None and not message.result.completed:
             self._write(Text(f"Turn ended: {message.result.stopped_by}", style="yellow"))
-        self._update_status()
         if self._exit_after_turn:
+            self._set_busy(False, "Ready")
+            self._queued_turns.clear()
+            self._update_status()
             self._begin_close()
+        elif self._start_next_queued_turn():
+            self._update_status()
+        else:
+            self._set_busy(False, "Ready")
+            self._update_status()
 
     @on(AgentEventArrived)
     def on_agent_event_arrived(self, message: AgentEventArrived) -> None:
@@ -808,6 +849,8 @@ class CagentTui(App[int]):
                 transcript = self.query_one("#conversation", TextArea)
                 prefix = transcript.text[: self._stream_start_offset]
                 transcript.load_text(prefix + text.strip())
+                transcript.move_cursor(transcript.document.end, record_width=False)
+                transcript.scroll_end(animate=False, immediate=True, x_axis=False)
         self._text_buffer = ""
         self._thinking_buffer = ""
         self._stream_kind = None
@@ -830,9 +873,17 @@ class CagentTui(App[int]):
 
     def _append_transcript(self, text: str) -> None:
         transcript = self.query_one("#conversation", TextArea)
-        transcript.insert(text, transcript.document.end)
-        if self.focused is not transcript or not transcript.selected_text:
-            transcript.scroll_end(animate=False)
+        has_selection = bool(transcript.selected_text)
+        transcript.insert(
+            text,
+            transcript.document.end,
+            maintain_selection_offset=has_selection,
+        )
+        if not has_selection:
+            # Appending at the document end should move the hidden TextArea
+            # cursor with it.  ``immediate`` avoids a deferred scroll callback
+            # racing Textual's selection watcher and briefly jumping to top.
+            transcript.scroll_end(animate=False, immediate=True, x_axis=False)
 
     def _render_tool_result(self, event: ToolFinished) -> None:
         if self.quiet:
@@ -1006,12 +1057,20 @@ class CagentTui(App[int]):
 
     @on(CommandCompleted)
     def on_command_completed(self, message: CommandCompleted) -> None:
-        self._set_busy(False, "Ready")
         if message.output.strip():
             self._write(Text(message.output.rstrip()))
         if message.error:
             self._write(Text(message.error, style="red"))
-        self._update_status()
+        if self._exit_after_turn:
+            self._set_busy(False, "Ready")
+            self._queued_turns.clear()
+            self._update_status()
+            self._begin_close()
+        elif self._start_next_queued_turn():
+            self._update_status()
+        else:
+            self._set_busy(False, "Ready")
+            self._update_status()
 
     def _open_resume(self, reference: str = "") -> None:
         trace_dir = resume_trace_dir(self.config)
@@ -1135,12 +1194,12 @@ class CagentTui(App[int]):
         composer.set_prompt_hint("Approval: y/n/a/q (Enter = yes)")
         composer.focus()
 
-    def _handle_approval_input(self, answer: str) -> None:
-        """Resolve the inline y/n/a/q prompt without starting a new turn."""
+    def _handle_approval_input(self, answer: str) -> bool:
+        """Resolve an exact y/n/a/q answer, returning whether it was consumed."""
         waiter = self._approval_waiter
         request = self._approval_request
         if waiter is None or request is None:
-            return
+            return False
         answer = answer.lower()
         allow_always = request.risk is not RiskLevel.DANGEROUS and not request.always_prompt
         decision: Decision | None = None
@@ -1153,8 +1212,7 @@ class CagentTui(App[int]):
         elif answer in ("q", "quit"):
             decision = Decision(False, abort=True)
         else:
-            self._write(Text("Please answer y, n, a, or q.", style="dim"))
-            return
+            return False
 
         style = "green" if decision.approved else "red"
         self._write(Text(f"> {answer or 'yes'}", style=style))
@@ -1165,8 +1223,14 @@ class CagentTui(App[int]):
             "Ask cagent or enter /help"
         )
         self._set_activity("Working")
+        return True
 
     def action_interrupt(self) -> None:
+        composer = self.query_one("#composer", ComposerInput)
+        if composer.value:
+            composer.value = ""
+            composer.focus()
+            return
         conversation = self.query_one("#conversation", TextArea)
         if conversation.selected_text and not self._busy:
             conversation.action_copy()
@@ -1327,9 +1391,14 @@ class CagentTui(App[int]):
         if not text:
             return
         separator = "\n" if transcript.text else ""
-        transcript.insert(separator + text, transcript.document.end)
-        if self.focused is not transcript or not transcript.selected_text:
-            transcript.scroll_end(animate=False)
+        has_selection = bool(transcript.selected_text)
+        transcript.insert(
+            separator + text,
+            transcript.document.end,
+            maintain_selection_offset=has_selection,
+        )
+        if not has_selection:
+            transcript.scroll_end(animate=False, immediate=True, x_axis=False)
 
     def _renderable_text(self, renderable: Any) -> str:
         """Render without ANSI escapes so terminal selection copies clean text."""

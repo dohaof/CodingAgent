@@ -114,8 +114,10 @@ cagent --list-tools                                  # tools and their arguments
 When connected to a terminal, the interactive session opens a full-screen
 interface with a scrollable conversation, a fixed input box, and a small live
 activity line for approval, sandbox, and context state. During active work,
-`Ctrl+C` interrupts only the current turn and returns to the input box. While
-idle, `Ctrl+C` exits the session. `Ctrl+R` opens the saved-conversation picker,
+submitted requests are queued and run in order after the current turn;
+`Ctrl+C` first clears any text in the input box, then interrupts the current
+turn when pressed again. While idle with an empty input, `Ctrl+C` exits the
+session. `Ctrl+R` opens the saved-conversation picker,
 `F1` shows help, and `Ctrl+Q` exits. Piped or redirected input automatically
 uses the line-oriented fallback so logs remain script-friendly.
 
@@ -123,8 +125,8 @@ The session details are shown once in a bordered block at the start of the
 conversation rather than occupying a fixed header. The conversation pane is
 read-only but selectable: drag over any user message, model response, command,
 diff, or tool result and press `Ctrl+C` while idle to copy it. During active
-work, `Ctrl+C` always interrupts the current turn; its partial conversation is
-saved and the session remains open.
+work with an empty input, `Ctrl+C` interrupts the current turn; its partial
+conversation is saved and the session remains open.
 
 When a mutating or dangerous tool needs permission, the request and its diff
 are written directly into the conversation. Enter `y`, `n`, `a` (`always`, when
