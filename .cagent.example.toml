@@ -43,6 +43,7 @@ wire = "openai"
 # requires_key = false
 
 temperature = 0.0
+# reasoning_effort = "medium"   # OpenAI: none..max; Anthropic: low|medium|high|xhigh|max
 max_output_tokens = 8192
 request_timeout = 120.0
 max_retries = 4

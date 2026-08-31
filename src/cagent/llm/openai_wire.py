@@ -139,6 +139,8 @@ class OpenAIProvider(LLMProvider):
             "temperature": self.config.temperature,
             "max_tokens": self.config.max_output_tokens,
         }
+        if self.config.reasoning_effort is not None:
+            body["reasoning_effort"] = self.config.reasoning_effort
         if tools:
             body["tools"] = [
                 {

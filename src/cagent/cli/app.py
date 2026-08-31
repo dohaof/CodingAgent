@@ -32,7 +32,7 @@ from ..agent.approval import ApprovalPolicy
 from ..agent.engine import Agent
 from ..agent.events import FanOutSink
 from ..agent.trace import TraceWriter, history_from_trace, read_trace
-from ..config import AgentConfig, load_config
+from ..config import AgentConfig, ReasoningEffort, load_config
 from ..errors import CagentError, ConfigError
 from ..tools.registry import default_registry
 from ..types import Message
@@ -46,12 +46,22 @@ from .resume import resume_trace_dir as _resume_trace_dir
 __all__ = ["main"]
 
 _BANNER_HELP = """\
-Commands: /help <instruct>  /tools  /cost  /context  /approve <mode>
+Commands: /help <instruct>  /tools  /cost  /context  /effort [level]  /approve <mode>
           /sandbox  /resume [ID|PATH]  /undo  /clear  /exit
 Use /help <instruct> for details about one command.
 Ctrl+C interrupts active work or exits while idle.
 Full-screen TTY: selected idle text is copied; Ctrl+R resumes; F1 helps;
 Ctrl+Q exits."""
+
+_REASONING_EFFORTS: tuple[ReasoningEffort, ...] = (
+    "none",
+    "minimal",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max",
+)
 
 _RESUME_HELP = """\
 Conversation recovery
@@ -157,6 +167,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="the endpoint needs no API key, e.g. a local Ollama or llama.cpp server",
     )
     endpoint.add_argument("--temperature", type=float, help="sampling temperature")
+    endpoint.add_argument(
+        "--reasoning-effort",
+        choices=_REASONING_EFFORTS,
+        help="reasoning effort for compatible models (Anthropic excludes none/minimal)",
+    )
 
     limits = parser.add_argument_group("limits")
     limits.add_argument("--token-budget", type=int, help="stop after this many tokens")
@@ -233,6 +248,7 @@ def _overrides(args: argparse.Namespace) -> dict[str, object]:
         "base_url": args.base_url,
         "wire": args.wire,
         "temperature": args.temperature,
+        "reasoning_effort": args.reasoning_effort,
         "token_budget": args.token_budget,
         "context_window": args.context_window,
         "bash_timeout": args.bash_timeout,
@@ -479,6 +495,8 @@ def _command(console: Console, agent: Agent, config: AgentConfig, line: str) -> 
                 f"({agent.context.pressure:.0%}) · {len(agent.context.history)} messages "
                 f"· {agent.context.compactions} compaction(s)"
             )
+        case "/effort":
+            _effort_command(console, config, arguments)
         case "/clear":
             agent.context.history.clear()
             agent.guard.note_progress()
@@ -534,6 +552,17 @@ _HELP_TOPICS = {
         "Show estimated context usage, retained messages, and compaction count.",
         "dim",
     ),
+    "effort": (
+        "Reasoning effort",
+        "Use /effort to show the current value, /effort default to use the model or "
+        "gateway default, or choose one of:\n"
+        "  /effort none|minimal|low|medium|high|xhigh|max\n\n"
+        "OpenAI-compatible requests use reasoning_effort. Anthropic requests use "
+        "output_config.effort and support low, medium, high, xhigh, and max. Model "
+        "support varies. /effort none and /effort default are different: none is "
+        "sent explicitly on the OpenAI wire; default omits the field.",
+        "cyan",
+    ),
     "approve": (
         "Approve",
         "Use /approve suggest, /approve auto-edit, or /approve full-auto to change\n"
@@ -571,6 +600,45 @@ def _print_help(console: Console, instruction: str | None = None) -> None:
         return
     title, body, border = detail
     console.print(Panel(Text(body), title=title, border_style=border, expand=False))
+
+
+def _effort_command(
+    console: Console,
+    config: AgentConfig,
+    arguments: list[str],
+) -> None:
+    """Inspect or update reasoning effort for subsequent model requests."""
+    if not arguments:
+        shown = config.reasoning_effort or "default (provider decides)"
+        console.print(f"reasoning effort: {shown}")
+        return
+
+    if len(arguments) != 1:
+        _print_effort_usage(console)
+        return
+
+    value = arguments[0].lower()
+    if value == "default":
+        config.reasoning_effort = None
+        console.print("[dim]reasoning effort: default (provider decides)[/dim]")
+        return
+    if value not in _REASONING_EFFORTS:
+        _print_effort_usage(console)
+        return
+    if config.wire == "anthropic" and value in ("none", "minimal"):
+        console.print(
+            "[red]effort:[/red] Anthropic supports low, medium, high, xhigh, and max; "
+            f"{value} is only available on the OpenAI wire."
+        )
+        return
+    config.reasoning_effort = value
+    console.print(f"[dim]reasoning effort: {value} (applies to the next request)[/dim]")
+
+
+def _print_effort_usage(console: Console) -> None:
+    """Print the accepted interactive effort values."""
+    values = "|".join((*_REASONING_EFFORTS, "default"))
+    console.print(f"[dim]usage: /effort [{values}][/dim]")
 
 
 def _resume_command(
@@ -808,6 +876,7 @@ def _show_config(console: Console, config: AgentConfig) -> int:
         "base_url": config.base_url or "[red]not set[/red] (base_url in .cagent.toml)",
         "model": config.model or "[red]not set[/red] (model in .cagent.toml)",
         "wire": config.wire,
+        "reasoning effort": config.reasoning_effort or "default (provider decides)",
         "api key": key_state,
         "workspace": str(config.workspace),
         "approval mode": config.approval_mode,

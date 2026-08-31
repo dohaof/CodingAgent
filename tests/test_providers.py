@@ -217,6 +217,15 @@ class TestOpenAIWire:
         OpenAIProvider(config, client=client).complete([Message.user("hi")], system="")
         assert seen[0]["stream"] is True
         assert seen[0]["stream_options"] == {"include_usage": True}
+        assert "reasoning_effort" not in seen[0]
+
+    def test_reasoning_effort_is_sent_when_configured(self, config: AgentConfig) -> None:
+        config.reasoning_effort = "high"
+        client, seen = capture(openai_stream())
+
+        OpenAIProvider(config, client=client).complete([Message.user("hi")], system="")
+
+        assert seen[0]["reasoning_effort"] == "high"
 
     def test_cancelled_owned_client_is_recreated_for_the_next_turn(
         self, config: AgentConfig, monkeypatch: pytest.MonkeyPatch
@@ -409,6 +418,26 @@ class TestAnthropicWire:
         AnthropicProvider(config, client=client).complete([Message.user("hi")], system="")
         assert seen[0]["max_tokens"] == config.max_output_tokens
 
+    def test_reasoning_effort_uses_anthropic_output_config(
+        self, config: AgentConfig
+    ) -> None:
+        config.reasoning_effort = "high"
+        client, seen = capture(anthropic_stream())
+
+        AnthropicProvider(config, client=client).complete([Message.user("hi")], system="")
+
+        assert "reasoning_effort" not in seen[0]
+        assert seen[0]["output_config"] == {"effort": "high"}
+
+    def test_anthropic_output_config_is_omitted_when_effort_is_unset(
+        self, config: AgentConfig
+    ) -> None:
+        client, seen = capture(anthropic_stream())
+
+        AnthropicProvider(config, client=client).complete([Message.user("hi")], system="")
+
+        assert "output_config" not in seen[0]
+
     def test_tool_results_become_user_tool_result_blocks(self, config: AgentConfig) -> None:
         client, seen = capture(anthropic_stream())
         AnthropicProvider(config, client=client).complete(HISTORY, system="")
@@ -533,6 +562,15 @@ class TestFactory:
     def test_the_anthropic_wire_can_be_selected(self, tmp_path) -> None:
         config = endpoint_config(tmp_path, wire="anthropic")
         assert isinstance(build_provider(config), AnthropicProvider)
+
+    @pytest.mark.parametrize("effort", ["none", "minimal"])
+    def test_anthropic_rejects_openai_only_effort_levels(
+        self, tmp_path, effort: str
+    ) -> None:
+        config = endpoint_config(tmp_path, wire="anthropic", reasoning_effort=effort)
+
+        with pytest.raises(ConfigError, match="Anthropic.*low, medium, high"):
+            config.validate()
 
     def test_an_unknown_wire_is_a_config_error(self, tmp_path) -> None:
         config = endpoint_config(tmp_path)

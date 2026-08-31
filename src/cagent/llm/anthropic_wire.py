@@ -178,6 +178,8 @@ class AnthropicProvider(LLMProvider):
         system_text = "\n\n".join(part for part in (system, *extra_system) if part)
         if system_text:
             body["system"] = system_text
+        if self.config.reasoning_effort is not None:
+            body["output_config"] = {"effort": self.config.reasoning_effort}
         if tools:
             body["tools"] = [
                 {

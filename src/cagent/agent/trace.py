@@ -158,6 +158,7 @@ class TraceWriter:
                 "model": config.model,
                 "endpoint": config.base_url,
                 "wire": config.wire,
+                "reasoning_effort": config.reasoning_effort,
                 "workspace": str(config.workspace),
                 "approval_mode": config.approval_mode,
                 "sandbox_mode": config.sandbox_mode,

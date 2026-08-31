@@ -99,6 +99,7 @@ base_url = "https://api.example.com/v1"
 model = "你的模型名称"
 api_key = "你的 API Key"
 wire = "openai"
+# reasoning_effort = "high"
 ```
 
 `base_url` 会按原值使用，并在末尾追加请求路径：OpenAI 格式追加
@@ -108,6 +109,12 @@ wire = "openai"
 ```toml
 wire = "anthropic"
 ```
+
+可设置 `reasoning_effort` 控制单次请求的推理强度。OpenAI-compatible wire 支持
+`none`、`minimal`、`low`、`medium`、`high`、`xhigh` 或 `max`，请求字段为
+`reasoning_effort`；Anthropic wire 支持 `low`、`medium`、`high`、`xhigh` 或 `max`，
+请求字段为 `output_config.effort`。不同模型支持的档位可能不同；不设置该项时
+不会发送 effort 字段，由模型或网关采用默认值。
 
 本地无需密钥的服务（例如 Ollama 或 llama.cpp）可以设置：
 
@@ -140,6 +147,7 @@ cached_input_per_m = 0.07
 | 配置项 | 默认值 | 作用 |
 | --- | --- | --- |
 | `max_output_tokens` | `8192` | 单次模型回复的最大 token 数 |
+| `reasoning_effort` | 未设置 | 请求级推理强度；OpenAI 支持 `none` 到 `max`，Anthropic 支持 `low`、`medium`、`high`、`xhigh`、`max` |
 | `request_timeout` | `120` | 模型请求超时时间（秒） |
 | `max_retries` | `4` | 请求失败时的最大重试次数 |
 | `context_window` | `128000` | 模型上下文窗口大小 |
@@ -212,6 +220,7 @@ diff 和实时状态。通过管道或重定向输入时，会自动切换为适
 | `/tools` | 列出当前启用的工具及参数结构 |
 | `/cost` | 显示 prompt、completion、缓存 token 和步骤数 |
 | `/context` | 显示当前上下文占用、消息数和压缩次数 |
+| `/effort` | 查看推理强度；使用 `/effort high` 等命令调整后续请求，`/effort default` 恢复模型默认值 |
 | `/approve` | 查看当前审批模式 |
 | `/approve suggest` | 后续每次文件修改和命令都请求确认 |
 | `/approve auto-edit` | 工作区内文件编辑自动执行，命令仍请求确认 |
@@ -240,6 +249,7 @@ diff 和实时状态。通过管道或重定向输入时，会自动切换为适
 | `--wire openai 或 anthropic` | 选择请求格式 |
 | `--no-key` | 声明接口不需要 API Key |
 | `--temperature FLOAT` | 覆盖采样温度 |
+| `--reasoning-effort LEVEL` | 设置请求级推理强度；Anthropic 不支持 `none` 和 `minimal` |
 
 ### 限制与工作区
 

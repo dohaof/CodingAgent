@@ -108,6 +108,10 @@ class TestArgumentParsing:
         args = build_parser().parse_args(["--wire", "anthropic", "task"])
         assert _overrides(args)["wire"] == "anthropic"
 
+    def test_reasoning_effort_can_be_selected(self) -> None:
+        args = build_parser().parse_args(["--reasoning-effort", "high", "task"])
+        assert _overrides(args)["reasoning_effort"] == "high"
+
     def test_there_is_no_provider_flag(self) -> None:
         # A named provider would mean a built-in table of vendor model names,
         # and those go stale; the endpoint is described directly instead.
@@ -216,6 +220,40 @@ class TestInformationalCommands:
         assert "/undo" in out
         assert "Tool calls and results are removed as one unit" in out
         assert "does not revert files" in out
+
+    def test_effort_command_changes_and_resets_later_requests(
+        self, captured, config: AgentConfig
+    ) -> None:
+        console, buffer = captured
+
+        _command(console, object(), config, "/effort high")  # type: ignore[arg-type]
+        assert config.reasoning_effort == "high"
+        assert "next request" in buffer.getvalue()
+
+        _command(console, object(), config, "/effort default")  # type: ignore[arg-type]
+        assert config.reasoning_effort is None
+
+    def test_effort_command_supports_the_anthropic_wire(
+        self, captured, config: AgentConfig
+    ) -> None:
+        console, buffer = captured
+        config.wire = "anthropic"
+
+        _command(console, object(), config, "/effort high")  # type: ignore[arg-type]
+
+        assert config.reasoning_effort == "high"
+        assert "next request" in buffer.getvalue()
+
+    def test_effort_command_rejects_openai_only_levels_on_anthropic(
+        self, captured, config: AgentConfig
+    ) -> None:
+        console, buffer = captured
+        config.wire = "anthropic"
+
+        _command(console, object(), config, "/effort minimal")  # type: ignore[arg-type]
+
+        assert config.reasoning_effort is None
+        assert "Anthropic supports low, medium, high, xhigh, and max" in buffer.getvalue()
 
     def test_undo_checkpoints_the_remaining_history(
         self, captured, config: AgentConfig
@@ -438,6 +476,17 @@ class TestInformationalCommands:
         assert "https://api.example.com/v1" in out
         assert "file-model" in out
         assert "set" in out
+
+    def test_reasoning_effort_is_loaded_from_toml(
+        self, capsys, tmp_path, write_config
+    ) -> None:
+        write_config(reasoning_effort="high")
+
+        assert main(["--show-config", "--workspace", str(tmp_path)]) == 0
+
+        out = capsys.readouterr().out
+        assert "reasoning effort" in out
+        assert "high" in out
 
     def test_show_config_reports_unrestricted_path_access(self, capsys, tmp_path) -> None:
         assert (
@@ -934,6 +983,30 @@ class TestTui:
             asyncio.run(inspect_startup())
         finally:
             release.set()
+            app.emergency_close()
+
+    def test_effort_command_updates_the_live_tui_configuration(
+        self, config: AgentConfig
+    ) -> None:
+        app = CagentTui(config)
+
+        async def exercise_effort() -> None:
+            async with app.run_test(size=(100, 30)) as pilot:
+                composer = app.query_one("#composer", ComposerInput)
+                for _ in range(20):
+                    if not composer.disabled:
+                        break
+                    await pilot.pause()
+
+                app._handle_command("/effort high")
+                await pilot.pause()
+
+                assert config.reasoning_effort == "high"
+                assert "next request" in app.query_one("#conversation", TextArea).text
+
+        try:
+            asyncio.run(exercise_effort())
+        finally:
             app.emergency_close()
 
     def test_undo_rebuilds_the_transcript_without_the_latest_user_turn(

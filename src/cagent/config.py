@@ -29,6 +29,7 @@ from .errors import ConfigError
 __all__ = [
     "AgentConfig",
     "ApprovalMode",
+    "ReasoningEffort",
     "SandboxMode",
     "SandboxSync",
     "Wire",
@@ -40,6 +41,9 @@ Wire = Literal["openai", "anthropic"]
 
 ApprovalMode = Literal["suggest", "auto-edit", "full-auto"]
 """How much the agent may do without asking. See :class:`AgentConfig`."""
+
+ReasoningEffort = Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"]
+"""Reasoning effort accepted by one or both supported model wires."""
 
 SandboxMode = Literal["auto", "off", "docker"]
 """How shell commands are isolated: automatic Docker, host, or forced Docker."""
@@ -100,6 +104,13 @@ class AgentConfig:
     otherwise be rejected for having no key."""
 
     temperature: float = 0.0
+    reasoning_effort: ReasoningEffort | None = None
+    """Optional request-level reasoning budget hint.
+
+    ``None`` leaves the provider's default unchanged. OpenAI-compatible APIs
+    receive ``reasoning_effort``; Anthropic receives ``output_config.effort``.
+    Model support varies, and Anthropic does not define ``none`` or ``minimal``.
+    """
     max_output_tokens: int = 8192
     request_timeout: float = 120.0
     max_retries: int = 4
@@ -281,6 +292,25 @@ class AgentConfig:
             raise ConfigError(f"token_budget must be positive when set, got {self.token_budget!r}.")
         if not 0.0 <= self.temperature <= 2.0:
             raise ConfigError(f"temperature must be within [0, 2], got {self.temperature!r}.")
+        if self.reasoning_effort not in (
+            None,
+            "none",
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max",
+        ):
+            raise ConfigError(
+                "reasoning_effort must be one of none, minimal, low, medium, high, "
+                f"xhigh, max; got {self.reasoning_effort!r}."
+            )
+        if self.wire == "anthropic" and self.reasoning_effort in ("none", "minimal"):
+            raise ConfigError(
+                "Anthropic reasoning_effort must be one of low, medium, high, xhigh, "
+                f"max; got {self.reasoning_effort!r}."
+            )
         if self.approval_mode not in ("suggest", "auto-edit", "full-auto"):
             raise ConfigError(
                 f"approval_mode must be one of suggest, auto-edit, full-auto; "
