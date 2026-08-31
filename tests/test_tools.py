@@ -7,6 +7,7 @@ because the happy path is what the model already expects.
 
 from __future__ import annotations
 
+import ntpath
 import os
 import shutil
 import sys
@@ -37,6 +38,12 @@ from cagent.tools.truncation import truncate_output
 from cagent.types import RiskLevel
 
 SAFE, MUTATING, DANGEROUS = RiskLevel.SAFE, RiskLevel.MUTATING, RiskLevel.DANGEROUS
+
+
+def _use_windows_path_semantics(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make Windows-path tests independent of the host OS running pytest."""
+    for name in ("abspath", "dirname", "join", "normcase"):
+        monkeypatch.setattr(os.path, name, getattr(ntpath, name))
 
 
 class TestReadFile:
@@ -476,6 +483,7 @@ class TestBuildInvocation:
 
     def test_windows_wsl_launcher_is_not_used_as_native_bash(self, monkeypatch) -> None:
         monkeypatch.setattr(sys, "platform", "win32")
+        _use_windows_path_semantics(monkeypatch)
         monkeypatch.setenv("SYSTEMROOT", r"C:\Windows")
         monkeypatch.setattr(shutil, "which", lambda name: r"C:\Windows\System32\bash.exe")
         argv, use_shell = _build_invocation("python -V")
@@ -483,6 +491,7 @@ class TestBuildInvocation:
 
     def test_windows_finds_bash_beside_git(self, monkeypatch) -> None:
         monkeypatch.setattr(sys, "platform", "win32")
+        _use_windows_path_semantics(monkeypatch)
         monkeypatch.setattr(
             shutil,
             "which",
@@ -559,12 +568,14 @@ class TestRunBash:
         )
         assert decode_subprocess_output("中文路径".encode("gbk")) == "中文路径"
 
-    def test_child_environment_forces_python_utf8(self, monkeypatch) -> None:
+    def test_child_environment_forces_python_utf8_and_preserves_path(self, monkeypatch) -> None:
         monkeypatch.setenv("PYTHONUTF8", "0")
+        inherited_path = os.pathsep.join(("project-venv", "system-bin"))
+        monkeypatch.setenv("PATH", inherited_path)
         environment = _child_environment()
         assert environment["PYTHONUTF8"] == "1"
         assert environment["PYTHONIOENCODING"] == "utf-8"
-        assert environment["PATH"].split(os.pathsep)[0] == str(Path(sys.executable).parent)
+        assert environment["PATH"] == inherited_path
 
     def test_a_failing_command_returns_stderr_rather_than_raising(
         self, make_ctx, tmp_path: Path

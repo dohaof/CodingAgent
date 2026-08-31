@@ -1,635 +1,405 @@
-# cagent
+# Cagent
 
-A coding agent, written from scratch. It talks to a language model, reads and
-edits files, runs commands, reads what they printed, and keeps going until the
-task is done or a safety guard stops it.
+`cagent` 是一个面向代码任务的轻量TUI智能体。
 
-No agent framework or SDK is used. The model is reached over raw HTTP; the tool
-schemas, the streaming parser, the conversation history, the context budget, the
-loop, and the stopping conditions are all hand-written and are the substance of
-the project.
+它可以查看项目文件、搜索代码、编辑文件、运行测试和命令，并根据执行结果继续
+工作，直到任务完成或触发限制。
 
-```
-$ cagent "the tests are failing, find out why and fix it"
+## 功能概览
 
-· step 1 · 1,757 tokens (1% of window)
-⏺ run_bash(python -m pytest -q, description=see the failure)
-  ⎿ ✗ exit 1 (0.68s)
-    E       assert -1 == 5
-    E        +  where -1 = add(2, 3)
-· step 2 · 1,914 tokens (1% of window)
-⏺ read_file(calc.py)
-  ⎿ ✓ 2 of 2 lines (0.00s)
-· step 3 · 1,959 tokens (2% of window)
-⏺ edit_file(calc.py, old_string=    return a - b, new_string=    return a + b)
-  ⎿ ✓ +1/-1 (0.00s)
-    --- a/calc.py
-    +++ b/calc.py
-    @@ -1,2 +1,2 @@
-     def add(a, b):
-    -    return a - b
-    +    return a + b
-· step 4 · 2,036 tokens (2% of window)
-⏺ run_bash(python -m pytest -q, description=confirm green)
-  ⎿ ✓ exit 0 (0.63s)
-    2 passed in 0.00s
-· step 5 · 2,097 tokens (2% of window)
+- 支持一次性任务和全屏交互式会话。
+- 提供文件读取、精确编辑、多处编辑、目录浏览、文件名匹配和正则搜索。
+- 可以执行项目自己的测试、构建和脚本，并处理超时、失败和输出截断。
+- 自动生成项目结构索引（Repo Map），帮助模型快速定位相关文件。
+- 自动读取工作区根目录的 `AGENTS.md`，将项目约定加入 system prompt；切换到 Docker
+  沙箱后读取沙箱副本中的同一文件，且不会因此放宽工具权限或路径边界。
+- 对较长任务自动压缩上下文，同时保留原始任务和最近操作。
+- 只读查询工具可以并行执行，写入和命令执行保持有序。
+- 文件修改显示 diff；命令和高风险操作可按审批策略确认。
+- 可选 Docker 临时沙箱、JSONL 调试记录、会话恢复、撤销上下文和费用统计。
 
-add subtracted instead of adding (calc.py:2). Fixed and pytest passes.
+## 环境要求
 
-┌────────────── session finished ───────────────┐
-│ steps                                       5 │
-│ tools run                                   4 │
-│ elapsed                                  1.5s │
-│ prompt tokens                           4,500 │
-│ completion tokens                         225 │
-│ cost               no rate set for this model │
-│ files touched                         calc.py │
-└───────────────────────────────────────────────┘
+- Python 3.11 或更高版本。
+- 一个可访问的模型接口，支持 OpenAI Chat Completions 格式或 Anthropic
+  Messages 格式。
+- Docker 仅在需要隔离执行命令时使用，无Docker只能无限制执行命令或者只执行只读命令。
+- Windows、Linux 和 macOS 均可运行。Linux/macOS 优先使用 Bash；Windows
+  会优先使用 Git Bash，没有可用 Bash 时使用系统 shell。
+
+## 安装
+
+### 全局安装（推荐）
+
+使用 `pipx` 可以把 `cagent` 安装到独立环境，并让它在任意项目目录中可用。
+
+Windows PowerShell：
+
+```powershell
+py -m pip install --user pipx
+py -m pipx ensurepath
+py -m pipx install C:\path\to\CodingAgent
 ```
 
----
-
-## Running it
-
-Requires Python 3.11+.
+Linux 或 macOS：
 
 ```bash
-pip install -e .
+python3 -m pip install --user pipx
+python3 -m pipx ensurepath
+python3 -m pipx install /path/to/CodingAgent
 ```
 
-### Configuring an endpoint
+执行 `ensurepath` 后重新打开终端，然后检查：
 
-Three settings, and none of them are guessed. Copy `.cagent.example.toml` to
-`.cagent.toml` (gitignored) and fill in:
+```bash
+cagent --version
+```
+
+从源码更新后重新安装：
+
+```bash
+pipx reinstall coding-agent
+```
+
+卸载：
+
+```bash
+pipx uninstall coding-agent
+```
+
+### 开发安装
+
+在仓库目录中创建虚拟环境并以可编辑模式安装：
+
+```bash
+python -m venv .venv
+# Linux/macOS
+source .venv/bin/activate
+# Windows PowerShell 使用：.venv\Scripts\Activate.ps1
+python -m pip install -e ".[dev]"
+```
+
+开发安装会提供测试、类型检查和代码检查工具。使用项目虚拟环境时，先激活
+它再运行 `cagent`，这样智能体执行的 `python`、`pytest` 等命令会使用项目
+自己的依赖。
+
+## 模型配置
+
+配置文件只有一个 `[cagent]` 表。配置加载顺序如下，后者覆盖前者：
+
+```text
+内置默认值 → ~/.cagent.toml → <工作区>/.cagent.toml → CLI 参数
+```
+
+复制仓库中的 `.cagent.example.toml` 为 `.cagent.toml`，或直接创建：
 
 ```toml
 [cagent]
-base_url = "https://api.example.com/v1"        # where to send requests
-model = "the-model-your-endpoint-serves"       # what to ask for
-api_key = "..."                                # your key
+base_url = "https://api.example.com/v1"
+model = "你的模型名称"
+api_key = "你的 API Key"
+wire = "openai"
 ```
 
-Anything OpenAI-compatible works — a vendor API, a gateway, a proxy, or a local
-server. Every key in that table is a field name, and flags of the same name
-(`--base-url`, `--model`) override it for one run: the layers are `~/.cagent.toml`
-→ `./.cagent.toml` → flags, later winning. There is no environment layer, on
-purpose: configuration has one spelling and one place to inspect when the agent
-behaves unexpectedly.
+`base_url` 会按原值使用，并在末尾追加请求路径：OpenAI 格式追加
+`/chat/completions`，Anthropic 格式追加 `/messages`。请按照服务商要求保留
+版本路径（通常是 `/v1`）。使用 Anthropic Messages API 时设置：
 
-Details worth knowing:
+```toml
+wire = "anthropic"
+```
 
-- **`base_url` is used verbatim.** `/chat/completions` is appended (or
-  `/messages` on the Anthropic wire), so include whatever version segment your
-  provider publishes — usually `.../v1`. Nothing is inserted or guessed, so a
-  gateway that mounts its API somewhere unusual still works; omitting a needed
-  `/v1` is the usual cause of a 404 on the first request. A trailing slash is
-  handled either way.
-- **`--wire` picks the request format**, `openai` (the default, which almost
-  everything emulates) or `anthropic` for the Messages API. This is the only
-  seam where a genuinely different protocol has to be declared; everything else
-  is just a URL.
-- **`--no-key` for a local server.** Ollama or llama.cpp then gets no
-  `Authorization` header at all, rather than one containing the word `None`.
-- **Unknown keys are an error.** A misspelled setting fails loudly at startup
-  instead of being silently ignored, which is the failure mode that costs an
-  afternoon.
+本地无需密钥的服务（例如 Ollama 或 llama.cpp）可以设置：
 
-The key comes from a config file and nowhere else: never from a flag, because a
-flag lands in shell history and the process list. Keep `.cagent.toml` untracked
-(it is gitignored here), or put the key in `~/.cagent.toml` and leave the project
-file for everything else. `cagent --show-config` prints what resolved —
-endpoint, model, wire, the full request URL, and whether a key was found — with
-the key masked. It also works when the configuration is incomplete, which is
-when you need it.
+```toml
+requires_key = false
+```
 
-### Using it
+密钥只应放在未提交的 `.cagent.toml` 或用户目录配置中，不支持通过 CLI 传入。
+运行 `cagent --show-config` 可以查看最终生效的地址、模型、工作区、审批和
+沙箱设置；
+
+### 费用配置
+
+项目不内置价格表。若希望在 `/cost` 和会话总结中显示费用，在配置中添加
+每百万 token 的美元价格：
+
+```toml
+[cagent.prices."你的模型名称"]
+input_per_m = 0.27
+output_per_m = 1.10
+cached_input_per_m = 0.07
+```
+
+模型名按最长前缀匹配，因此同一厂商的日期版本也可以复用配置。未配置价格时, 仍会显示 token 数量
+
+### 常用配置项
+
+除接口信息外，以下设置也可以直接写入 `[cagent]`：
+
+| 配置项 | 默认值 | 作用 |
+| --- | --- | --- |
+| `max_output_tokens` | `8192` | 单次模型回复的最大 token 数 |
+| `request_timeout` | `120` | 模型请求超时时间（秒） |
+| `max_retries` | `4` | 请求失败时的最大重试次数 |
+| `context_window` | `128000` | 模型上下文窗口大小 |
+| `compact_threshold` | `0.75` | 上下文达到窗口比例后开始压缩 |
+| `keep_recent_turns` | `6` | 压缩时保留的最近步骤数 |
+| `bash_timeout` | `120` | shell 命令默认超时时间（秒） |
+| `approval_mode` | `auto-edit` | `suggest`、`auto-edit` 或 `full-auto` |
+| `repo_map_enabled` | `true` | 是否生成 Repo Map |
+| `repo_map_token_budget` | `1600` | Repo Map 使用的 token 预算 |
+| `trace_dir` | 工作区下 `.cagent/traces` | JSONL trace 目录；用 `--no-trace` 关闭 |
+
+## 快速开始
+
+在目标项目目录执行：
 
 ```bash
-cagent "add a --json flag to the report command"     # one task
-cagent                                               # full-screen interactive session
-cagent --list-tools                                  # tools and their arguments
+cagent "运行测试并修复失败"
 ```
 
-When connected to a terminal, the interactive session opens a full-screen
-interface with a scrollable conversation, a fixed input box, and a small live
-activity line for approval, sandbox, and context state. During active work,
-submitted requests are queued and run in order after the current turn;
-`Ctrl+C` first clears any text in the input box, then interrupts the current
-turn when pressed again. While idle with an empty input, `Ctrl+C` exits the
-session. `Ctrl+R` opens the saved-conversation picker,
-`F1` shows help, and `Ctrl+Q` exits. Piped or redirected input automatically
-uses the line-oriented fallback so logs remain script-friendly.
+不带任务参数时进入交互会话：
 
-The session details are shown once in a bordered block at the start of the
-conversation rather than occupying a fixed header. The conversation pane is
-read-only but selectable: drag over any user message, model response, command,
-diff, or tool result and press `Ctrl+C` while idle to copy it. During active
-work with an empty input, `Ctrl+C` interrupts the current turn; its partial
-conversation is saved and the session remains open.
-
-When a mutating or dangerous tool needs permission, the request and its diff
-are written directly into the conversation. Enter `y`, `n`, `a` (`always`, when
-offered), or `q` (`quit`) in the input box; an empty answer is the same as `y`.
-Model text streams into the conversation as it arrives, so it can be selected
-without waiting for the turn to finish.
-
-The transcript uses prominent `USER`, `ASSISTANT`, and `TOOL` labels. Tool
-results are grouped for scanning: a `read_file` result shows its path once,
-then indented line numbers and source; search results likewise show each path
-once with indented match lines. Added and removed diff lines remain green and
-red respectively.
-
-To continue a previous conversation, start an interactive session with `cagent`,
-then enter `/resume`. The agent lists saved conversations from the current
-workspace and lets you choose one by number. A short session ID or full JSONL
-path can also be passed directly. Use `/help resume` inside the session for
-details.
-The trace is read-only; the current configuration, credentials, workspace,
-approvals, and sandbox remain active. A trace cannot restore an old Docker
-container or unsynchronised sandbox files, and clipped tool output means
-recovery is best-effort rather than a filesystem snapshot.
-
-The command is installed by the Python package; it is not tied to this
-repository. On Windows, activate the virtual environment once per terminal and
-then run it from any project directory:
-
-```powershell
-& "C:\path\to\CodingAgent\venv\Scripts\Activate.ps1"
-cd D:\Projects\MyProject
-cagent "run the tests and fix the failure"
+```bash
+cagent
 ```
 
-To avoid activating a virtual environment manually, install the project with
-`pipx install --editable C:\path\to\CodingAgent`; `pipx` exposes `cagent` on
-your user `PATH`. You can also keep the shell in another directory and select
-the target explicitly:
+默认工作区是启动命令时的当前目录。也可以从其他目录指定项目：
 
-```powershell
-cagent --workspace D:\Projects\MyProject "inspect and fix the tests"
+```bash
+cagent --workspace /path/to/project "检查并修复测试"
+# Windows 示例
+cagent --workspace D:\Projects\MyProject "运行测试并修复失败"
 ```
 
-#### Interactive commands
+查看版本、配置和工具：
 
-Inside the interactive session, `/help` shows a compact command list. Add a
-command name to see its details, for example `/help sandbox` or `/help resume`.
-Conversation recovery is available only inside the session:
-
-```text
-/resume                         # list and choose a saved conversation
-/resume <number>                # choose an item from that list
-/resume <session-id>            # find it in the workspace trace directory
-/resume path/to/session.jsonl   # use an explicit path
-/undo                           # remove the latest user turn from context
+```bash
+cagent --version
+cagent --show-config
+cagent --list-tools
 ```
 
-`/undo` removes the most recent user message together with every assistant and
-tool message that answered it. It does not revert file edits, commands, package
-installation, or other side effects that already occurred.
+## 交互界面
 
-By default traces live in `<workspace>/.cagent/traces`. The picker shows the most
-recent sessions first, including
-their timestamp, short ID, step count, status, and first request.
-Only sessions with at least one non-empty user request are saved and listed;
-commands such as `/help` and `/exit` alone do not create a saved
-conversation. Restoring a conversation alone also does not create a new trace;
-the restored checkpoint is recorded only when you submit a new non-empty
-request. A partially interrupted session is listed only when its trace still
-contains provider-valid conversation history.
+连接到终端时，`cagent` 使用全屏界面显示对话、模型输出、工具调用、审批提示、
+diff 和实时状态。通过管道或重定向输入时，会自动切换为适合脚本和日志的逐行模式。
 
-This replaces the current conversation history with the messages recorded in
-the trace and keeps using the current workspace and configuration. In the
-full-screen interface, the conversation pane is cleared and rebuilt with a
-`Restored context` marker followed by a `Live conversation continues from here`
-marker, so the boundary is visible without opening the JSONL file. It does not
-restore the old container, unsynchronised sandbox files, or approval state.
+工具需要确认时，在输入框输入：
 
-#### 交互式沙箱
+- `y`：允许本次操作（直接回车也表示允许）；
+- `n`：拒绝本次操作，并把拒绝原因返回给模型；
+- `a`：在允许时记住同类操作；
+- `q`：停止当前任务。
 
-不需要重启程序即可在交互窗口中开启、提交或撤销沙箱修改。输入
-`/help sandbox` 可以在程序内查看沙箱操作说明，`/help resume` 可以查看对话恢复说明。
+常用快捷键：
+
+| 快捷键 | 作用 |
+| --- | --- |
+| `Ctrl+C` | 有选中文本时复制；有输入时清空输入；任务运行中中断任务；空闲且输入为空时退出 |
+| `Ctrl+Q` | 退出交互会话 |
+| `Ctrl+R` | 打开会话恢复列表 |
+| `F1` | 打开帮助 |
+
+## 交互命令
+
+在交互会话中输入以下命令。输入 `/help <命令>` 可以查看对应帮助。
 
 | 命令 | 作用 |
 | --- | --- |
-| `/sandbox` | 查看当前状态、镜像和同步策略 |
-| `/sandbox on [IMAGE]` | 创建项目快照并开启 Docker 隔离；不写 IMAGE 时使用当前配置 |
-| `/sandbox image IMAGE` | 设置本地镜像；沙箱开启时会重启容器，但保留当前快照 |
-| `/sandbox sync never\|ask\|always` | 设置关闭沙箱或退出程序时的处理方式 |
-| `/sandbox apply` | 立即把当前修改同步到真实项目，沙箱继续运行，并建立新基线 |
-| `/sandbox rollback` | 丢弃尚未同步的修改，重新载入真实项目，沙箱继续运行 |
-| `/sandbox off` | 按当前同步策略处理修改，然后回到真实项目模式 |
+| `/help [主题]` | 显示帮助或指定主题的详细说明 |
+| `/tools` | 列出当前启用的工具及参数结构 |
+| `/cost` | 显示 prompt、completion、缓存 token 和步骤数 |
+| `/context` | 显示当前上下文占用、消息数和压缩次数 |
+| `/approve` | 查看当前审批模式 |
+| `/approve suggest` | 后续每次文件修改和命令都请求确认 |
+| `/approve auto-edit` | 工作区内文件编辑自动执行，命令仍请求确认 |
+| `/approve full-auto` | 仅危险操作请求确认 |
+| `/resume [编号、ID 或路径]` | 恢复已保存的会话，不带参数时打开选择列表 |
+| `/undo` | 从上下文移除最近一轮对话 |
+| `/clear` | 清空当前对话上下文 |
+| `/sandbox ...` | 查看或控制 Docker 沙箱 |
+| `/exit`、`/quit` | 退出会话 |
 
-推荐的交互流程：
+`/undo` 只改变模型上下文，不会撤销已经写入的文件、执行过的命令、安装的
+依赖或其他副作用。需要还原文件时请使用版本控制工具或沙箱的
+`/sandbox rollback`。
+
+## CLI 参数
+
+任务可以放在所有选项之后，也可以直接用引号包起来。完整帮助可通过
+`cagent --help` 查看。
+
+### 模型接口
+
+| 参数 | 说明 |
+| --- | --- |
+| `--base-url URL` | 覆盖 API 地址 |
+| `--model NAME` | 覆盖模型名称 |
+| `--wire openai 或 anthropic` | 选择请求格式 |
+| `--no-key` | 声明接口不需要 API Key |
+| `--temperature FLOAT` | 覆盖采样温度 |
+
+### 限制与工作区
+
+| 参数 | 说明 |
+| --- | --- |
+| `--token-budget INT` | 本次任务允许消耗的 token 上限 |
+| `--context-window INT` | 模型上下文窗口大小，用于上下文压缩 |
+| `--bash-timeout FLOAT` | 单条命令的超时时间（秒） |
+| `--workspace PATH` | 指定工作区，默认是当前目录 |
+| `--allow-outside-workspace` | 允许文件工具访问工作区之外的路径 |
+
+### 审批与沙箱
+
+| 参数 | 说明 |
+| --- | --- |
+| `--approval suggest、auto-edit 或 full-auto` | 设置审批策略 |
+| `-y`、`--yes` | `--approval full-auto` 的简写 |
+| `--sandbox auto、off 或 docker` | 自动选择、关闭或强制使用 Docker |
+| `--sandbox-sync never、ask 或 always` | 沙箱结束时丢弃、询问或自动同步修改 |
+| `--sandbox-image IMAGE` | 指定本地 Docker 镜像 |
+| `--sandbox-memory-mb INT` | 沙箱内存上限，单位 MiB |
+| `--sandbox-cpus FLOAT` | 沙箱 CPU 上限 |
+| `--sandbox-pids INT` | 沙箱进程数上限 |
+| `--sandbox-workspace-mb INT` | 沙箱工作区普通文件大小上限 |
+
+### 输出与诊断
+
+| 参数 | 说明 |
+| --- | --- |
+| `--no-repo-map` | 不生成项目结构索引 |
+| `--no-thinking` | 隐藏模型的思考过程显示 |
+| `--quiet` | 只显示警告和最终总结 |
+| `--trace-dir PATH` | 将 JSONL trace 写入指定目录 |
+| `--no-trace` | 关闭 trace 记录 |
+| `--show-config` | 显示解析后的配置并退出 |
+| `--list-tools` | 显示工具及 schema 并退出 |
+| `--version` | 显示版本并退出 |
+
+## Docker 沙箱
+
+沙箱用于把命令和文件操作放在项目临时副本中执行。默认配置为：
 
 ```text
+sandbox_mode = "auto"
+sandbox_sync = "ask"
+sandbox_image = "python:3.12-slim"
+```
+
+`auto` 只有在 Docker daemon 和镜像都已存在时才启用隔离；条件不满足会给出
+警告并回退到宿主机。镜像不会自动拉取。要强制隔离，可使用：
+
+```bash
+cagent --sandbox docker --sandbox-image my-project-agent:latest "运行测试"
+```
+
+在交互会话中也可以控制：
+
+```text
+/sandbox                         查看状态
 /sandbox image my-project-agent:latest
 /sandbox sync ask
 /sandbox on
-... 让 Agent 修改代码并运行测试 ...
-/sandbox apply       # 阶段性提交，继续在沙箱中工作
-... 继续修改 ...
-/sandbox rollback    # 放弃最近一轮尚未提交的修改
-/sandbox off         # 完成后回到真实项目
+/sandbox apply                   立即把当前修改同步到真实项目
+/sandbox rollback                丢弃尚未同步的修改
+/sandbox off                     按同步策略退出沙箱
 ```
 
-同步策略的含义：
+沙箱使用一次临时快照和一个会话级容器，容器结束后会被删除。默认网络关闭、
+根文件系统只读，并限制内存、CPU、进程数和工作区大小。`never` 会丢弃修改，
+`ask` 退出时展示受限 diff 并询问，`always` 自动同步。宿主机模式下，shell
+进程本身不受工作区边界限制；审批和路径检查不能替代进程隔离。
 
-- `never`：关闭或退出时丢弃所有未提交的沙箱修改。
-- `ask`：关闭或退出时展示受限 diff，确认后才同步。
-- `always`：关闭或退出时自动同步；若真实项目被其他程序改动，会拒绝同步并提示冲突。
-- `/sandbox apply` 是显式同步命令，不再弹出第二次确认；`/sandbox rollback` 不会撤销已经 apply 的修改。
-
-沙箱生命周期属于“一个 Agent 对话会话”：同一个交互窗口中的多个任务共享
-一个快照和一个容器，容器在第一次 `run_bash` 时才启动，退出窗口后删除。相同
-工作目录同时打开两个 Agent，会分别拥有自己的快照和容器，未同步的修改互不
-可见。沙箱开启期间，文件工具操作临时快照，Shell 在 Linux 容器中运行；真实
-项目只有在同步时才会被修改，默认的工作目录边界和命令审批仍然有效。
-
-默认 `sandbox_mode = "auto"` 会检查 Docker 服务和本地镜像；两者可用时自动启用
-隔离，否则回退到宿主机并显示警告。宿主机 `run_bash` 的进程权限始终是
-`SHELL host (unrestricted)`，因为 `cd ..`、绝对路径、重定向、符号链接和子进程
-都能绕过单纯的工作目录检查。`allow_outside_workspace = false` 仍让文件工具
-保持 `PATHS workspace-only`；设为 true 才允许文件工具访问工作区外路径。
-`/sandbox off` 是明确关闭 Docker，审批模式只决定确认流程，不提供进程隔离。
-
-With `--workspace`, that directory is the file-tool workspace and the
-location where the project `.cagent.toml` is read. File tools are workspace-only
-by default. Host shell execution remains available, but is unrestricted at the
-process level unless Docker isolation is active, and cagent warns about this.
-The user-level
-`%USERPROFILE%\.cagent.toml` remains available for shared endpoint settings.
-
-**Supervision.** `--approval suggest` confirms every change; `auto-edit` (the
-default) lets file edits through and confirms shell commands; `full-auto`
-confirms only destructive commands. Nothing auto-approves a destructive command.
-
-These are separate from sandboxing. `full-auto` is an approval policy, not a
-"danger-full-access" switch.
-
-**Sandboxing.** The default `sandbox_mode = "auto"` checks whether Docker and
-the selected local image are available. If so, it automatically enables
-isolated shell execution. To require that behavior, use
-`--sandbox docker --sandbox-sync ask` (or set the same fields
-in `.cagent.toml`). The agent copies the project to a temporary snapshot and
-mounts only that snapshot into a constrained, network-disabled Docker
-container. The real project is never mounted into the container. One Agent
-session owns one container: the first `run_bash` starts it and later commands
-use `docker exec`, so tools and packages installed during that session remain
-available in writable locations. The root filesystem is read-only, so stable
-project dependencies should be baked into the image rather than installed by
-the Agent. The container is removed when the Agent closes; opening a new Agent
-creates a new container and a fresh snapshot. Docker reuses local image layers,
-so it does not reinstall image dependencies on every session.
-
-The image must already exist locally because pulls are disabled. In `auto`, a
-missing image or unavailable daemon causes a warning and host fallback. In
-explicit `docker` mode it fails closed instead. For a project
-with non-Python or heavier dependencies, create a project-specific image once:
+如果项目依赖 Node、Java 或其他工具，建议预先构建本地镜像：
 
 ```dockerfile
-# Dockerfile.agent
 FROM node:22-bookworm
 RUN npm install -g pnpm
 ```
 
-```powershell
+```bash
 docker build -f Dockerfile.agent -t my-project-agent:latest .
-cagent --workspace . --sandbox docker --sandbox-image my-project-agent:latest "run the tests"
 ```
 
-Keep credentials out of the Docker build context. At minimum, add
-`.cagent.toml`, `.cagent.toml.*`, `.git`, and `.cagent/` to `.dockerignore`;
-the example Dockerfile above does not need to copy the project into the image.
+请不要把密钥或 `.cagent.toml` 放入 Docker 构建上下文。
 
-The image build is an explicit user action because a Dockerfile can execute
-arbitrary installation scripts. At session end, `never` discards the snapshot,
-`ask` shows a bounded diff and requires a separate approval, and `always` copies
-it back after a concurrent-change check. `--sandbox off` explicitly selects
-the host shell. A host process can escape its initial directory through `cd ..`,
-absolute paths, redirection, symlinks, or child interpreters; command
-classification and approval are not a process isolation boundary.
+## Agent 工具
 
-The default `allow_outside_workspace = false` still makes file tools enforce the
-workspace boundary, shown as `PATHS workspace-only`. If Docker is unavailable,
-the status is therefore `PATHS workspace-only / SHELL host (unrestricted)` and a
-warning explains the risk. Set `allow_outside_workspace = true` only when file
-tools should also access paths outside the workspace; the status then shows
-`PATHS unrestricted`. This is the project's danger-full-access equivalent for
-file paths, using the current OS user's existing permissions.
+模型当前可以调用以下 8 个工具：
 
-**Cost.** Token counts are always reported. Dollar figures require rates you
-supply, because a built-in price table goes stale and a stale price prints a
-confident number that is wrong:
+| 工具 | 用途 | 主要参数 |
+| --- | --- | --- |
+| `read_file` | 分页读取文本文件并显示行号 | `path`, `offset`, `limit` |
+| `write_file` | 创建文件或完整覆盖文件 | `path`, `content` |
+| `edit_file` | 替换文件中的唯一文本片段并生成 diff | `path`, `old_string`, `new_string`, `replace_all` |
+| `multi_edit` | 按顺序原子执行同一文件的多处替换 | `path`, `edits` |
+| `list_dir` | 查看有限深度的目录树 | `path`, `depth`, `max_entries` |
+| `glob_files` | 按 glob 模式查找文件 | `pattern`, `path` |
+| `grep_search` | 按正则表达式搜索文件内容 | `pattern`, `path`, `glob`, `case_sensitive`, `context`, `max_results` |
+| `run_bash` | 执行测试、构建和其他 shell 命令 | `command`, `timeout`, `description` |
 
-```toml
-[cagent.prices."the-model-your-endpoint-serves"]
-input_per_m = 0.27          # US dollars per million tokens
-output_per_m = 1.10
-cached_input_per_m = 0.07   # optional
+只读查询工具可以并行运行；文件写入和命令执行会按顺序进行。`edit_file`
+会依次尝试精确、空白归一化和模糊匹配，匹配不唯一时拒绝修改；
+`multi_edit` 任一步失败都会使整个批次保持不变。
+
+## Repo Map 与上下文
+
+启动任务时，Agent 可以生成项目结构索引，包含源文件路径、声明和导入关系，
+并按任务相关性排序。它是导航摘要，不会替代 `read_file`，也不会自动下载语法
+解析器。
+
+长任务接近 `context_window` 时会自动压缩上下文：优先省略旧工具输出，必要时
+总结旧步骤，最后才移除更早步骤。最初的用户任务和最近操作会保留。可用
+`--context-window` 调整窗口，用 `/context` 查看当前压力。
+
+## Trace 与会话恢复
+
+默认 trace 位于：
+
+```text
+<workspace>/.cagent/traces/*.jsonl
 ```
 
-### Checking it
+每行是一个事件，便于在任务中断后检查过程。也可以用 `--trace-dir PATH` 指定
+目录，或用 `--no-trace` 完全关闭记录。
+
+恢复方式：
+
+```text
+cagent
+/resume                         选择最近会话
+/resume 1                       按列表编号恢复
+/resume 20260831-abcdef         按会话 ID 或前缀恢复
+/resume path/to/session.jsonl   从指定文件恢复
+```
+
+恢复只加载对话历史，继续使用当前工作区、配置、审批状态和沙箱；不会恢复旧
+容器或未同步的文件。会话选择器默认只显示包含有效用户请求的记录。
+
+## 常见问题
+
+**提示缺少 `base_url` 或 `model`。** 在工作区或用户目录创建 `.cagent.toml`，
+然后运行 `cagent --show-config` 检查最终配置。
+
+**首次请求返回 404。** 检查 `base_url` 是否包含服务商要求的版本路径，并确认
+`wire` 与接口格式匹配。
+
+**输入 `cagent` 提示找不到命令。** 重新打开终端，确认 `pipx ensurepath` 添加
+的目录在 `PATH` 中；也可以在已激活的项目虚拟环境中重新执行开发安装。
+
+**Docker 没有启用。** `auto` 模式要求 Docker daemon 正在运行且镜像已在本地。
+用 `cagent --show-config` 查看状态；需要严格隔离时使用 `--sandbox docker`，
+缺少条件时它会直接失败而不会回退到宿主机。
+
+**模型改错了文件。** 查看工具输出的 diff；`/undo` 只能撤销对话上下文，文件
+本身请使用 Git、编辑器历史或沙箱的 `/sandbox rollback` 恢复。
+
+## 开发检查
 
 ```bash
-pytest                       # 533 tests
-ruff check src tests eval
-mypy src/cagent eval
-python -m eval.run           # the benchmark; needs a real endpoint
+python -m pytest
+python -m ruff check .
+python -m mypy src
 ```
-
----
-
-## Architecture
-
-Five layers. Each one depends only on the layer below it, and the seams are where
-the design decisions live.
-
-```
-┌──────────────────────────────────────────────────────────────────┐
-│  cli/          argument parsing · streaming render · approval    │
-│                prompt · cost                                     │
-│                the only layer that prints                        │
-└────────────────────────────┬─────────────────────────────────────┘
-                             │ typed events
-┌────────────────────────────▼─────────────────────────────────────┐
-│  agent/        the loop · context compaction · loop guards ·     │
-│                approval policy · repo map · system prompt ·      │
-│                JSONL trace                                      │
-└──────────────┬──────────────────────────────────┬────────────────┘
-               │ Message / ToolSpec               │ ToolOutcome
-┌──────────────▼──────────────┐   ┌───────────────▼────────────────┐
-│  llm/                       │   │  tools/                        │
-│  provider ABC · OpenAI wire │   │  BaseTool · schema reflection · │
-│  Anthropic wire · SSE       │   │  registry · match ladder ·     │
-│  parser · tool-call         │   │  diffs · files · shell ·       │
-│  accumulator · retry ·      │   │  search · truncation           │
-│  token estimation           │   │                                │
-└──────────────┬──────────────┘   └───────────────┬────────────────┘
-               └──────────────┬───────────────────┘
-┌─────────────────────────────▼────────────────────────────────────┐
-│  types · errors · config     provider-neutral message model,     │
-│                              exception hierarchy, layered config │
-└──────────────────────────────────────────────────────────────────┘
-```
-
-### The loop
-
-One step: ask the model what to do. If it answers in prose, the turn is over. If
-it asks for tools, authorise each call, run it, append the result, and ask again
-with what was learned.
-
-Two invariants make that survivable.
-
-**Every tool call gets exactly one result.** Including refused calls, calls with
-malformed JSON, and calls to tools that do not exist. Both wire formats reject a
-request whose `tool_calls` have no matching results, so an unanswered call does
-not degrade the run — it ends it with a 400. Every early exit in dispatch still
-produces a result part.
-
-**Nothing a tool does can stop the loop.** `BaseTool.invoke` converts bad
-arguments, a refused path, and unexpected exceptions into a `ToolOutcome` with
-`is_error` set. The engine does the same for approval refusals and its own
-dispatch errors. A failure is an observation the model can act on.
-
-Those two combine into the property the agent is actually built around: a failing
-command comes back as text with its traceback intact, and the model fixes its own
-mistake. Self-correction is not a feature added on top; it is what happens when
-failures are reported instead of raised.
-
-### The edit engine — `tools/matching.py`
-
-An agent that rewrites whole files loses code it never read. So edits are local:
-`edit_file(path, old_string, new_string)`.
-
-The problem is that `old_string` is the model's *copy* of what it read, and copies
-drift — indentation gets normalised, tabs become spaces, a character is mistyped.
-A byte-exact matcher fails on all of it. So matching degrades through three
-levels, returning every match from the first level that finds any, never mixing
-levels:
-
-| level | tolerates | similarity |
-|---|---|---|
-| exact | nothing | 1.00 |
-| whitespace | uniform indent drift, tabs vs spaces, trailing whitespace | 0.99 |
-| fuzzy | small typos, one inserted or deleted line | ≥ threshold (0.86) |
-
-Two details make it usable rather than dangerous:
-
-- **Re-indentation.** When a match was found at a different indentation than the
-  needle, the replacement is shifted by the same delta. Without this a fuzzy
-  replace lands mis-indented and the file no longer parses — which is why naive
-  fuzzy replace is worse than no fuzzy replace.
-- **Ambiguity is refused, not guessed.** Two matches means an error listing both
-  line numbers and telling the model to include more context. `replace_all` is
-  honoured only for exact matches; on a fuzzy match it is refused outright,
-  because a fuzzy match applied everywhere is how an agent destroys a file.
-
-A failed match is not just "not found": `best_rejected` reports the nearest
-below-threshold candidate with its line number and score, so the model can see
-what it got wrong.
-
-Edits are atomic (temp file + `os.replace`) and preserve the file's newline style
-and encoding. An edit that silently converts a CRLF file to LF shows up in the
-user's version control as a whole-file change.
-
-### Context management — `agent/context.py`
-
-Each step adds an assistant turn and its tool results, so a long task grows its
-own prompt until the request is rejected. Two constraints shape the fix.
-
-*Tool calls and their results are inseparable* — so history is segmented into
-**steps** (an assistant turn plus the results answering it) and steps are the
-unit of removal. Segmenting per *user turn* instead is the obvious mistake: an
-agentic task is one user message followed by dozens of steps, so it produces a
-single indivisible block and compaction can never free anything during exactly
-the long task that needs it.
-
-*Not all history is equally valuable* — so compaction escalates, cheapest first:
-
-1. **elide** old tool output, keeping a few lines and a marker. Usually enough,
-   because tool output is the bulk of a transcript and stale output is its least
-   useful part.
-2. **summarise** old steps into a progress note, via a separate tool-free model
-   call. Rejected if the note would not be smaller than what it replaces.
-3. **drop** old steps, leaving a marker saying how many went and instructing the
-   model to re-read rather than trust its memory.
-
-The first block — the task — is never touched, and the last few steps are kept
-verbatim. An agent that forgets what it was asked will confidently finish the
-wrong job. If all three stages still leave the history above the configured
-model window, the turn stops with an instruction to increase `--context-window`
-instead of sending a request that will certainly fail.
-
-### Stopping — `agent/guards.py`
-
-An agent that decides its own next action can fail by never stopping, and that
-failure is expensive rather than loud. There is no arbitrary step ceiling. The
-loop stops when the model returns a final answer, the optional token budget is
-spent, a repeated identical tool call is detected, or the user interrupts it.
-
-Repetition is handled in two stages. A repeated identical call first earns a
-*nudge* — a tool result telling the model it is looping and what to try instead —
-because the usual cause is a model that cannot see its own pattern, and one
-sentence often fixes it. Only an unbroken streak past the limit stops the run.
-
-### Safety — `agent/approval.py`, `tools/shell.py`
-
-`classify_command` sorts a command into safe / mutating / dangerous by inspecting
-each stage of a compound command and taking the worst; the allowlist is small, so
-it can only be wrong in the safe direction. The approval policy holds all the
-permission rules in one auditable place.
-
-The approval prompt shows the tool's own dry-run account of the action — for an
-edit, the *real* diff of what would be written. A prompt the user cannot evaluate
-trains them to approve everything, which is worse than no prompt.
-
-A dangerous command's remembered-approval key is its full text, so consent never
-transfers from one irreversible action to a different one. "Always allow" is
-neither offered nor honoured for those.
-
-Other measures: paths are resolved and checked for workspace containment (`..`
-and symlinks both caught); command timeouts kill the whole process tree, not just
-the shell; and the child environment is stripped of anything whose name looks
-like a credential — the model can run `env`, and whatever it prints lands in the
-transcript and the trace file.
-
-### Schema reflection — `tools/schema.py`
-
-A tool declares its arguments once, as an annotated dataclass, and the JSON Schema
-sent to the model is derived from it. They cannot drift apart.
-
-```python
-@dataclass
-class EditFileParams:
-    path: Annotated[str, Doc("Path to the file")]
-    old_string: Annotated[str, Doc("Text to find — must match uniquely")]
-    new_string: Annotated[str, Doc("Replacement text")]
-    replace_all: bool = False
-```
-
-Reflection covers primitives, `Literal`, `Enum`, `list[T]`, `dict[str, T]`,
-`X | None`, and nested dataclasses (which `multi_edit` needs). An unsupported
-annotation raises at schema-build time — failing loudly beats shipping a wrong
-schema and debugging the resulting nonsense arguments.
-
-Validation of the model's arguments is deliberately asymmetric: lenient where
-models are reliably sloppy (`"12"` for an int, `"yes"` for a bool, a bare scalar
-where an array was declared), strict where being wrong would run the wrong action
-(unknown keys, missing required fields, values outside a `Literal`). All field
-errors are reported together, and each message is phrased as an instruction the
-model can act on — that string goes straight back into the transcript.
-
-### Observability — `agent/trace.py`, `cli/render.py`
-
-The engine never prints. It emits typed events to a sink, and the CLI decides what
-a human should see; the same run drives a terminal renderer, a JSONL trace, and a
-test that asserts on a list, concurrently.
-
-The trace is one JSON object per event, flushed per line, because the runs worth
-examining are the ones that crashed. `/resume` reconstructs the recorded
-user, assistant, and tool-result messages in the current interactive Agent;
-credentials, approvals, usage counters, and Docker state are deliberately not
-stored in the trace.
-
-The session summary reports tokens, cached tokens, and estimated cost; for a model
-with no published rate it reports the token counts and no dollar figure rather
-than guessing.
-
----
-
-## Testing
-
-610 tests, hermetic: no network, no real sleeps, no dependence on the machine's
-PATH. `mypy` clean, `ruff` clean, 86% line coverage.
-
-The interesting choices are in what gets tested. A scripted provider records the
-exact request bodies the engine built, so the tests can assert on serialisation
-and on the call/result pairing invariant across a whole run. The search tool is
-tested through *both* engines with the same fixtures, asserting byte-identical
-output, so behaviour does not depend on whether ripgrep is installed. And the bulk
-of the suite is on the paths a live run produces only by accident: a refused edit,
-malformed tool-call JSON, an unknown tool, a crashing tool, a looping model, a
-full context window.
-
-Two bugs the suite caught, both worth stating because neither is obvious:
-
-- **Stale bytecode.** Python decides a cached `.pyc` is current from the source's
-  mtime *in whole seconds* plus its size. Changing `a - b` to `a + b` alters
-  neither — so a verification re-run inside the same second executed the old
-  bytecode and reported the bug as unfixed, which would send the agent off to
-  "fix" already-correct code. `run_bash` now sets `PYTHONDONTWRITEBYTECODE`.
-- **A hanging timeout.** `subprocess.run(timeout=...)` kills only the shell; the
-  surviving grandchild holds the output pipes open, so the wait never returns.
-  The benchmark hung instead of scoring a loss. Both the shell tool and the
-  grader now kill the whole process tree.
-
----
-
-## Benchmark
-
-```bash
-python -m eval.run                 # all tasks, prints pass@1
-python -m eval.run --repeat 3      # variance across attempts
-python -m eval.run --json out.json # machine-readable results
-```
-
-Seven tasks, each a small broken project plus a verification command the agent is
-never shown. Grading is mechanical: only the check's exit code counts, and the
-agent's own report is recorded for reading but never consulted. An agent that says
-"fixed it" is not evidence.
-
-Each task targets a specific hazard rather than a generic bug:
-
-| task | what it tests |
-|---|---|
-| `sign-error` | reading a failing test to locate a one-line fix |
-| `wrong-function` | three near-identical functions — the wrong edit fixes nothing |
-| `two-files` | a rename that must land in two files at once |
-| `crash-traceback` | a bug whose only evidence is a traceback |
-| `missing-feature` | code specified entirely by a failing test |
-| `ambiguous-string` | a value appearing four times, where replace-all destroys the file |
-| `crlf-and-bom` | CRLF + BOM + non-ASCII, where a careless rewrite corrupts every line |
-
-`tests/test_eval.py` tests the *harness*: that every task starts genuinely broken,
-that the intended fix passes, and that the obvious cheats — claiming success,
-deleting the test, replace-all, a naive whole-file rewrite — are all caught. A
-benchmark that silently mismeasures is worse than none.
-
----
-
-## Trade-offs
-
-**Token counting is estimated, not exact.** `tiktoken` is used when installed;
-otherwise a hand-written heuristic that counts CJK codepoints separately, since a
-per-character rule tuned on English badly underestimates Chinese. Estimates decide
-when to compact; the numbers reported to the user come from the provider.
-
-**Mid-stream failures are not retried.** Retries cover connecting and non-2xx
-responses. Once tokens have arrived, a transport error surfaces to the engine —
-replaying half a completion would corrupt the transcript.
-
-**Command classification is a heuristic.** It decides what is worth interrupting
-the user for, not what is permitted; the approval mode is the real gate. The
-automatic/explicit Docker mode adds a separate execution boundary, but it is still not a
-kernel-grade security guarantee: Docker itself must be trusted and kept patched,
-and the host project is protected by never mounting it read/write into the
-container and by requiring a reviewed copy-back.
-
-**The repo map is a task-aware structural index, not source code.** It keeps
-paths for every supported source file, extracts declarations plus imports and
-exports, and ranks them against the current task. Python uses the standard AST;
-other languages use a locally cached Tree-sitter grammar when available and a
-conservative fallback otherwise. A layered token budget preserves many paths
-before adding detail, and an incremental index reparses only changed files.
-The map is a navigation aid, never a substitute for reading the file before
-editing it. Grammar downloads are never triggered implicitly during startup.
-
-**Parallel execution is opt-in.** Independent `read_file`, `list_dir`,
-`glob_files`, and `grep_search` calls may run concurrently. Writes, shell
-commands, mixed batches, and tools without an explicit concurrency marker remain
-serial so approval and shared workspace state stay deterministic.
-
-**Fuzzy matching has a floor and no AST validation.** Below the similarity
-threshold an edit is refused rather than guessed. Validating the result against a
-parser — Tree-sitter, or `ast` for Python — would catch edits that match textually
-but produce invalid syntax. Today the check is empirical: run the tests.

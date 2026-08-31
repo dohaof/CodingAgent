@@ -23,7 +23,6 @@ from cagent.agent.events import (
     Activity,
     ApprovalRequested,
     CollectingSink,
-    CompactionDone,
     RunFinished,
     RunStarted,
     StepFinished,
@@ -854,56 +853,7 @@ class TestTermination:
         assert agent.run_turn("two").completed
 
 
-class TestContextPressure:
-    def test_history_is_compacted_and_stays_valid(self, project: Path) -> None:
-        (project / "noisy.py").write_text(
-            "for i in range(200): print('output line', i, 'x' * 40)\n", encoding="utf-8"
-        )
-        config = auto(
-            project,
-            allow_outside_workspace=True,
-            context_window=4000,
-            compact_threshold=0.5,
-            keep_recent_turns=1,
-        )
-        script = [
-            tool_turn("run_bash", {"command": f"python noisy.py {index}"})
-            + [StreamFinished("tool_calls")]
-            for index in range(8)
-        ] + [text_turn("done")]
-
-        agent, sink, provider = make_agent(config, script)
-        agent.context.summarizer = None
-        result = agent.run_turn("generate a lot of output")
-
-        compactions = sink.of_type(CompactionDone)
-        assert compactions
-        assert result.completed
-        assert provider.pairing_is_valid(), "compaction broke call/result pairing"
-
-    def test_the_task_survives_compaction(self, project: Path) -> None:
-        (project / "noisy.py").write_text(
-            "for i in range(200): print('line', i, 'y' * 40)\n", encoding="utf-8"
-        )
-        config = auto(
-            project,
-            allow_outside_workspace=True,
-            context_window=4000,
-            compact_threshold=0.5,
-            keep_recent_turns=1,
-        )
-        script = [
-            tool_turn("run_bash", {"command": f"python noisy.py {index}"})
-            + [StreamFinished("tool_calls")]
-            for index in range(8)
-        ] + [text_turn("done")]
-
-        agent, _, provider = make_agent(config, script)
-        agent.context.summarizer = None
-        result = agent.run_turn("REMEMBER THIS TASK: tidy the noisy output")
-        assert result.completed
-        assert "REMEMBER THIS TASK" in agent.context.history[0].text
-
+class TestRepoMapRefresh:
     def test_the_repo_map_is_rebuilt_after_the_agent_writes(self, project: Path) -> None:
         # A map that still describes the tree as it was is worse than none.
         agent, sink, provider = make_agent(

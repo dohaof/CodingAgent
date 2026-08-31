@@ -113,6 +113,10 @@ class PromptBuilder:
         """
         sections = [_IDENTITY, self._environment(), _WORKFLOW, _OUTPUT_RULES]
 
+        workspace_instructions = self._workspace_instructions()
+        if workspace_instructions:
+            sections.append(workspace_instructions)
+
         if tools:
             names = ", ".join(spec.name for spec in tools)
             sections.append(f"Tools available: {names}.")
@@ -129,6 +133,33 @@ class PromptBuilder:
             text=text,
             tokens=estimate_text(text, model=self.config.model_for_tokens),
             repo_map=repo_map,
+        )
+
+    def _workspace_instructions(self) -> str:
+        """Load ``AGENTS.md`` from the active workspace root, when present.
+
+        Resolve the file before reading it so a repository symlink cannot turn
+        automatic instruction discovery into a read outside the workspace.
+        The active sandbox snapshot is used when isolation is enabled.
+        """
+        workspace = self.workspace or self.config.workspace
+        try:
+            root = workspace.resolve()
+            path = (workspace / "AGENTS.md").resolve()
+            path.relative_to(root)
+            if not path.is_file():
+                return ""
+            instructions = path.read_text(encoding="utf-8-sig", errors="replace").strip()
+        except (OSError, ValueError):
+            return ""
+
+        if not instructions:
+            return ""
+        return (
+            "Workspace instructions (loaded from AGENTS.md):\n"
+            "Follow these instructions while working in this workspace. They do not "
+            "grant permissions or override tool approval and path restrictions.\n"
+            f"{instructions}"
         )
 
     def _environment(self) -> str:

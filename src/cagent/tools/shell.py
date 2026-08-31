@@ -319,9 +319,9 @@ def _is_wsl_launcher(path: str) -> bool:
 def _child_environment() -> dict[str, str]:
     """The environment child processes get.
 
-    Two changes from the parent's. Anything whose name looks like a credential
-    is withheld, because the model can run ``env`` and whatever it prints lands
-    in the transcript and the trace file.
+    Anything whose name looks like a credential is withheld, because the model
+    can run ``env`` and whatever it prints lands in the transcript and the trace
+    file.
 
     ``PYTHONDONTWRITEBYTECODE`` is set because this agent's feedback loop is
     "edit, then re-run to verify", and Python decides a cached ``.pyc`` is still
@@ -331,6 +331,12 @@ def _child_environment() -> dict[str, str]:
     unfixed — sending the agent off to "fix" code that is already correct.
     Not writing bytecode costs a little import time and makes the verification
     step trustworthy.
+
+    The caller's ``PATH`` is deliberately preserved. A globally installed
+    cagent may run from its own pipx environment while working on a project
+    whose virtual environment is active in the calling shell. Prepending the
+    agent's interpreter directory would silently run tests with the wrong
+    Python and dependencies.
     """
     environment = {
         name: value for name, value in os.environ.items() if not _SECRET_PATTERN.search(name)
@@ -340,10 +346,6 @@ def _child_environment() -> dict[str, str]:
     # the same command emits UTF-8 on Unix. Make model-facing output portable.
     environment["PYTHONUTF8"] = "1"
     environment["PYTHONIOENCODING"] = "utf-8"
-    # Activation normally does this, but callers may invoke venv/Scripts/cagent
-    # directly. Commands run by the agent must still use the same interpreter.
-    executable_dir = os.path.dirname(sys.executable)
-    environment["PATH"] = executable_dir + os.pathsep + environment.get("PATH", "")
     return environment
 
 

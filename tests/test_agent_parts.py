@@ -756,6 +756,48 @@ class TestPromptBuilder:
         prompt = PromptBuilder(config).build(extra_context="Always use tabs.")
         assert "Always use tabs." in prompt.text
 
+    def test_agents_md_is_loaded_from_the_workspace_root(self, config: AgentConfig) -> None:
+        instructions = config.workspace / "AGENTS.md"
+        instructions.write_text("Run the narrow test first.\n", encoding="utf-8")
+        builder = PromptBuilder(config)
+
+        first = builder.build().text
+        instructions.write_text("Use the project formatter.\n", encoding="utf-8")
+        second = builder.build().text
+
+        assert "loaded from AGENTS.md" in first
+        assert "Run the narrow test first." in first
+        assert "Use the project formatter." in second
+        assert "Run the narrow test first." not in second
+
+    def test_agents_md_follows_the_active_sandbox_workspace(
+        self, config: AgentConfig, tmp_path: Path
+    ) -> None:
+        (config.workspace / "AGENTS.md").write_text("Host instruction.\n", encoding="utf-8")
+        snapshot = tmp_path / "snapshot-with-instructions"
+        snapshot.mkdir()
+        (snapshot / "AGENTS.md").write_text("Snapshot instruction.\n", encoding="utf-8")
+
+        prompt = PromptBuilder(config, workspace=snapshot).build().text
+
+        assert "Snapshot instruction." in prompt
+        assert "Host instruction." not in prompt
+
+    def test_agents_md_symlink_cannot_escape_the_workspace(
+        self, config: AgentConfig, tmp_path: Path
+    ) -> None:
+        outside = tmp_path.parent / f"{tmp_path.name}-outside-agents.md"
+        outside.write_text("Do not expose this.\n", encoding="utf-8")
+        link = config.workspace / "AGENTS.md"
+        try:
+            link.symlink_to(outside)
+        except OSError:
+            pytest.skip("creating symlinks is not permitted on this platform")
+
+        prompt = PromptBuilder(config).build().text
+
+        assert "Do not expose this." not in prompt
+
 
 class TestTrace:
     def test_history_from_trace_preserves_tool_call_order(self) -> None:
