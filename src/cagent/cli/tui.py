@@ -26,9 +26,13 @@ from rich.syntax import Syntax
 from rich.table import Table
 from rich.text import Text
 from textual import events, on
+from textual._wrap import compute_wrap_offsets
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
+from textual.document._document_navigator import DocumentNavigator
+from textual.document._wrapped_document import WrappedDocument
+from textual.expand_tabs import get_tab_widths
 from textual.message import Message as TextualMessage
 from textual.screen import ModalScreen
 from textual.strip import Strip
@@ -241,6 +245,124 @@ class ComposerInput(Input):
         self.placeholder = self._prompt_hint
 
 
+class _TranscriptWrappedDocument(WrappedDocument):
+    """Wrap Markdown using the cells painted by :class:`TranscriptTextArea`.
+
+    The transcript deliberately keeps Markdown source characters so copying a
+    selection returns the original response.  Hidden delimiters and link targets
+    therefore still occupy document columns, but not terminal cells.  Textual's
+    stock ``WrappedDocument`` assumes those two coordinate systems are identical;
+    this view supplies the visual text for wrapping and translates hit-testing
+    back to source columns.
+    """
+
+    def __init__(self, owner: TranscriptTextArea, *args: Any, **kwargs: Any) -> None:
+        self._owner = owner
+        super().__init__(*args, **kwargs)
+
+    def _visual_line(self, line_index: int) -> str:
+        return self._owner._visual_line(line_index).plain
+
+    def _wrap_line(self, line_index: int) -> tuple[list[int], list[int]]:
+        visual = self._visual_line(line_index)
+        tab_sections = get_tab_widths(visual, self._tab_width)
+        offsets = (
+            compute_wrap_offsets(
+                visual,
+                self._width,
+                tab_size=self._tab_width,
+                precomputed_tab_sections=tab_sections,
+            )
+            if self._width
+            else []
+        )
+        return offsets, [tab_width for _, tab_width in tab_sections]
+
+    def wrap(self, width: int, tab_width: int | None = None) -> None:
+        self._width = width
+        if tab_width:
+            self._tab_width = tab_width
+
+        self._wrap_offsets = []
+        self._offset_to_line_info = []
+        self._line_index_to_offsets = []
+        self._tab_width_cache = []
+
+        current_offset = 0
+        for line_index in range(self.document.line_count):
+            visual_offsets, tab_widths = self._wrap_line(line_index)
+            # Hidden Markdown is replaced one-for-one with zero-width code
+            # points, so visual and source code-point offsets remain identical.
+            self._wrap_offsets.append(visual_offsets)
+            self._tab_width_cache.append(tab_widths)
+            line_offsets: list[int] = []
+            for section_offset in range(len(visual_offsets) + 1):
+                self._offset_to_line_info.append((line_index, section_offset))
+                line_offsets.append(current_offset)
+                current_offset += 1
+            self._line_index_to_offsets.append(line_offsets)
+
+    def wrap_range(self, start: Any, old_end: Any, new_end: Any) -> None:
+        """Incrementally rewrap edited visual lines while preserving source offsets."""
+        start_line = start[0]
+        old_end_line = old_end[0]
+        new_end_line = new_end[0]
+        old_last = len(self._line_index_to_offsets) - 1
+        new_last = self.document.line_count - 1
+        start_line = max(0, min(start_line, old_last, new_last))
+        old_end_line = max(0, min(old_end_line, old_last))
+        new_end_line = max(0, min(new_end_line, new_last))
+        top_line, old_bottom_line = sorted((start_line, old_end_line))
+        new_bottom_line = max(start_line, new_end_line)
+
+        top_y = self._line_index_to_offsets[top_line][0]
+        old_bottom_y = self._line_index_to_offsets[old_bottom_line][-1]
+        new_wrap_offsets: list[list[int]] = []
+        new_line_offsets: list[list[int]] = []
+        new_offset_info: list[tuple[int, int]] = []
+        new_tab_widths: list[list[int]] = []
+        current_y = top_y
+        for line_index in range(top_line, new_bottom_line + 1):
+            offsets, tab_widths = self._wrap_line(line_index)
+            new_wrap_offsets.append(offsets)
+            new_tab_widths.append(tab_widths)
+            y_offsets: list[int] = []
+            for section_offset in range(len(offsets) + 1):
+                y_offsets.append(current_y)
+                new_offset_info.append((line_index, section_offset))
+                current_y += 1
+            new_line_offsets.append(y_offsets)
+
+        self._offset_to_line_info[top_y : old_bottom_y + 1] = new_offset_info
+        self._line_index_to_offsets[top_line : old_bottom_line + 1] = new_line_offsets
+        self._tab_width_cache[top_line : old_bottom_line + 1] = new_tab_widths
+        self._wrap_offsets[top_line : old_bottom_line + 1] = new_wrap_offsets
+
+        old_height = old_bottom_y - top_y + 1
+        offset_shift = len(new_offset_info) - old_height
+        line_shift = new_bottom_line - old_bottom_line
+        if line_shift:
+            for y_offset in range(top_y + len(new_offset_info), len(self._offset_to_line_info)):
+                line_index, section_offset = self._offset_to_line_info[y_offset]
+                self._offset_to_line_info[y_offset] = (
+                    line_index + line_shift,
+                    section_offset,
+                )
+        if offset_shift:
+            for line_index in range(
+                top_line + len(new_line_offsets), len(self._line_index_to_offsets)
+            ):
+                self._line_index_to_offsets[line_index] = [
+                    offset + offset_shift
+                    for offset in self._line_index_to_offsets[line_index]
+                ]
+
+    def get_sections(self, line_index: int) -> list[str]:
+        visual = self._visual_line(line_index)
+        sections = Text(visual, end="").divide(self.get_offsets(line_index))
+        return [section.plain for section in sections]
+
+
 class TranscriptTextArea(TextArea):
     """Selectable transcript with semantic and Markdown line highlighting.
 
@@ -261,6 +383,24 @@ class TranscriptTextArea(TextArea):
     _rendering_markdown = False
 
     _fence_re = re.compile(r"^\s*(`{3,}|~{3,})")
+
+    def _set_document(self, text: str, language: str | None) -> None:
+        """Install a visual-width-aware wrapped view for the transcript."""
+        super()._set_document(text, language)
+        self.wrapped_document = _TranscriptWrappedDocument(
+            self, self.document, tab_width=self.indent_width
+        )
+        self.navigator = DocumentNavigator(self.wrapped_document)
+        self._rewrap_and_refresh_virtual_size()
+
+    def _visual_line(self, line_index: int) -> Text:
+        """Return exactly the code points painted for a source line."""
+        previous = self._rendering_markdown
+        self._rendering_markdown = True
+        try:
+            return self.get_line(line_index)
+        finally:
+            self._rendering_markdown = previous
 
     def _in_code_fence(self, line_index: int) -> tuple[bool, bool]:
         """Return ``(inside, fence_marker)`` for a source line.

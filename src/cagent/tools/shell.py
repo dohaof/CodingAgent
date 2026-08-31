@@ -235,6 +235,7 @@ def _docker_command(command: str, ctx: ToolContext, *, name: str | None = None) 
     if ctx.sandbox is None:
         raise ToolError("Docker sandbox is not available for this tool context.")
     image = ctx.config.sandbox_image.strip()
+    network = ["--network=bridge"] if ctx.config.sandbox_network else ["--network=none"]
     return [
         "docker",
         "run",
@@ -242,7 +243,7 @@ def _docker_command(command: str, ctx: ToolContext, *, name: str | None = None) 
         "--pull=never",
         "--name",
         name or f"cagent-{uuid.uuid4().hex[:12]}",
-        "--network=none",
+        *network,
         "--read-only",
         "--cap-drop=ALL",
         "--security-opt=no-new-privileges",

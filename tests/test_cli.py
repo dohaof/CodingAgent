@@ -139,7 +139,7 @@ class TestArgumentParsing:
                 "--sandbox-cpus", "1.5",
                 "--sandbox-pids", "64",
                 "--sandbox-workspace-mb", "128",
-                "task",
+                "--sandbox-network", "task",
             ]
         )
         overrides = _overrides(args)
@@ -150,6 +150,19 @@ class TestArgumentParsing:
         assert overrides["sandbox_cpus"] == 1.5
         assert overrides["sandbox_pids"] == 64
         assert overrides["sandbox_workspace_mb"] == 128
+        assert overrides["sandbox_network"] is True
+
+    def test_sandbox_network_is_off_unless_explicitly_enabled(self) -> None:
+        args = build_parser().parse_args(["task"])
+        assert _overrides(args)["sandbox_network"] is None
+
+    def test_sandbox_network_can_be_loaded_from_project_toml(
+        self, tmp_path, write_config
+    ) -> None:
+        write_config(sandbox_network=True)
+        from cagent.config import load_config
+
+        assert load_config(cwd=tmp_path).sandbox_network is True
 
     def test_repo_map_can_be_switched_off(self) -> None:
         args = build_parser().parse_args(["--no-repo-map", "task"])
@@ -1181,6 +1194,30 @@ class TestTui:
         assert visual.plain.replace("\u200b", "") == "bold"
         assert "\u200b" in visual.plain
         assert str(transcript.get_line(6).spans[0].style) == "cyan"
+
+    def test_markdown_link_uses_visual_width_for_wrapping_and_mouse_columns(self) -> None:
+        source = (
+            "Install failed. [requirements.txt](/workspace/requirements.txt:1) "
+            "requires `pytest>=8.0,<9`."
+        )
+        transcript = TranscriptTextArea(source, read_only=True)
+
+        transcript._rendering_markdown = True
+        try:
+            visual = transcript.get_line(0)
+        finally:
+            transcript._rendering_markdown = False
+
+        assert visual.cell_len < len(source)
+        transcript.wrapped_document.wrap(visual.cell_len)
+        assert transcript.wrapped_document.get_offsets(0) == []
+        assert transcript.wrapped_document.offset_to_location((visual.cell_len, 0)) == (
+            0,
+            len(source),
+        )
+        assert transcript.wrapped_document.location_to_offset((0, len(source))).x == (
+            visual.cell_len
+        )
 
     def test_tool_events_are_written_with_distinguishable_transcript_labels(
         self, config: AgentConfig

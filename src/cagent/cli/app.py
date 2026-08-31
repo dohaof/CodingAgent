@@ -100,6 +100,9 @@ By default `sandbox_mode = "auto"` checks Docker Desktop/Engine and the selected
 local image. When both exist, cagent creates an isolated project snapshot and
 uses one container for this conversation. It never pulls images automatically.
 If either check fails, it falls back to the host and prints a warning.
+The container uses `--network=none` by default. Set `sandbox_network = true` in
+`.cagent.toml`, or pass `--sandbox-network`, only when the task needs network
+access; this selects Docker's default bridge network.
 
   /sandbox                         show status, image, and sync policy
   /sandbox on [IMAGE]              copy the project and enable Docker isolation
@@ -213,6 +216,11 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="IMAGE",
         help="local Docker image for the sandbox (default: python:3.12-slim)",
     )
+    safety.add_argument(
+        "--sandbox-network",
+        action="store_true",
+        help="allow Docker sandbox commands to use the default bridge network",
+    )
     safety.add_argument("--sandbox-memory-mb", type=int, help="Docker memory limit in MiB")
     safety.add_argument("--sandbox-cpus", type=float, help="Docker CPU limit")
     safety.add_argument("--sandbox-pids", type=int, help="Docker process limit")
@@ -257,6 +265,7 @@ def _overrides(args: argparse.Namespace) -> dict[str, object]:
         "sandbox_mode": args.sandbox,
         "sandbox_sync": args.sandbox_sync,
         "sandbox_image": args.sandbox_image,
+        "sandbox_network": True if args.sandbox_network else None,
         "sandbox_memory_mb": args.sandbox_memory_mb,
         "sandbox_cpus": args.sandbox_cpus,
         "sandbox_pids": args.sandbox_pids,
@@ -807,7 +816,9 @@ def _sandbox_command(console: Console, agent: Agent, arguments: list[str]) -> No
                 f"paths: {path_policy}\n"
                 f"shell: {shell_policy}\n"
                 f"image: {agent.config.sandbox_image}\n"
-                f"sync: {agent.config.sandbox_sync}"
+                f"sync: {agent.config.sandbox_sync}\n"
+                "network: "
+                f"{'bridge (enabled)' if agent.config.sandbox_network else 'none (disabled)'}"
             )
         elif action == "on":
             image = arguments[1] if len(arguments) > 1 else None
@@ -881,6 +892,7 @@ def _show_config(console: Console, config: AgentConfig) -> int:
         "workspace": str(config.workspace),
         "approval mode": config.approval_mode,
         "sandbox": f"{config.sandbox_mode} ({config.sandbox_sync})",
+        "sandbox network": "bridge (enabled)" if config.sandbox_network else "none (disabled)",
         "path boundary": "unrestricted" if config.allow_outside_workspace else "workspace-only",
         "shell execution": shell_execution,
         "context window": f"{config.context_window:,}",

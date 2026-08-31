@@ -151,6 +151,47 @@ def test_docker_command_has_no_network_and_only_snapshot_mount(tmp_path: Path) -
     assert argv[-5:] == ["--entrypoint", "/bin/sh", config.sandbox_image, "-lc", "pytest -q"]
 
 
+def test_docker_command_can_enable_bridge_network(tmp_path: Path) -> None:
+    config = _config(tmp_path, sandbox_network=True)
+
+    class Snapshot:
+        workspace = tmp_path / "snapshot"
+
+    ctx = ToolContext(
+        workspace=Snapshot.workspace,
+        config=config,
+        approve=lambda _request: True,
+        emit=lambda _line: None,
+        abort=threading.Event(),
+        sandbox=Snapshot(),  # type: ignore[arg-type]
+        force_workspace_boundary=True,
+    )
+    argv = _docker_command("python -V", ctx, name="cagent-network")
+    assert "--network=bridge" in argv
+    assert "--network=none" not in argv
+
+
+def test_session_container_can_enable_bridge_network(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(sandbox_module, "docker_available", lambda: True)
+    calls: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):  # type: ignore[no-untyped-def]
+        calls.append(list(argv))
+        return subprocess.CompletedProcess(argv, 0, stdout="container-id\n", stderr="")
+
+    monkeypatch.setattr(sandbox_module.subprocess, "run", fake_run)
+    config = _config(tmp_path, sandbox_network=True)
+    session = SandboxSession.create(config)
+    assert session is not None
+    try:
+        session.ensure_container(config)
+    finally:
+        session.close()
+
+    assert "--network=bridge" in calls[0]
+    assert "--network=none" not in calls[0]
+
+
 def test_session_container_is_started_once_and_removed_on_close(
     tmp_path: Path, monkeypatch
 ) -> None:

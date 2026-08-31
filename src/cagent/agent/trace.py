@@ -163,6 +163,7 @@ class TraceWriter:
                 "approval_mode": config.approval_mode,
                 "sandbox_mode": config.sandbox_mode,
                 "sandbox_sync": config.sandbox_sync,
+                "sandbox_network": config.sandbox_network,
                 "context_window": config.context_window,
             }
         )

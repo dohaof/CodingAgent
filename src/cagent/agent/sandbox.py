@@ -7,9 +7,10 @@ Docker container.  At the end of a run the copy is either discarded or merged
 back after a conflict check and an explicit approval request.
 
 Docker is an execution boundary, not a complete security proof.  The container
-is therefore started with no network, a read-only root filesystem, no Linux
-capabilities, a temporary ``/tmp``, and finite CPU/memory/process limits.  The
-Docker socket is deliberately never mounted.
+is therefore started with no network by default (or the default bridge network
+when explicitly enabled), a read-only root filesystem, no Linux capabilities,
+a temporary ``/tmp``, and finite CPU/memory/process limits.  The Docker socket
+is deliberately never mounted.
 """
 
 from __future__ import annotations
@@ -373,6 +374,7 @@ class SandboxSession:
 
         name = f"cagent-{uuid.uuid4().hex[:12]}"
         image = config.sandbox_image.strip()
+        network = ["--network=bridge"] if config.sandbox_network else ["--network=none"]
         argv = [
             "docker",
             "run",
@@ -381,7 +383,7 @@ class SandboxSession:
             "--pull=never",
             "--name",
             name,
-            "--network=none",
+            *network,
             "--read-only",
             "--cap-drop=ALL",
             "--security-opt=no-new-privileges",
@@ -436,8 +438,8 @@ class SandboxSession:
         self.container_name = name
         # Normal interpreter shutdown (including an unhandled exception) must
         # not leave a detached sandbox consuming resources. SIGKILL/power loss
-        # cannot be handled, but the container remains network-isolated and
-        # can be removed manually with ``docker ps --filter name=cagent-``.
+        # cannot be handled, but the container can be removed manually with
+        # ``docker ps --filter name=cagent-``.
         atexit.register(self.stop_container)
         return name
 

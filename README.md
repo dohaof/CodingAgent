@@ -270,6 +270,7 @@ diff 和实时状态。通过管道或重定向输入时，会自动切换为适
 | `--sandbox auto、off 或 docker` | 自动选择、关闭或强制使用 Docker |
 | `--sandbox-sync never、ask 或 always` | 沙箱结束时丢弃、询问或自动同步修改 |
 | `--sandbox-image IMAGE` | 指定本地 Docker 镜像 |
+| `--sandbox-network` | 允许容器使用 Docker 默认 bridge 网络；默认断网 |
 | `--sandbox-memory-mb INT` | 沙箱内存上限，单位 MiB |
 | `--sandbox-cpus FLOAT` | 沙箱 CPU 上限 |
 | `--sandbox-pids INT` | 沙箱进程数上限 |
@@ -296,6 +297,7 @@ diff 和实时状态。通过管道或重定向输入时，会自动切换为适
 sandbox_mode = "auto"
 sandbox_sync = "ask"
 sandbox_image = "python:3.12-slim"
+sandbox_network = false
 ```
 
 `auto` 只有在 Docker daemon 和镜像都已存在时才启用隔离；条件不满足会给出
@@ -317,7 +319,9 @@ cagent --sandbox docker --sandbox-image my-project-agent:latest "运行测试"
 /sandbox off                     按同步策略退出沙箱
 ```
 
-沙箱使用一次临时快照和一个会话级容器，容器结束后会被删除。默认网络关闭、
+沙箱使用一次临时快照和一个会话级容器，容器结束后会被删除。默认网络关闭；如确需在容器内下载依赖，
+可在未提交的 `.cagent.toml` 的 `[cagent]` 表中设置 `sandbox_network = true`（使用 Docker 默认 bridge 网络），
+或本次运行传入 `--sandbox-network`。开启网络会扩大命令的外部访问面，请仅在可信项目和必要时使用。
 根文件系统只读，并限制内存、CPU、进程数和工作区大小。`never` 会丢弃修改，
 `ask` 退出时展示受限 diff 并询问，`always` 自动同步。宿主机模式下，shell
 进程本身不受工作区边界限制；审批和路径检查不能替代进程隔离。

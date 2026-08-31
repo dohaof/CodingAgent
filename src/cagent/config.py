@@ -158,6 +158,13 @@ class AgentConfig:
     sandbox_image: str = "python:3.12-slim"
     """Docker image used for isolated shell commands; it must be local."""
 
+    sandbox_network: bool = False
+    """Allow Docker sandbox containers to use the default bridge network.
+
+    The secure default is ``false`` (Docker ``--network=none``). Enable this
+    only when commands need network access, for example to download packages.
+    """
+
     sandbox_memory_mb: int = 1024
     sandbox_cpus: float = 2.0
     sandbox_pids: int = 256

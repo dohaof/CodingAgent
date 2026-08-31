@@ -812,7 +812,11 @@ class Agent:
                 return f"auto (host fallback; sync: {self.config.sandbox_sync})"
             return "off"
         container = self.sandbox.container_name or "not started"
-        return f"docker (container: {container}; sync: {self.config.sandbox_sync})"
+        network = "bridge" if self.config.sandbox_network else "none"
+        return (
+            f"docker (container: {container}; sync: {self.config.sandbox_sync}; "
+            f"network: {network})"
+        )
 
     def enable_sandbox(self, *, image: str | None = None) -> None:
         """Create a disposable snapshot and enable Docker execution."""
