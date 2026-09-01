@@ -330,13 +330,19 @@ class SandboxSession:
                 "Docker sandbox requested, but the Docker daemon is unavailable. "
                 "Start Docker Desktop/Engine or set sandbox_mode = 'off'."
             )
-        if config.sandbox_mode == "auto" and not docker_image_available(
-            config.sandbox_image.strip()
-        ):
-            return (
-                None,
+        if not docker_image_available(config.sandbox_image.strip()):
+            detail = (
                 f"Sandbox image {config.sandbox_image!r} is not available locally; "
-                "cagent never pulls images automatically.",
+                "cagent never pulls images automatically."
+            )
+            if config.sandbox_mode == "auto":
+                return None, detail
+            # Forced isolation must fail before a snapshot exists. Creating one
+            # anyway leaves the file tools writing to a copy that ``run_bash``
+            # can never execute in: the agent could edit but never verify.
+            raise SandboxError(
+                f"Docker sandbox requested, but image {config.sandbox_image!r} is not "
+                "available locally. Build or pull it first, or set sandbox_mode = 'off'."
             )
         real = config.workspace
         if not real.is_dir():
@@ -429,8 +435,8 @@ class SandboxSession:
             if "No such image" in detail or "pull access denied" in detail.lower():
                 raise SandboxError(
                     f"Sandbox image {image!r} is not available locally. "
-                    "Build a project image with 'docker build -f Dockerfile.agent -t "
-                    f"{image} .' or pull it explicitly with 'docker pull {image}'."
+                    f"Build it from the project's Dockerfile with 'docker build -t {image} .' "
+                    f"or pull it explicitly with 'docker pull {image}'."
                 )
             if len(detail) > 2_000:
                 detail = detail[:2_000] + "..."

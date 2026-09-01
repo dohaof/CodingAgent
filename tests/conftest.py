@@ -15,6 +15,7 @@ from pathlib import Path
 
 import pytest
 
+from cagent.agent import sandbox as sandbox_module
 from cagent.agent.approval import ApprovalPolicy, Decision
 from cagent.agent.events import CollectingSink
 from cagent.config import AgentConfig
@@ -47,6 +48,19 @@ def isolate_config(monkeypatch, tmp_path_factory) -> None:
     empty = tmp_path_factory.mktemp("no_config")
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: empty))
     monkeypatch.chdir(empty)
+
+
+@pytest.fixture(autouse=True)
+def assume_local_sandbox_image(monkeypatch) -> None:
+    """Keep sandbox image lookups off the machine's real Docker daemon.
+
+    ``create_with_status`` verifies the configured image before it snapshots, in
+    both ``auto`` and ``docker`` mode, so a test that enables a sandbox would
+    otherwise pass or fail depending on which images the developer happens to
+    have pulled. Tests about a *missing* image override this with their own
+    ``setattr``.
+    """
+    monkeypatch.setattr(sandbox_module, "docker_image_available", lambda _image: True)
 
 
 @pytest.fixture

@@ -73,7 +73,7 @@ from .events import (
 )
 from .guards import LoopGuard
 from .prompt import FOCUS_HEADER, PromptBuilder
-from .sandbox import SandboxError, SandboxSession
+from .sandbox import SandboxError, SandboxSession, docker_available, docker_image_available
 
 __all__ = ["Agent", "TurnResult"]
 
@@ -973,12 +973,27 @@ class Agent:
         self._refresh_system_prompt()
 
     def set_sandbox_image(self, image: str) -> None:
-        """Select an image, recycling only the container and keeping the snapshot."""
+        """Select an image, recycling only the container and keeping the snapshot.
+
+        The image is checked before anything is changed. An unavailable name used
+        to be accepted here and only surfaced from ``ensure_container`` on the next
+        ``run_bash``, leaving the file tools writing into a snapshot no command
+        could run in.
+        """
         image = image.strip()
         if not image:
             raise SandboxError("Sandbox image must not be empty.")
         if image == self.config.sandbox_image:
             return
+        if not docker_available():
+            raise SandboxError(
+                "Cannot select a sandbox image: the Docker CLI or daemon is unavailable."
+            )
+        if not docker_image_available(image):
+            raise SandboxError(
+                f"Sandbox image {image!r} is not available locally; cagent never pulls "
+                f"images automatically. Still using {self.config.sandbox_image!r}."
+            )
         if self.sandbox is not None:
             self.sandbox.stop_container()
         self.config.sandbox_image = image

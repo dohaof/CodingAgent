@@ -577,6 +577,38 @@ class TestFailureHandling:
         finally:
             agent.close()
 
+    def test_switching_to_an_unavailable_image_changes_nothing(
+        self, project: Path, monkeypatch
+    ) -> None:
+        """A mid-session image switch must be verified before it is committed.
+
+        An unavailable name used to be accepted here, after the running container
+        had already been stopped, and only surfaced from ``ensure_container`` on
+        the next ``run_bash``. The file tools kept writing into a snapshot no
+        command could execute in, so the agent could edit but never verify.
+        """
+        monkeypatch.setattr(sandbox_module, "docker_available", lambda: True)
+        config = auto(project, sandbox_sync="never")
+        agent, _, _ = make_agent(config, [text_turn("done")])
+        try:
+            agent.enable_sandbox(image="python:3.12-slim")
+            assert agent.sandbox is not None
+            stopped: list[bool] = []
+            monkeypatch.setattr(
+                sandbox_module.SandboxSession,
+                "stop_container",
+                lambda _self: stopped.append(True),
+            )
+            monkeypatch.setattr(sandbox_module, "docker_image_available", lambda _image: False)
+
+            with pytest.raises(sandbox_module.SandboxError, match="not available locally"):
+                agent.set_sandbox_image("missing:latest")
+
+            assert agent.config.sandbox_image == "python:3.12-slim"
+            assert stopped == []
+        finally:
+            agent.close()
+
     def test_sandbox_edits_are_synced_only_after_final_approval(
         self, project: Path, monkeypatch
     ) -> None:

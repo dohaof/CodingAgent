@@ -236,6 +236,20 @@ def test_session_container_is_started_once_and_removed_on_close(
     assert calls[1] == ["docker", "rm", "--force", name]
 
 
+def test_docker_mode_fails_closed_when_the_local_image_is_missing(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Forced isolation must refuse before a snapshot exists.
+
+    Creating one anyway leaves the file tools writing into a copy that
+    ``run_bash`` can never execute in, so the agent can edit but never verify.
+    """
+    monkeypatch.setattr(sandbox_module, "docker_available", lambda: True)
+    monkeypatch.setattr(sandbox_module, "docker_image_available", lambda _image: False)
+    with pytest.raises(SandboxError, match="not available locally"):
+        SandboxSession.create(_config(tmp_path))
+
+
 def test_missing_image_has_actionable_error(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(sandbox_module, "docker_available", lambda: True)
 
@@ -250,6 +264,6 @@ def test_missing_image_has_actionable_error(tmp_path: Path, monkeypatch) -> None
     monkeypatch.setattr(sandbox_module.subprocess, "run", fake_run)
     session = SandboxSession.create(_config(tmp_path))
     assert session is not None
-    with pytest.raises(SandboxError, match="docker build -f Dockerfile.agent"):
+    with pytest.raises(SandboxError, match="docker build -t"):
         session.ensure_container(_config(tmp_path))
     session.close()
