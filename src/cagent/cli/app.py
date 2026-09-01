@@ -23,6 +23,7 @@ from types import FrameType
 from typing import NoReturn
 
 from rich.console import Console
+from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
@@ -148,6 +149,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "task", nargs="*", help="the task to perform; omit for an interactive session"
+    )
+    parser.add_argument(
+        "--gui",
+        action="store_true",
+        help="open the desktop app instead of the terminal UI; "
+        "the task slot then names a workspace directory",
     )
 
     endpoint = parser.add_argument_group("endpoint")
@@ -282,11 +289,69 @@ def _overrides(args: argparse.Namespace) -> dict[str, object]:
     return values
 
 
+def _gui_workspace(console: Console, args: argparse.Namespace) -> Path | None:
+    """Which project the desktop app should open, or ``None`` on a bad request.
+
+    ``--gui`` reuses the task slot for a directory: the desktop app has its own
+    composer, so there is nowhere for a task string to go, and typing one is a
+    mistake worth naming rather than silently dropping.
+    """
+    workspace = args.workspace
+    if workspace is None and args.task:
+        candidate = Path(args.task[0]).expanduser()
+        if len(args.task) == 1 and candidate.is_dir():
+            workspace = candidate
+        else:
+            console.print(
+                "[red]--gui takes a workspace directory, not a task.[/red] "
+                "Type the task in the desktop app's own composer."
+            )
+            return None
+    workspace = (workspace or Path.cwd()).expanduser().resolve()
+    if not workspace.is_dir():
+        console.print(f"[red]Workspace is not a directory:[/red] {workspace}")
+        return None
+    return workspace
+
+
+def _run_gui(console: Console, args: argparse.Namespace) -> int:
+    """Hand off to the Electron desktop client."""
+    from ..gui.launcher import DesktopLaunchError, find_desktop_bundle, launch_desktop
+
+    workspace = _gui_workspace(console, args)
+    if workspace is None:
+        return 2
+    # The desktop app loads the config itself and reports problems in its own
+    # window, so a broken file here must not stop the launch — it would replace
+    # a readable error screen with a terminal traceback.
+    configured = None
+    with contextlib.suppress(ConfigError):
+        configured = load_config(cwd=workspace).desktop_path
+    dropped = sorted(
+        key for key, value in _overrides(args).items() if value is not None and key != "workspace"
+    )
+    if dropped:
+        console.print(
+            "[yellow]Note:[/yellow] the desktop app reads its settings from .cagent.toml. "
+            f"These flags are not forwarded: {', '.join(dropped)}"
+        )
+    try:
+        return launch_desktop(find_desktop_bundle(configured), workspace)
+    except DesktopLaunchError as exc:
+        # Escaped: the message shows a `[cagent]` config table, which rich would
+        # otherwise read as a style tag and silently delete from the instructions.
+        console.print(f"[red]{escape(str(exc))}[/red]")
+        return 2
+
+
 def main(argv: list[str] | None = None) -> int:
     """Run the CLI. Returns the process exit code."""
     parser = build_parser()
     args = parser.parse_args(argv)
     console = Console(highlight=False, soft_wrap=False)
+
+    if args.gui:
+        return _run_gui(console, args)
 
     try:
         # An explicit workspace is also the project-config root.  This makes

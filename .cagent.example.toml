@@ -102,6 +102,13 @@ allow_outside_workspace = false
 repo_map_enabled = true
 repo_map_token_budget = 1600
 
+# --- desktop client --------------------------------------------------------
+# Where the built Electron client lives, for `cagent --gui`. Its runtime is far
+# too large to ship in a wheel, so a globally installed cagent has to be told
+# where a checkout is. Unset means: look next to the installed package, which
+# only finds one when running from source or an editable install.
+# desktop_path = "/path/to/CodingAgent/desktop"
+
 # --- observability ---------------------------------------------------------
 # trace_dir = "traces"           # unset disables trace files
 log_level = "INFO"

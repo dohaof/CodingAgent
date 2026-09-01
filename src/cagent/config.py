@@ -17,6 +17,7 @@ unit-testable.
 
 from __future__ import annotations
 
+import re
 import tomllib
 from collections.abc import Mapping
 from dataclasses import dataclass, field, fields
@@ -174,6 +175,16 @@ class AgentConfig:
     repo_map_token_budget: int = 1600
     repo_map_enabled: bool = True
 
+    # desktop client
+    desktop_path: Path | None = None
+    """Where the built Electron desktop client lives, for ``cagent --gui``.
+
+    The desktop app cannot travel inside the Python distribution: its Electron
+    runtime is around half a gigabyte, which no wheel can carry. An installed
+    CLI therefore has to be told where a built checkout is. Unset means: look
+    for one next to this package, then explain what to do.
+    """
+
     # observability
     trace_dir: Path | None = None
     log_level: str = "INFO"
@@ -187,6 +198,10 @@ class AgentConfig:
             if not trace_dir.is_absolute():
                 trace_dir = self.workspace / trace_dir
             self.trace_dir = trace_dir.resolve()
+        # Not workspace-relative: the desktop checkout is one location shared by
+        # every project, so a relative path here means "relative to where I am".
+        if self.desktop_path is not None:
+            self.desktop_path = Path(self.desktop_path).expanduser().resolve()
 
     def __repr__(self) -> str:
         shown = ", ".join(
@@ -411,15 +426,14 @@ def _coerce(label: str, raw: object, hint: object) -> object:
     raise ConfigError(f"Unsupported configuration type for {label}: {hint!r}.")
 
 
-def _read_config_file(path: Path) -> Mapping[str, object]:
-    """Parse the ``[cagent]`` table from one TOML file; ``{}`` if absent."""
-    if not path.is_file():
-        return {}
+def _table_from_text(text: str, path: Path) -> Mapping[str, object]:
+    """Parse the ``[cagent]`` table out of a TOML document; ``{}`` if absent.
+
+    ``path`` only names the source in error messages, so the same rules apply to
+    a file on disk and to a document that is about to become one.
+    """
     try:
-        with path.open("rb") as handle:
-            document = tomllib.load(handle)
-    except OSError as exc:
-        raise ConfigError(f"Could not read config file {path}: {exc}") from exc
+        document = tomllib.loads(text)
     except tomllib.TOMLDecodeError as exc:
         raise ConfigError(f"Config file {path} is not valid TOML: {exc}") from exc
 
@@ -433,6 +447,113 @@ def _read_config_file(path: Path) -> Mapping[str, object]:
     if not isinstance(table, dict):
         raise ConfigError(f"[{CONFIG_TABLE}] in {path} must be a table.")
     return table
+
+
+def _read_config_file(path: Path) -> Mapping[str, object]:
+    """Parse the ``[cagent]`` table from one TOML file; ``{}`` if absent."""
+    if not path.is_file():
+        return {}
+    try:
+        # ``utf-8-sig`` also accepts a file a Windows editor saved with a BOM.
+        text = path.read_text(encoding="utf-8-sig")
+    except OSError as exc:
+        raise ConfigError(f"Could not read config file {path}: {exc}") from exc
+    return _table_from_text(text, path)
+
+
+def _toml_string(value: str) -> str:
+    """Quote a value as a TOML string.
+
+    Prefers a literal string so a Windows path keeps its backslashes, instead of
+    doubling every one of them in a file the user is meant to read and edit.
+    """
+    if not any(char in value for char in "'\n\r"):
+        return f"'{value}'"
+    return '"{}"'.format(value.replace("\\", "\\\\").replace('"', '\\"'))
+
+
+def _with_setting(text: str, name: str, value: str, path: Path) -> str:
+    """Return ``text`` with ``name = value`` inside its ``[cagent]`` table."""
+    line = f"{name} = {_toml_string(value)}"
+    if not text.strip():
+        return f"[{CONFIG_TABLE}]\n{line}\n"
+    lines = text.splitlines()
+    header = next(
+        (
+            index
+            for index, raw in enumerate(lines)
+            if raw.strip().replace(" ", "") == f"[{CONFIG_TABLE}]"
+        ),
+        None,
+    )
+    if header is None:
+        # Reached only for a document with no settings at all — one that is pure
+        # comments, such as a copied example with everything switched off. A file
+        # with top-level keys and no table was already rejected by the read.
+        separator = "" if text.endswith("\n") else "\n"
+        return f"{text}{separator}\n[{CONFIG_TABLE}]\n{line}\n"
+    # The table ends where the next one begins.
+    end = next(
+        (index for index in range(header + 1, len(lines)) if lines[index].lstrip().startswith("[")),
+        len(lines),
+    )
+    assignment = re.compile(rf"^\s*{re.escape(name)}\s*=")
+    for index in range(header + 1, end):
+        if assignment.match(lines[index]):
+            lines[index] = line
+            return "\n".join(lines) + "\n"
+    lines.insert(header + 1, line)
+    return "\n".join(lines) + "\n"
+
+
+def write_setting(name: str, value: str, *, config_file: Path | None = None) -> Path:
+    """Record one setting in a user config file, leaving the rest of it alone.
+
+    Rewriting the document through a TOML serialiser would be shorter, and would
+    also discard every comment the user wrote and reorder their settings, so this
+    edits the single line instead.
+
+    The file normally holds an API key, so the new text has to earn the write: it
+    must parse, and every setting that was already there must survive unchanged.
+    A copy of the original is kept beside it regardless.
+
+    Args:
+        name: An :class:`AgentConfig` field name.
+        value: The value to record, written as a TOML string.
+        config_file: Which file to edit. Defaults to ``~/.cagent.toml``.
+
+    Returns:
+        The path that was written.
+
+    Raises:
+        ConfigError: If ``name`` is not a setting, the file cannot be read or
+            written, or the edit would lose something that was already there.
+    """
+    if name not in {spec.name for spec in fields(AgentConfig)}:
+        raise ConfigError(f"Unknown setting {name!r}.")
+    path = (config_file or Path.home() / CONFIG_FILENAME).expanduser()
+    before = _read_config_file(path)
+    original = path.read_text(encoding="utf-8-sig") if path.is_file() else ""
+
+    updated = _with_setting(original, name, value, path)
+    after = _table_from_text(updated, path)
+    if after.get(name) != value:
+        raise ConfigError(f"Could not record {name} in {path}; leaving it untouched.")
+    lost = sorted(key for key, old in before.items() if key != name and after.get(key) != old)
+    if lost:
+        raise ConfigError(
+            f"Refusing to write {path}: the edit would change {', '.join(lost)}."
+        )
+
+    try:
+        if original:
+            path.with_suffix(f"{path.suffix}.bak").write_text(original, encoding="utf-8")
+        else:
+            path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(updated, encoding="utf-8")
+    except OSError as exc:
+        raise ConfigError(f"Could not write config file {path}: {exc}") from exc
+    return path
 
 
 def load_config(
