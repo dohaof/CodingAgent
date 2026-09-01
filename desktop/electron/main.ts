@@ -6,7 +6,11 @@ import readline from "node:readline";
 
 type BridgeCommand = Record<string, unknown> & { type: string };
 
-const packageRoot = path.resolve(app.getAppPath());
+// `app.getAppPath()` is the directory of the entry script when Electron is
+// launched as `electron dist-electron/main.js`, which is one level too deep and
+// breaks the renderer path, the Python source root, and the venv lookup. This
+// file always sits in `<packageRoot>/dist-electron`, packaged or not.
+const packageRoot = path.resolve(__dirname, "..");
 const sourceRootCandidates = [
   process.env.CAGENT_SOURCE_PATH,
   path.join(packageRoot, "src"),
@@ -57,9 +61,38 @@ function stopBridge(): void {
   const current = bridge;
   bridge = null;
   if (!current || current.killed) return;
-  current.stdin.write(JSON.stringify({ type: "shutdown" }) + "\n");
+  // EOF ends the bridge's read loop; the kill is only for a wedged interpreter.
+  current.stdin.end();
   const timer = setTimeout(() => current.kill(), 1800);
   current.once("exit", () => clearTimeout(timer));
+}
+
+// Quitting a sandboxed session is a decision, not a formality: the disposable
+// copy is either merged into the project or thrown away. Ask the bridge to close
+// gracefully and hold the window open until it answers, or a stray click on the
+// title bar silently discards everything the agent wrote.
+let shutdownRequested = false;
+let closeConfirmed = false;
+let shutdownTimer: NodeJS.Timeout | null = null;
+
+function clearShutdownTimer(): void {
+  if (shutdownTimer) clearTimeout(shutdownTimer);
+  shutdownTimer = null;
+}
+
+function finishClose(): void {
+  clearShutdownTimer();
+  closeConfirmed = true;
+  stopBridge();
+  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.close();
+}
+
+function beginGracefulClose(): void {
+  shutdownRequested = true;
+  bridge!.stdin.write(JSON.stringify({ type: "shutdown" }) + "\n");
+  // Only guards against a bridge that never answers at all. Cancelled as soon
+  // as it asks the user something, because then the wait is the user's own.
+  shutdownTimer = setTimeout(finishClose, 15000);
 }
 
 function startBridge(): void {
@@ -75,7 +108,15 @@ function startBridge(): void {
     ["-m", "cagent.gui.bridge", "--workspace", workspace],
     {
       cwd: packageRoot,
-      env: { ...process.env, ...(pythonPath ? { PYTHONPATH: pythonPath } : {}), PYTHONUNBUFFERED: "1" },
+      // PYTHONIOENCODING covers anything written before the bridge pins its own
+      // streams, such as an import-time traceback. Both sides must be UTF-8 or
+      // non-ASCII output arrives here as mojibake.
+      env: {
+        ...process.env,
+        ...(pythonPath ? { PYTHONPATH: pythonPath } : {}),
+        PYTHONUNBUFFERED: "1",
+        PYTHONIOENCODING: "utf-8",
+      },
       windowsHide: true,
       stdio: ["pipe", "pipe", "pipe"],
     },
@@ -87,12 +128,19 @@ function startBridge(): void {
       const payload = JSON.parse(line) as Record<string, unknown>;
       sendToRenderer(payload);
       if (payload.type === "exit_requested") mainWindow?.close();
+      if (payload.type === "shutdown_complete") finishClose();
+      // The bridge is now waiting on a human, so the watchdog must not fire:
+      // deciding what to do with sandbox changes takes as long as it takes.
+      if (payload.type === "approval_requested" && shutdownRequested) clearShutdownTimer();
     } catch {
       sendToRenderer({ type: "bridge_log", level: "warning", message: line });
     }
   });
-  child.stderr.on("data", (chunk: Buffer) => {
-    const message = chunk.toString("utf8").trim();
+  // setEncoding decodes through a StringDecoder, so a multi-byte character
+  // split across two chunks survives instead of turning into replacement marks.
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (chunk: string) => {
+    const message = chunk.trim();
     if (message) sendToRenderer({ type: "bridge_log", level: "error", message });
   });
   child.on("error", (error) => {
@@ -127,10 +175,26 @@ function createWindow(): void {
       sandbox: true,
     },
   });
+  // A blank window is indistinguishable from a hung one, so surface the two
+  // load failures that produce it instead of leaving them in the dev console.
+  mainWindow.webContents.on("preload-error", (_event, preloadPath, error) => {
+    console.error(`[cagent] preload failed: ${preloadPath}: ${error.message}`);
+  });
+  mainWindow.webContents.on("did-fail-load", (_event, code, description, url) => {
+    console.error(`[cagent] renderer failed to load: ${description} (${code}) ${url}`);
+  });
   const devUrl = process.env.VITE_DEV_SERVER_URL;
   if (devUrl) void mainWindow.loadURL(devUrl);
   else void mainWindow.loadFile(path.join(packageRoot, "dist", "index.html"));
   mainWindow.webContents.on("did-finish-load", startBridge);
+  mainWindow.on("close", (event) => {
+    if (closeConfirmed) return;
+    if (!bridge || bridge.killed) { closeConfirmed = true; return; }
+    event.preventDefault();
+    // A second attempt means the user would rather leave than keep waiting.
+    if (shutdownRequested) finishClose();
+    else beginGracefulClose();
+  });
   mainWindow.on("closed", () => {
     mainWindow = null;
     stopBridge();

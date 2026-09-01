@@ -107,6 +107,7 @@ class DesktopSession:
         self._busy = False
         self._initialized = False
         self._closed = False
+        self._shutdown_started = False
         self._approval_lock = threading.Lock()
         self._approval_ready = threading.Event()
         self._approval_request: ApprovalRequest | None = None
@@ -161,7 +162,18 @@ class DesktopSession:
                 detail=traceback.format_exc(limit=8),
             )
 
-    def close(self, reason: str = "finished") -> None:
+    def close(self, reason: str = "finished", *, interactive: bool = False) -> None:
+        """Finish the session, applying the sandbox sync policy on the way out.
+
+        Args:
+            reason: Recorded in the trace as why the session ended.
+            interactive: Whether a renderer is still there to answer questions.
+                Closing a sandboxed session asks whether to copy the disposable
+                copy back to the project; with no one to ask, the policy refuses
+                and the work is thrown away. That is the right answer for a
+                renderer that is already gone, and the wrong one for a session
+                being rotated under a live window — so the caller decides.
+        """
         if self._closed:
             return
         self._closed = True
@@ -169,10 +181,7 @@ class DesktopSession:
         agent = self.agent
         if agent is None:
             return
-        # Process shutdown cannot present a modal approval reliably. Keep the
-        # core's normal sync policy for an active session, but never leave the
-        # Electron process blocked waiting for a renderer that is closing.
-        if self.policy is not None:
+        if self.policy is not None and not interactive:
             self.policy.prompter = None
         trace_path = (
             str(self.trace.path)
@@ -186,13 +195,48 @@ class DesktopSession:
         with contextlib.suppress(Exception):
             agent.close()
 
+    def begin_shutdown(self) -> None:
+        """Close the session off the reader thread, then report completion.
+
+        Closing inline would deadlock: the sandbox sync approval is answered by
+        an ``approval`` message over stdin, and the reader thread cannot deliver
+        it while it is itself blocked inside :meth:`close`. Electron waits for
+        ``shutdown_complete`` before it tears the window down.
+        """
+        if self._shutdown_started:
+            return
+        self._shutdown_started = True
+        self.interrupt()
+
+        def run() -> None:
+            try:
+                self.close("shutdown", interactive=True)
+            except Exception as exc:  # noqa: BLE001 - shutdown must always finish
+                self.emitter.send(
+                    "worker_error",
+                    message=f"{type(exc).__name__}: {exc}",
+                    detail=traceback.format_exc(limit=8),
+                )
+            finally:
+                self.emitter.send("shutdown_complete")
+
+        threading.Thread(target=run, name="cagent-gui-shutdown", daemon=True).start()
+
     def new_session(self) -> None:
         if not self._require_idle():
             return
         self._launch(self._new_session, name="cagent-gui-new-session")
 
     def _new_session(self) -> None:
-        self.close("new_session")
+        self.emitter.send("history_cleared")
+        self._rotate_session("new_session")
+
+    def _rotate_session(self, reason: str) -> None:
+        """Finish the live session and build a fresh one in this same process."""
+        # The window is open and the user is waiting on us, so the sandbox sync
+        # question can and must be asked: rotating a session is not a reason to
+        # silently discard everything the agent wrote.
+        self.close(reason, interactive=True)
         # Re-use this bridge process and the resolved workspace, but create all
         # mutable agent collaborators again so usage and remembered approvals reset.
         self._closed = False
@@ -202,7 +246,6 @@ class DesktopSession:
         self.trace = None
         self.sink = None
         self._restored_from = None
-        self.emitter.send("history_cleared")
         self._initialize()
 
     # ------------------------------------------------------------------ turns
@@ -358,6 +401,10 @@ class DesktopSession:
     def resume(self, path: Path) -> None:
         if not self._require_idle() or self.config is None or self.agent is None:
             return
+        self._launch(lambda: self._resume(path), name="cagent-gui-resume")
+
+    def _resume(self, path: Path) -> None:
+        assert self.config is not None
         candidate = path.expanduser()
         if not candidate.is_absolute():
             candidate = resume_trace_dir(self.config) / candidate
@@ -387,6 +434,16 @@ class DesktopSession:
                 f"This trace used {recorded_workspace}; tools will continue to use "
                 f"{self.config.workspace}."
             )
+        # `restore_history` replaces the whole transcript and documents that a
+        # resumed context belongs to a fresh agent. The desktop client can ask
+        # for a resume mid-conversation, so rotate first: grafting the history
+        # onto a session that already has turns writes a history_checkpoint
+        # into that session's own trace, and the checkpoint then wins on replay
+        # and hides the conversation the trace was recording.
+        if self.trace is not None and self.trace.has_user_message:
+            self._rotate_session("resumed")
+        if self.agent is None:
+            return
         self.agent.restore_history(history)
         if self.trace is not None:
             self.trace.record_history(history)
@@ -498,7 +555,20 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _force_utf8_streams() -> None:
+    """Pin the JSONL pipes to UTF-8.
+
+    When stdio is a pipe Python falls back to the locale encoding (cp936 on a
+    Chinese Windows install), while Electron always reads and writes UTF-8.
+    Anything non-ASCII would be mangled in both directions.
+    """
+    for stream in (sys.stdin, sys.stdout, sys.stderr):
+        with contextlib.suppress(AttributeError, ValueError, OSError):
+            stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
+
+
 def main(argv: list[str] | None = None) -> int:
+    _force_utf8_streams()
     args = _parser().parse_args(argv)
     emitter = JsonEmitter()
     session = DesktopSession(args.workspace, emitter)
@@ -527,7 +597,10 @@ def main(argv: list[str] | None = None) -> int:
                 elif kind == "status":
                     session.send_status()
                 elif kind == "shutdown":
-                    break
+                    # Keep reading: the sandbox sync approval still has to come
+                    # back over this stream. The loop ends on stdin EOF, which
+                    # Electron sends once it sees `shutdown_complete`.
+                    session.begin_shutdown()
                 else:
                     emitter.send("protocol_error", message=f"Unknown command type: {kind!r}")
             except (json.JSONDecodeError, TypeError, ValueError) as exc:

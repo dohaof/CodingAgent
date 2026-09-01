@@ -37,38 +37,54 @@ import {
   Square,
   Terminal,
   TestTube,
+  Trash2,
   TriangleAlert,
   Undo2,
   Wrench,
   X,
 } from "lucide";
 import DOMPurify from "dompurify";
-import { marked } from "marked";
+import { marked, type TokenizerAndRendererExtension, type Tokens } from "marked";
 import "./style.css";
 
 type AnyRecord = Record<string, any>;
 
 const appRoot = document.querySelector<HTMLDivElement>("#app")!;
-if (!window.cagent) {
+// Without the Electron preload there is no backend to talk to. Stub the API so
+// the layout still renders, but never swallow a command silently: every send
+// reports why nothing happened, or a broken launch looks like a frozen UI.
+const previewMode = !window.cagent;
+if (previewMode) {
+  const previewConfig = { model: "desktop preview", approval_mode: "auto-edit" };
+  let notify: ((event: BackendEvent) => void) | null = null;
   window.cagent = {
-    send(): void {},
+    send(): void {
+      notify?.({
+        type: "protocol_error",
+        message: "Preview mode: no backend attached. Run `npm run start` in desktop/.",
+      });
+    },
     onEvent(listener): () => void {
+      notify = listener;
       const timer = window.setTimeout(() => {
-        listener({
-          type: "ready",
-          session_id: "preview",
-          workspace: "Browser preview",
-          config: { model: "desktop preview", approval_mode: "auto-edit" },
-        });
+        listener({ type: "ready", session_id: "preview", workspace: "Browser preview", config: previewConfig });
         listener({
           type: "status",
           busy: false,
           steps: 0,
           context: { tokens: 0, window: 128000, messages: 0, compactions: 0 },
-          config: { model: "desktop preview", approval_mode: "auto-edit" },
+          config: previewConfig,
+        });
+        listener({
+          type: "warning",
+          message: "Preview mode - the Python backend is not attached",
+          detail:
+            "This page is running without the Electron preload, so the composer, "
+            + "slash commands, and the approval-mode control cannot reach cagent.\n"
+            + "Launch the desktop app instead: cd desktop && npm run start",
         });
       }, 0);
-      return () => window.clearTimeout(timer);
+      return () => { notify = null; window.clearTimeout(timer); };
     },
     async chooseWorkspace(): Promise<null> { return null; },
     minimize(): void {},
@@ -114,6 +130,7 @@ const uiIcons = {
   Square,
   Terminal,
   TestTube,
+  Trash2,
   TriangleAlert,
   Undo2,
   Wrench,
@@ -174,9 +191,106 @@ function relativeDate(value: unknown): string {
   return date.toLocaleDateString(undefined, { month: "short", day: "numeric" });
 }
 
+/** A ``<delim>text<delim>`` inline span, for marks Markdown has no syntax for. */
+function pairedMark(name: string, delimiter: string, tag: string): TokenizerAndRendererExtension {
+  const rule = new RegExp(`^${delimiter.replace(/[+=^~]/g, "\\$&")}(?=\\S)([\\s\\S]*?\\S)${delimiter.replace(/[+=^~]/g, "\\$&")}`);
+  return {
+    name,
+    level: "inline",
+    start(src: string) { return src.indexOf(delimiter); },
+    tokenizer(src: string) {
+      const match = rule.exec(src);
+      if (!match) return undefined;
+      return { type: name, raw: match[0], tokens: this.lexer.inlineTokens(match[1] ?? "") };
+    },
+    renderer(token) { return `<${tag}>${this.parser.parseInline(token.tokens ?? [])}</${tag}>`; },
+  };
+}
+
+// GFM gives us strikethrough, tables and task lists; `breaks` matches the chat
+// convention that a newline the user typed is a newline they meant. Underline
+// and highlight have no Markdown spelling at all, so models reach for ++ and ==
+// (or raw <u>, which DOMPurify's html profile already keeps) — support both.
+marked.use({
+  gfm: true,
+  breaks: true,
+  extensions: [pairedMark("underline", "++", "u"), pairedMark("highlight", "==", "mark")],
+  renderer: {
+    code(token: Tokens.Code): string | false {
+      const language = ((token.lang || "").trim().split(/\s+/)[0] ?? "").toLowerCase();
+      return language === "diff" || language === "patch" ? renderDiff(token.text) : false;
+    },
+  },
+});
+
 function markdown(value: string): string {
   const html = marked.parse(value || "", { async: false }) as string;
   return DOMPurify.sanitize(html, { USE_PROFILES: { html: true } });
+}
+
+const MAX_DIFF_LINES = 260;
+/** Header lines of a unified diff. Only meaningful before the first hunk: inside
+    one, `--- x` is a deleted line whose text happens to start with `--`. */
+const DIFF_HEADER = /^(diff |index |--- |\+\+\+ |old mode|new mode|new file|deleted file|similarity |rename |copy |Binary files )/;
+
+function isUnifiedDiff(text: string): boolean {
+  return text.startsWith("--- ") || text.startsWith("diff ");
+}
+
+function diffStats(text: string): { added: number; removed: number } {
+  let added = 0;
+  let removed = 0;
+  for (const line of text.split("\n")) {
+    if (line.startsWith("+++") || line.startsWith("---")) continue;
+    if (line.startsWith("+")) added += 1;
+    else if (line.startsWith("-")) removed += 1;
+  }
+  return { added, removed };
+}
+
+function diffRow(kind: string, lineNumber: number | null, sign: string, text: string): string {
+  return `<div class="diff-line ${kind}"><span class="diff-no">${lineNumber ?? ""}</span><span class="diff-sign">${sign}</span><span class="diff-text">${escapeHtml(text) || "&nbsp;"}</span></div>`;
+}
+
+/** A unified diff as added/removed rows, the way the CLI prints it.
+ *
+ * Line numbers come from the hunk headers rather than a running count, so a
+ * clipped or multi-hunk diff still points at real positions in the file.
+ */
+function renderDiff(text: string): string {
+  const lines = text.replace(/\n+$/, "").split("\n");
+  const shown = lines.slice(0, MAX_DIFF_LINES);
+  let oldLine = 0;
+  let newLine = 0;
+  let inHunk = false;
+  const rows = shown.map((line) => {
+    const hunk = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(line);
+    if (hunk) {
+      oldLine = Number(hunk[1]);
+      newLine = Number(hunk[2]);
+      inHunk = true;
+      return diffRow("hunk", null, "", line);
+    }
+    if (line.startsWith("\\") || (!inHunk && DIFF_HEADER.test(line))) return diffRow("meta", null, "", line);
+    if (line.startsWith("+")) return diffRow("add", newLine++, "+", line.slice(1));
+    if (line.startsWith("-")) return diffRow("del", oldLine++, "-", line.slice(1));
+    oldLine += 1;
+    return diffRow("ctx", newLine++, "", line.startsWith(" ") ? line.slice(1) : line);
+  });
+  const hidden = lines.length - shown.length;
+  const more = hidden > 0 ? `<div class="diff-more">… ${hidden} more diff line${hidden === 1 ? "" : "s"}</div>` : "";
+  return `<div class="diff-view">${rows.join("")}${more}</div>`;
+}
+
+/** The `+N/-M` badge for a finished edit, from its metadata or its own diff. */
+function diffBadge(outcome: AnyRecord, display: string): string {
+  const metadata = (outcome.metadata || {}) as AnyRecord;
+  const counted = "added" in metadata || "removed" in metadata;
+  if (!counted && !(display && isUnifiedDiff(display))) return "";
+  const stats = counted
+    ? { added: Number(metadata.added || 0), removed: Number(metadata.removed || 0) }
+    : diffStats(display);
+  return `<span class="diff-stat"><b class="plus">+${stats.added}</b><b class="minus">-${stats.removed}</b></span>`;
 }
 
 function send(type: string, payload: AnyRecord = {}): void {
@@ -281,12 +395,13 @@ function shell(): void {
 }
 
 function bindUI(): void {
-  document.querySelector("#collapse-sidebar")?.addEventListener("click", () => {
-    state.sidebarCollapsed = !state.sidebarCollapsed;
-    localStorage.setItem("cagent.sidebar", state.sidebarCollapsed ? "collapsed" : "expanded");
-    document.querySelector(".window-shell")?.classList.toggle("sidebar-collapsed", state.sidebarCollapsed);
+  document.querySelector("#collapse-sidebar")?.addEventListener("click", () => setSidebarCollapsed(!state.sidebarCollapsed));
+  document.querySelector("#open-sessions")?.addEventListener("click", () => {
+    // Narrow layouts slide the sidebar in over the transcript; wide layouts
+    // only ever need this button to undo a collapse.
+    if (window.matchMedia("(max-width: 880px)").matches) document.querySelector(".window-shell")?.classList.toggle("sessions-open");
+    else setSidebarCollapsed(false);
   });
-  document.querySelector("#open-sessions")?.addEventListener("click", () => document.querySelector(".window-shell")?.classList.toggle("sessions-open"));
   document.querySelector("#new-session")?.addEventListener("click", newSession);
   document.querySelector("#choose-workspace")?.addEventListener("click", chooseWorkspace);
   document.querySelector("#open-settings")?.addEventListener("click", () => openSettings());
@@ -327,21 +442,33 @@ function bindUI(): void {
   document.addEventListener("keydown", (event) => {
     if (event.ctrlKey && event.key.toLowerCase() === "n") { event.preventDefault(); newSession(); }
     if (event.ctrlKey && event.key.toLowerCase() === "r") { event.preventDefault(); openSessionPicker(); }
-    if (event.ctrlKey && event.key.toLowerCase() === "q") { event.preventDefault(); send("shutdown"); window.cagent.close(); }
+    // Closing the window runs the graceful shutdown in the main process, which
+    // may still have to ask about sandbox changes. Sending `shutdown` here too
+    // would start that twice and race the answer.
+    if (event.ctrlKey && event.key.toLowerCase() === "q") { event.preventDefault(); window.cagent.close(); }
     if (event.key === "Escape" && state.settingsOpen) closeSettings();
   });
-  document.querySelector("#transcript-wrap")?.addEventListener("scroll", () => {
-    const wrap = document.querySelector<HTMLElement>("#transcript-wrap");
-    const follow = document.querySelector<HTMLElement>("#scroll-follow");
-    if (wrap && follow) follow.classList.toggle("visible", wrap.scrollHeight - wrap.scrollTop - wrap.clientHeight > 180);
-  });
+  document.querySelector("#transcript-wrap")?.addEventListener("scroll", updateScrollFollow);
+  document.querySelector("#scroll-follow")?.addEventListener("click", scrollToLatest);
+  // Scrolling is not the only thing that can strand the button: clearing the
+  // transcript for a new session removes the content below without moving the
+  // scroll position, so no scroll event fires and the prompt to jump to a
+  // latest that no longer exists stays on screen. Watch the content box too.
+  const transcript = document.querySelector("#transcript");
+  if (transcript) new ResizeObserver(updateScrollFollow).observe(transcript);
+}
+
+function updateScrollFollow(): void {
+  const wrap = document.querySelector<HTMLElement>("#transcript-wrap");
+  const follow = document.querySelector<HTMLElement>("#scroll-follow");
+  if (wrap && follow) follow.classList.toggle("visible", wrap.scrollHeight - wrap.scrollTop - wrap.clientHeight > 180);
 }
 
 function resizeComposer(): void {
   const input = document.querySelector<HTMLTextAreaElement>("#composer-input");
   if (!input) return;
   input.style.height = "auto";
-  input.style.height = `${Math.min(Math.max(input.scrollHeight, 27), 150)}px`;
+  input.style.height = `${Math.min(Math.max(input.scrollHeight, 32), 190)}px`;
 }
 
 function filteredCommands(): readonly (readonly [string, string, string])[] {
@@ -387,11 +514,14 @@ async function chooseWorkspace(): Promise<void> {
   if (selected) { state.workspace = selected; toast(`Workspace changed to ${selected}`, "success"); }
 }
 
+function setSidebarCollapsed(collapsed: boolean): void {
+  state.sidebarCollapsed = collapsed;
+  localStorage.setItem("cagent.sidebar", collapsed ? "collapsed" : "expanded");
+  document.querySelector(".window-shell")?.classList.toggle("sidebar-collapsed", collapsed);
+}
+
 function openSessionPicker(): void {
-  if (state.sidebarCollapsed) {
-    state.sidebarCollapsed = false;
-    document.querySelector(".window-shell")?.classList.remove("sidebar-collapsed");
-  }
+  if (state.sidebarCollapsed) setSidebarCollapsed(false);
   document.querySelector(".window-shell")?.classList.add("sessions-open");
   document.querySelector("#sessions-list")?.scrollIntoView({ behavior: "smooth" });
 }
@@ -400,6 +530,9 @@ function clearTranscript(): void {
   const transcript = document.querySelector<HTMLElement>("#transcript");
   if (transcript) transcript.innerHTML = `<div class="welcome" id="welcome"><div class="welcome-kicker"><span class="status-dot ready"></span> New local session</div><h1>Ready for a task</h1><p class="welcome-copy">No messages in this session.</p></div>`;
   state.assistantNode = null; state.assistantText = ""; state.toolNodes.clear(); state.pendingApproval = null; renderApproval(); renderIcons();
+  // Synchronous, so an emptied transcript never paints with a stale button:
+  // the ResizeObserver above only catches up on the next frame.
+  updateScrollFollow();
 }
 
 function appendBlock(className: string, html: string): HTMLElement {
@@ -435,10 +568,15 @@ function appendThinking(text: string): void {
   let thinking = node.querySelector<HTMLDetailsElement>(".thinking-content");
   if (!thinking) {
     thinking = document.createElement("details"); thinking.className = "thinking-content"; thinking.open = false;
-    thinking.innerHTML = `<summary>${icon("brain", 14)} Reasoning trace <span>streaming</span></summary><div class="thinking-text"></div>`;
+    thinking.innerHTML = `<summary>${icon("brain", 14)} Reasoning trace <span>streaming</span></summary><div class="thinking-text prose"></div>`;
     node.insertBefore(thinking, node.querySelector(".assistant-content")); renderIcons();
   }
-  thinking.querySelector(".thinking-text")!.textContent += text;
+  // The trace is model prose like any other reply, so it gets the same Markdown
+  // pass. Keep the raw text on the node: each delta re-renders the whole thing,
+  // and half a heading parsed as literal text would never repair itself.
+  const body = thinking.querySelector<HTMLElement>(".thinking-text")!;
+  body.dataset.raw = (body.dataset.raw || "") + text;
+  body.innerHTML = markdown(body.dataset.raw);
 }
 
 function appendAssistant(text: string): void {
@@ -448,9 +586,76 @@ function appendAssistant(text: string): void {
   scrollToLatest();
 }
 
+const MAX_REPLAY_LINES = 12;
+const MAX_REPLAY_LINE_CHARS = 240;
+const MAX_REPLAY_ARG_CHARS = 68;
+
+/** Condense a replayed call's arguments to one line, as the CLI does.
+ *
+ * The interesting argument is almost always a path or a command, so those are
+ * shown bare and everything else as `key=value`.
+ */
+function replayArguments(call: AnyRecord): string {
+  const args = call.arguments && typeof call.arguments === "object" ? call.arguments as AnyRecord : {};
+  const entries = Object.entries(args);
+  if (!entries.length) return "";
+  return entries.map(([key, value]) => {
+    let text = typeof value === "string" ? value.replace(/\n/g, "⏎") : String(value);
+    if (text.length > MAX_REPLAY_ARG_CHARS) text = `${text.slice(0, MAX_REPLAY_ARG_CHARS)}…`;
+    return ["path", "command", "pattern"].includes(key) ? text : `${key}=${text}`;
+  }).join(", ");
+}
+
+/** A bounded excerpt of a replayed tool result, matching the CLI's limits. */
+function replayDetail(text: string): string {
+  const lines = text.split("\n");
+  while (lines.length && !lines[0]!.trim()) lines.shift();
+  while (lines.length && !lines.at(-1)!.trim()) lines.pop();
+  if (!lines.length) return "";
+  const shown = lines.slice(0, MAX_REPLAY_LINES).map((line) =>
+    line.length > MAX_REPLAY_LINE_CHARS ? `${line.slice(0, MAX_REPLAY_LINE_CHARS - 3)}...` : line);
+  const hidden = lines.length - shown.length;
+  const more = hidden > 0 ? `\n… ${hidden} more line${hidden === 1 ? "" : "s"}` : "";
+  return `<pre>${escapeHtml(shown.join("\n") + more)}</pre>`;
+}
+
+/** The tool activity of a replayed turn: each call and the result it produced.
+ *
+ * The trace keeps a tool's `content` but not its `display`, so a replayed edit
+ * shows the post-edit snippet the model saw rather than the coloured diff a
+ * live run prints — the diff is derived at execution time and is simply gone.
+ */
+function renderReplayedCalls(message: AnyRecord, results: Map<string, AnyRecord>): string {
+  if (!Array.isArray(message.parts)) return "";
+  const calls = message.parts.filter((part: AnyRecord) => part.type === "tool_call");
+  if (!calls.length) return "";
+  const rows = calls.map((call: AnyRecord) => {
+    const name = String(call.name || "tool");
+    const args = replayArguments(call);
+    const result = results.get(String(call.id ?? ""));
+    const content = String(result?.content || "");
+    const failed = Boolean(result?.is_error);
+    const body = content.trim() ? replayDetail(content) : "";
+    return `<div class="replayed-call${failed ? " failed" : ""}"><div class="replayed-call-head">${icon(name === "run_bash" ? "terminal" : "file-code-2", 14)}<b>${escapeHtml(name)}</b>${args ? `<span>${escapeHtml(args)}</span>` : ""}${icon(result ? (failed ? "circle-x" : "circle-check") : "circle-help", 14)}</div>${body}</div>`;
+  });
+  return `<div class="replayed-calls">${rows.join("")}</div>`;
+}
+
+/** Tool results from a replayed history, keyed by the call they answer. */
+function replayResults(messages: AnyRecord[]): Map<string, AnyRecord> {
+  const results = new Map<string, AnyRecord>();
+  for (const message of messages) {
+    if (!Array.isArray(message.parts)) continue;
+    for (const part of message.parts as AnyRecord[]) {
+      if (part.type === "tool_result" && part.call_id) results.set(String(part.call_id), part);
+    }
+  }
+  return results;
+}
+
 function renderParts(message: AnyRecord): string {
   if (!Array.isArray(message.parts)) return "";
-  return message.parts.map((part: AnyRecord) => part.type === "text" ? markdown(String(part.text || "")) : part.type === "thinking" ? `<details class="replayed-thinking"><summary>${icon("brain", 13)} Reasoning trace</summary><div>${escapeHtml(String(part.text || ""))}</div></details>` : "").join("");
+  return message.parts.map((part: AnyRecord) => part.type === "text" ? markdown(String(part.text || "")) : part.type === "thinking" ? `<details class="replayed-thinking"><summary>${icon("brain", 13)} Reasoning trace</summary><div class="prose">${markdown(String(part.text || ""))}</div></details>` : "").join("");
 }
 
 function renderToolStarted(event: AnyRecord): void {
@@ -468,11 +673,26 @@ function renderToolFinished(event: AnyRecord): void {
   const id = String(event.call?.id || event.id || "");
   const node = state.toolNodes.get(id);
   if (!node) { renderToolStarted(event); return renderToolFinished(event); }
+  const outcome = (event.outcome || event) as AnyRecord;
   const card = node.querySelector<HTMLElement>(".tool-card");
   const output = node.querySelector<HTMLElement>(".tool-output");
-  card?.classList.remove("running"); card?.classList.add(event.outcome?.is_error || event.is_error ? "error" : "done");
-  const spinner = node.querySelector(".tool-spinner"); if (spinner) spinner.innerHTML = icon(event.outcome?.is_error || event.is_error ? "circle-x" : "circle-check", 15);
-  if (output) output.innerHTML = `<pre>${escapeHtml(String(event.outcome?.content || event.content || "No output"))}</pre><span class="tool-duration">${Number(event.duration_s || 0).toFixed(2)}s${event.truncated ? " · truncated" : ""}</span>`;
+  card?.classList.remove("running"); card?.classList.add(outcome.is_error ? "error" : "done");
+  const spinner = node.querySelector(".tool-spinner"); if (spinner) spinner.innerHTML = icon(outcome.is_error ? "circle-x" : "circle-check", 15);
+  // A tool's `display` is the rich account of what it did — for an edit, the
+  // diff. As in the CLI it replaces the raw content, which only narrates the
+  // same change back; the content's first line is kept as the summary.
+  const content = String(outcome.content || "");
+  const display = typeof outcome.display === "string" ? outcome.display : "";
+  const body = display
+    ? `<span class="tool-summary">${escapeHtml(content.split("\n")[0] || "done")}</span>${isUnifiedDiff(display) ? renderDiff(display) : `<pre>${escapeHtml(display)}</pre>`}`
+    : `<pre>${escapeHtml(content || "No output")}</pre>`;
+  if (output) output.innerHTML = `${body}<span class="tool-duration">${Number(event.duration_s || 0).toFixed(2)}s${outcome.truncated ? " · truncated" : ""}</span>`;
+  const head = node.querySelector(".tool-card-head");
+  const subtitle = head?.querySelector(".tool-title span");
+  if (subtitle) subtitle.textContent = outcome.is_error ? "Failed" : "Completed";
+  head?.querySelector(".diff-stat")?.remove();
+  const badge = diffBadge(outcome, display);
+  if (badge) head?.querySelector(".risk-tag")?.insertAdjacentHTML("beforebegin", badge);
   renderIcons(); scrollToLatest();
 }
 
@@ -483,8 +703,22 @@ function renderApproval(): void {
   const request = state.pendingApproval.request || state.pendingApproval;
   const risk = String(request.risk || "MUTATING").toLowerCase();
   const canAlways = risk !== "dangerous" && !request.always_prompt;
+  // An edit's detail is the diff it wants to write. Colour it and open it by
+  // default: a prompt the user cannot evaluate trains them to approve blindly.
+  const detail = String(request.detail || "");
+  const isDiff = isUnifiedDiff(detail);
+  const stats = isDiff ? diffStats(detail) : null;
+  // The sandbox sync asks the one question where "Deny" destroys work rather
+  // than merely declining it, so it gets labels that say what each button does.
+  const isSync = String(request.tool || "") === "sandbox_sync";
+  const heading = isSync ? "Keep these sandbox changes?" : "Approval required";
+  const subject = isSync
+    ? "The disposable copy is about to be closed"
+    : `${escapeHtml(String(request.tool || "tool"))} wants to run`;
+  const denyLabel = isSync ? `${icon("trash-2", 14)} Discard changes` : "Deny";
+  const allowLabel = isSync ? `${icon("check", 14)} Copy to project` : `${icon("check", 14)} Allow once`;
   slot.classList.add("open");
-  slot.innerHTML = `<div class="approval-card ${risk}"><div class="approval-heading"><span class="approval-symbol">${icon(risk === "dangerous" ? "triangle-alert" : "shield-alert", 17)}</span><div><b>Approval required</b><span>${escapeHtml(String(request.tool || "tool"))} wants to run</span></div><span class="risk-tag ${risk}">${risk}</span></div><p>${escapeHtml(String(request.summary || "This action may modify your workspace."))}</p>${request.detail ? `<details><summary>View details</summary><pre>${escapeHtml(String(request.detail))}</pre></details>` : ""}<div class="approval-actions"><button class="approval-deny" data-approval="deny">Deny</button><button class="approval-always" data-approval="always" ${canAlways ? "" : "disabled"}>${icon("check-check", 14)} Always allow</button><button class="approval-allow" data-approval="approve">${icon("check", 14)} Allow once</button></div></div>`;
+  slot.innerHTML = `<div class="approval-card ${risk}${isSync ? " sync" : ""}"><div class="approval-heading"><span class="approval-symbol">${icon(risk === "dangerous" ? "triangle-alert" : isSync ? "container" : "shield-alert", 17)}</span><div><b>${heading}</b><span>${subject}</span></div>${stats ? `<span class="diff-stat"><b class="plus">+${stats.added}</b><b class="minus">-${stats.removed}</b></span>` : ""}<span class="risk-tag ${risk}">${risk}</span></div><p>${escapeHtml(String(request.summary || "This action may modify your workspace."))}</p>${detail ? `<details${isDiff ? " open" : ""}><summary>View details</summary>${isDiff ? renderDiff(detail) : `<pre>${escapeHtml(detail)}</pre>`}</details>` : ""}<div class="approval-actions"><button class="approval-deny" data-approval="deny">${denyLabel}</button>${isSync ? "" : `<button class="approval-always" data-approval="always" ${canAlways ? "" : "disabled"}>${icon("check-check", 14)} Always allow</button>`}<button class="approval-allow" data-approval="approve">${allowLabel}</button></div></div>`;
   slot.querySelectorAll<HTMLButtonElement>("[data-approval]").forEach((button) => button.addEventListener("click", () => {
     const decision = button.dataset.approval!; send("approval", { decision }); state.pendingApproval = null; renderApproval();
   }));
@@ -509,9 +743,19 @@ function renderSessions(): void {
 function renderHistory(messages: AnyRecord[], source = "resumed session"): void {
   clearTranscript();
   appendBlock("system-notice", `<div class="notice-icon">${icon("history", 15)}</div><div><b>Context restored</b><span>${escapeHtml(source)} · prior turns are available to the agent</span></div>`);
+  const results = replayResults(messages || []);
   for (const message of messages || []) {
-    if (message.role === "user") appendBlock("user-block", `<div class="message-meta"><span class="avatar user-avatar">YOU</span><span class="message-label">You</span></div><div class="user-content">${escapeHtml(message.parts?.map((p: AnyRecord) => p.text || "").join("") || "").replace(/\n/g, "<br>")}</div>`);
-    else if (message.role === "assistant") appendBlock("assistant-block", `<div class="message-meta"><span class="avatar agent-avatar">c</span><span class="message-label">cagent</span></div><div class="assistant-content prose">${renderParts(message)}</div>`);
+    if (message.role === "user") {
+      const text = String(message.parts?.map((p: AnyRecord) => p.text || "").join("") || "");
+      if (text.trim()) appendBlock("user-block", `<div class="message-meta"><span class="avatar user-avatar">YOU</span><span class="message-label">You</span></div><div class="user-content">${escapeHtml(text).replace(/\n/g, "<br>")}</div>`);
+    } else if (message.role === "assistant") {
+      // A step that only called tools carries no text. Rendering the bubble
+      // anyway leaves a "cagent" header with nothing under it, so replay what
+      // the step actually did instead of an empty turn.
+      const body = renderParts(message);
+      const calls = renderReplayedCalls(message, results);
+      if (body || calls) appendBlock("assistant-block", `<div class="message-meta"><span class="avatar agent-avatar">c</span><span class="message-label">cagent</span></div>${body ? `<div class="assistant-content prose">${body}</div>` : ""}${calls}`);
+    }
   }
   state.assistantNode = null; state.assistantText = ""; renderIcons();
 }
@@ -549,6 +793,7 @@ function handleEvent(event: AnyRecord): void {
   switch (event.type) {
     case "ready": state.activeSession = String(event.session_id || ""); state.workspace = String(event.workspace || ""); state.config = { ...state.config, ...(event.config || {}) }; updateWorkspace(); updateStatusBar(); break;
     case "backend_restarting": state.workspace = String(event.workspace || ""); updateWorkspace(); break;
+    case "backend_stopped": setBusy(false); toast("The Python backend stopped", "warning"); appendBlock("warning-block", `<span class="warning-symbol">${icon("circle-x", 16)}</span><div><b>Backend stopped</b><span>Exit code ${escapeHtml(String(event.code ?? event.signal ?? "unknown"))} - nothing you send will reach cagent until it restarts.</span></div>`); renderIcons(); break;
     case "sessions": state.sessions = Array.isArray(event.sessions) ? event.sessions : []; state.activeSession = String(event.active_id || state.activeSession); state.restoredFrom = String(event.restored_from || ""); renderSessions(); break;
     case "status": state.status = { ...state.status, ...event }; state.config = { ...state.config, ...(event.config || {}) }; updateStatusBar(); updateWorkspace(); if (state.settingsOpen) renderSettings(); break;
     case "busy_changed": setBusy(Boolean(event.busy)); break;
