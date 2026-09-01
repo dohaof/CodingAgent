@@ -435,7 +435,7 @@ class SandboxSession:
             if "No such image" in detail or "pull access denied" in detail.lower():
                 raise SandboxError(
                     f"Sandbox image {image!r} is not available locally. "
-                    f"Build it from the project's Dockerfile with 'docker build -t {image} .' "
+                    f"Build it locally (e.g. 'docker build -t {image} .') "
                     f"or pull it explicitly with 'docker pull {image}'."
                 )
             if len(detail) > 2_000:

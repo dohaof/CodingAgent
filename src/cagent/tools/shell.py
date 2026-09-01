@@ -268,7 +268,11 @@ def _docker_command(command: str, ctx: ToolContext, *, name: str | None = None) 
         "--entrypoint",
         "/bin/sh",
         image,
-        "-lc",
+        # Not a login shell: Debian's /etc/profile assigns PATH outright, which
+        # discards the PATH the image's own ENV set. A project image that puts
+        # its interpreter on PATH that way -- the usual venv layout -- would see
+        # its tools vanish, so a plain -c inherits the container environment.
+        "-c",
         command,
     ]
 
@@ -282,7 +286,7 @@ def _docker_exec_command(command: str, container_name: str) -> list[str]:
         "/workspace",
         container_name,
         "/bin/sh",
-        "-lc",
+        "-c",  # see _docker_command: -l would reset PATH from /etc/profile
         command,
     ]
 

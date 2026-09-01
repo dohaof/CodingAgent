@@ -12,7 +12,7 @@ from cagent.agent import sandbox as sandbox_module
 from cagent.agent.sandbox import SandboxError, SandboxSession
 from cagent.config import AgentConfig
 from cagent.tools.base import ToolContext
-from cagent.tools.shell import _docker_command
+from cagent.tools.shell import _docker_command, _docker_exec_command
 
 
 def _config(workspace: Path, **kwargs: object) -> AgentConfig:
@@ -170,7 +170,32 @@ def test_docker_command_has_no_network_and_only_snapshot_mount(tmp_path: Path) -
     assert "--network=none" in argv
     assert "--read-only" in argv and "--cap-drop=ALL" in argv
     assert "type=bind,src=" + str(tmp_path / "snapshot") + ",dst=/workspace" in argv
-    assert argv[-5:] == ["--entrypoint", "/bin/sh", config.sandbox_image, "-lc", "pytest -q"]
+    assert argv[-5:] == ["--entrypoint", "/bin/sh", config.sandbox_image, "-c", "pytest -q"]
+    # A login shell would re-run /etc/profile and reset PATH, hiding the tools a
+    # project image installed into its own prefix.
+    assert "-lc" not in argv
+
+
+def test_docker_exec_inherits_the_container_environment() -> None:
+    """The session container path must not run a login shell.
+
+    ``/bin/sh -lc`` re-reads ``/etc/profile``, which on Debian assigns PATH
+    outright and so discards whatever the image's ``ENV PATH`` put first. A
+    project image that installs its interpreter into a venv -- the usual layout
+    -- would then report its own test runner as ``not found``.
+    """
+    argv = _docker_exec_command("pytest -q", "cagent-session")
+    assert argv == [
+        "docker",
+        "exec",
+        "--workdir",
+        "/workspace",
+        "cagent-session",
+        "/bin/sh",
+        "-c",
+        "pytest -q",
+    ]
+    assert "-lc" not in argv
 
 
 def test_docker_command_can_enable_bridge_network(tmp_path: Path) -> None:
