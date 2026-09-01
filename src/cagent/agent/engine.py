@@ -222,7 +222,7 @@ class Agent:
                 endpoint=self.config.resolved_base_url,
                 system_tokens=self.context.system_tokens,
                 tool_names=tuple(sorted(self.registry.names())),
-                sandbox_status=self.sandbox_status(),
+                sandbox_status=self.sandbox_startup_status(),
                 shell_access=shell_access,
                 path_boundary=path_boundary,
             )
@@ -817,6 +817,12 @@ class Agent:
             f"docker (container: {container}; sync: {self.config.sandbox_sync}; "
             f"network: {network})"
         )
+
+    def sandbox_startup_status(self) -> str:
+        """Return a stable sandbox label for the non-refreshing startup panel."""
+        if self.sandbox is not None:
+            return "docker"
+        return self.sandbox_status()
 
     def enable_sandbox(self, *, image: str | None = None) -> None:
         """Create a disposable snapshot and enable Docker execution."""

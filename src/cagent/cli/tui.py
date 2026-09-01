@@ -1490,7 +1490,7 @@ class CagentTui(App[int]):
             "APPROVAL",
             self.config.approval_mode,
             "SANDBOX",
-            self.agent.sandbox_status(),
+            event.sandbox_status or self.agent.sandbox_startup_status(),
         )
         status.add_row("PATHS", self._path_boundary_status(), "", "")
         status.add_row("SHELL", self._shell_execution_status(), "", "")

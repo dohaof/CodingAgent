@@ -447,7 +447,7 @@ class TestFailureHandling:
             agent.announce("test isolation")
             (started,) = sink.of_type(RunStarted)
             assert started.shell_access == "container"
-            assert "docker" in started.sandbox_status
+            assert started.sandbox_status == "docker"
             assert not sink.of_type(Warning)
         finally:
             agent.close()
