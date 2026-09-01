@@ -31,3 +31,7 @@ htmlcov/
 traces/
 *.log
 eval/runs/
+
+# Electron GUI dependencies and generated main-process output
+desktop/node_modules/
+desktop/dist-electron/

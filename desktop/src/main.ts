@@ -1,0 +1,589 @@
+import {
+  ArrowDown,
+  ArrowUp,
+  ArrowUpRight,
+  Brain,
+  Check,
+  CheckCheck,
+  ChevronDown,
+  ChevronRight,
+  CircleCheck,
+  CircleHelp,
+  CircleX,
+  Coins,
+  Container,
+  createIcons,
+  Ellipsis,
+  Eraser,
+  FileCode2,
+  FolderOpen,
+  Gauge,
+  GitPullRequest,
+  History,
+  Info,
+  LoaderCircle,
+  LogOut,
+  PanelLeft,
+  PanelLeftClose,
+  Plus,
+  ScanSearch,
+  Settings,
+  Settings2,
+  ShieldAlert,
+  ShieldCheck,
+  Shrink,
+  SlidersHorizontal,
+  Sparkles,
+  Square,
+  Terminal,
+  TestTube,
+  TriangleAlert,
+  Undo2,
+  Wrench,
+  X,
+} from "lucide";
+import DOMPurify from "dompurify";
+import { marked } from "marked";
+import "./style.css";
+
+type AnyRecord = Record<string, any>;
+
+const appRoot = document.querySelector<HTMLDivElement>("#app")!;
+if (!window.cagent) {
+  window.cagent = {
+    send(): void {},
+    onEvent(listener): () => void {
+      const timer = window.setTimeout(() => {
+        listener({
+          type: "ready",
+          session_id: "preview",
+          workspace: "Browser preview",
+          config: { model: "desktop preview", approval_mode: "auto-edit" },
+        });
+        listener({
+          type: "status",
+          busy: false,
+          steps: 0,
+          context: { tokens: 0, window: 128000, messages: 0, compactions: 0 },
+          config: { model: "desktop preview", approval_mode: "auto-edit" },
+        });
+      }, 0);
+      return () => window.clearTimeout(timer);
+    },
+    async chooseWorkspace(): Promise<null> { return null; },
+    minimize(): void {},
+    maximize(): void {},
+    close(): void {},
+  };
+}
+const uiIcons = {
+  ArrowDown,
+  ArrowUp,
+  ArrowUpRight,
+  Brain,
+  Check,
+  CheckCheck,
+  ChevronDown,
+  ChevronRight,
+  CircleCheck,
+  CircleHelp,
+  CircleX,
+  Coins,
+  Container,
+  Ellipsis,
+  Eraser,
+  FileCode2,
+  FolderOpen,
+  Gauge,
+  GitPullRequest,
+  History,
+  Info,
+  LoaderCircle,
+  LogOut,
+  PanelLeft,
+  PanelLeftClose,
+  Plus,
+  ScanSearch,
+  Settings,
+  Settings2,
+  ShieldAlert,
+  ShieldCheck,
+  Shrink,
+  SlidersHorizontal,
+  Sparkles,
+  Square,
+  Terminal,
+  TestTube,
+  TriangleAlert,
+  Undo2,
+  Wrench,
+  X,
+};
+const state = {
+  sessions: [] as AnyRecord[],
+  activeSession: "",
+  restoredFrom: "",
+  workspace: "",
+  config: {} as AnyRecord,
+  status: { busy: false, usage: {}, context: {}, steps: 0 } as AnyRecord,
+  pendingApproval: null as AnyRecord | null,
+  sidebarCollapsed: localStorage.getItem("cagent.sidebar") === "collapsed",
+  settingsOpen: false,
+  commandMenuOpen: false,
+  commandQuery: "",
+  showThinking: localStorage.getItem("cagent.thinking") !== "hidden",
+  assistantNode: null as HTMLElement | null,
+  assistantText: "",
+  toolNodes: new Map<string, HTMLElement>(),
+};
+
+const commands = [
+  ["/help", "Show command help", "circle-help"],
+  ["/tools", "List available tools", "wrench"],
+  ["/cost", "Show token usage and steps", "coins"],
+  ["/context", "Show context pressure", "gauge"],
+  ["/effort", "View or change reasoning effort", "brain"],
+  ["/approve", "Change approval mode", "shield-check"],
+  ["/sandbox", "Inspect or control Docker sandbox", "container"],
+  ["/undo", "Remove the latest turn from context", "undo-2"],
+  ["/clear", "Clear conversation context", "eraser"],
+  ["/resume", "Browse saved sessions", "history"],
+  ["/exit", "Close the session", "log-out"],
+] as const;
+
+function icon(name: string, size = 16): string {
+  return `<i data-lucide="${name}" width="${size}" height="${size}" aria-hidden="true"></i>`;
+}
+
+function renderIcons(): void {
+  createIcons({ icons: uiIcons, attrs: { "stroke-width": 1.8 } });
+}
+
+function escapeHtml(value: string): string {
+  return value.replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char]!);
+}
+
+function relativeDate(value: unknown): string {
+  if (typeof value !== "string") return "";
+  const date = new Date(value);
+  if (Number.isNaN(date.valueOf())) return "";
+  const seconds = Math.max(0, (Date.now() - date.valueOf()) / 1000);
+  if (seconds < 60) return "just now";
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`;
+  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ago`;
+  return date.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+}
+
+function markdown(value: string): string {
+  const html = marked.parse(value || "", { async: false }) as string;
+  return DOMPurify.sanitize(html, { USE_PROFILES: { html: true } });
+}
+
+function send(type: string, payload: AnyRecord = {}): void {
+  window.cagent.send({ type, ...payload });
+}
+
+function setBusy(busy: boolean): void {
+  state.status.busy = busy;
+  document.body.classList.toggle("is-busy", busy);
+  const input = document.querySelector<HTMLTextAreaElement>("#composer-input");
+  const sendButton = document.querySelector<HTMLButtonElement>("#send-button");
+  if (input) input.disabled = busy && !state.pendingApproval;
+  if (sendButton) sendButton.disabled = busy && !state.pendingApproval;
+  const stop = document.querySelector<HTMLButtonElement>("#stop-button");
+  if (stop) stop.hidden = !busy;
+  const submit = document.querySelector<HTMLButtonElement>("#send-button");
+  if (submit) submit.hidden = busy;
+  updateStatusBar();
+}
+
+function updateStatusBar(): void {
+  const activity = document.querySelector<HTMLElement>("#activity-label");
+  const statusDot = document.querySelector<HTMLElement>("#connection-dot");
+  const statusText = document.querySelector<HTMLElement>("#connection-text");
+  if (activity) activity.textContent = state.pendingApproval ? "Approval required" : state.status.busy ? "Agent is working" : "Ready";
+  if (statusDot) statusDot.className = `status-dot ${state.pendingApproval ? "attention" : state.status.busy ? "working" : "ready"}`;
+  if (statusText) statusText.textContent = state.pendingApproval ? "Action needs approval" : state.status.busy ? "Working" : "Connected";
+  const context = state.status.context || {};
+  const meter = document.querySelector<HTMLElement>("#context-meter");
+  const meterLabel = document.querySelector<HTMLElement>("#context-label");
+  const ratio = Number(context.window) ? Math.min(Number(context.tokens || 0) / Number(context.window), 1) : 0;
+  if (meter) meter.style.setProperty("--value", `${ratio * 100}%`);
+  if (meterLabel) meterLabel.textContent = `${Math.round(ratio * 100)}% context`;
+  const steps = document.querySelector<HTMLElement>("#steps-label");
+  if (steps) steps.textContent = `${state.status.steps || 0} steps`;
+  const model = document.querySelector<HTMLElement>("#model-label");
+  if (model) model.textContent = state.config.model || "Model not configured";
+}
+
+function shell(): void {
+  appRoot.innerHTML = `
+    <div class="window-shell ${state.sidebarCollapsed ? "sidebar-collapsed" : ""}">
+      <aside class="sessions-sidebar" id="sessions-sidebar">
+        <div class="brand-row">
+          <div class="brand-mark">c</div>
+          <div class="brand-copy"><strong>cagent</strong><span>coding workspace</span></div>
+          <button class="icon-button sidebar-toggle" id="collapse-sidebar" title="Collapse sessions sidebar" aria-label="Collapse sessions sidebar">${icon("panel-left-close")}</button>
+        </div>
+        <button class="new-session-button" id="new-session">${icon("plus", 17)}<span>New session</span></button>
+        <div class="sessions-heading"><span>Sessions</span><span class="session-count" id="session-count">0</span></div>
+        <div class="sessions-list" id="sessions-list"><div class="sessions-empty">No saved sessions yet.<br><span>Completed conversations appear here.</span></div></div>
+        <div class="sidebar-footer">
+          <button class="workspace-button" id="choose-workspace">${icon("folder-open", 16)}<span class="workspace-text"><small>Workspace</small><b id="workspace-label">Loading...</b></span>${icon("chevron-right", 15)}</button>
+          <button class="sidebar-settings" id="open-settings">${icon("settings", 16)}<span>Settings</span></button>
+        </div>
+      </aside>
+      <main class="main-panel">
+        <header class="topbar">
+          <div class="topbar-left">
+            <button class="icon-button mobile-menu" id="open-sessions" title="Show sessions" aria-label="Show sessions">${icon("panel-left", 17)}</button>
+            <div class="crumb"><span class="crumb-root">cagent</span><span class="crumb-separator">/</span><span id="session-crumb">new session</span></div>
+          </div>
+          <div class="topbar-right">
+            <div class="connection-state"><span class="status-dot ready" id="connection-dot"></span><span id="connection-text">Connecting</span></div>
+            <button class="topbar-control" id="approval-control" title="Approval mode">${icon("shield-check", 15)}<span id="approval-label">auto-edit</span>${icon("chevron-down", 14)}</button>
+            <button class="icon-button" id="open-settings-top" title="Session settings" aria-label="Session settings">${icon("sliders-horizontal", 17)}</button>
+          </div>
+        </header>
+        <section class="transcript-wrap" id="transcript-wrap">
+          <div class="transcript" id="transcript">
+            <div class="welcome" id="welcome">
+              <div class="welcome-kicker"><span class="status-dot ready"></span> Local agent workspace</div>
+              <h1>Ready for a task</h1>
+              <p class="welcome-copy">No messages in this session.</p>
+              <div class="quick-grid">
+                <button class="quick-action" data-prompt="Inspect this repository and summarize its architecture."><span class="quick-icon">${icon("scan-search", 19)}</span><span><b>Map this repository</b><small>Understand structure and conventions</small></span>${icon("arrow-up-right", 15)}</button>
+                <button class="quick-action" data-prompt="Run the test suite, diagnose any failures, and fix the smallest safe change."><span class="quick-icon amber">${icon("test-tube", 19)}</span><span><b>Run and fix tests</b><small>Let the agent verify each change</small></span>${icon("arrow-up-right", 15)}</button>
+                <button class="quick-action" data-prompt="Review the current git diff and point out correctness or security issues."><span class="quick-icon coral">${icon("git-pull-request", 19)}</span><span><b>Review a diff</b><small>Find risks before you commit</small></span>${icon("arrow-up-right", 15)}</button>
+              </div>
+            </div>
+          </div>
+          <div class="scroll-follow" id="scroll-follow">${icon("arrow-down", 14)} Jump to latest</div>
+        </section>
+        <section class="composer-area">
+          <div class="approval-slot" id="approval-slot"></div>
+          <div class="command-suggestions" id="command-suggestions"></div>
+          <div class="composer-box">
+            <textarea id="composer-input" rows="1" placeholder="Ask cagent to change your code..." aria-label="Message cagent"></textarea>
+            <div class="composer-tools">
+              <div class="composer-hints"><button class="tool-pill" id="slash-hint">${icon("terminal", 14)} Commands</button></div>
+              <div class="composer-actions"><button class="icon-button" id="clear-composer" title="Clear input" aria-label="Clear input">${icon("x", 16)}</button><button class="send-button" id="send-button" title="Send message">${icon("arrow-up", 17)}</button><button class="stop-button" id="stop-button" hidden title="Interrupt agent">${icon("square", 15)}<span>Stop</span></button></div>
+            </div>
+          </div>
+          <div class="activity-row"><span class="activity-icon">${icon(state.status.busy ? "loader-circle" : "sparkles", 14)}</span><span id="activity-label">Preparing workspace</span><span class="activity-divider"></span><span id="model-label">Model not configured</span><span class="activity-spacer"></span><span id="steps-label">0 steps</span><span class="context-meter" id="context-meter"><i></i></span><span id="context-label">0% context</span></div>
+        </section>
+      </main>
+      <div class="settings-panel" id="settings-panel" aria-hidden="true"><div class="settings-backdrop" id="settings-backdrop"></div><div class="settings-drawer"><div class="drawer-header"><div><span class="eyebrow">Session controls</span><h2>Configuration</h2></div><button class="icon-button" id="close-settings" title="Close settings" aria-label="Close settings">${icon("x", 18)}</button></div><div class="settings-body" id="settings-body"></div></div></div>
+      <div class="toast-region" id="toast-region"></div>
+    </div>`;
+  bindUI();
+  renderIcons();
+}
+
+function bindUI(): void {
+  document.querySelector("#collapse-sidebar")?.addEventListener("click", () => {
+    state.sidebarCollapsed = !state.sidebarCollapsed;
+    localStorage.setItem("cagent.sidebar", state.sidebarCollapsed ? "collapsed" : "expanded");
+    document.querySelector(".window-shell")?.classList.toggle("sidebar-collapsed", state.sidebarCollapsed);
+  });
+  document.querySelector("#open-sessions")?.addEventListener("click", () => document.querySelector(".window-shell")?.classList.toggle("sessions-open"));
+  document.querySelector("#new-session")?.addEventListener("click", newSession);
+  document.querySelector("#choose-workspace")?.addEventListener("click", chooseWorkspace);
+  document.querySelector("#open-settings")?.addEventListener("click", () => openSettings());
+  document.querySelector("#open-settings-top")?.addEventListener("click", () => openSettings());
+  document.querySelector("#close-settings")?.addEventListener("click", closeSettings);
+  document.querySelector("#settings-backdrop")?.addEventListener("click", closeSettings);
+  document.querySelector("#send-button")?.addEventListener("click", submitComposer);
+  document.querySelector("#stop-button")?.addEventListener("click", () => send("interrupt"));
+  document.querySelector("#clear-composer")?.addEventListener("click", () => {
+    const input = document.querySelector<HTMLTextAreaElement>("#composer-input");
+    if (input) { input.value = ""; input.focus(); }
+  });
+  document.querySelector("#slash-hint")?.addEventListener("click", () => {
+    const input = document.querySelector<HTMLTextAreaElement>("#composer-input");
+    if (input) { input.value = "/"; input.focus(); updateCommandMenu(); }
+  });
+  document.querySelector("#composer-input")?.addEventListener("input", () => {
+    resizeComposer();
+    updateCommandMenu();
+  });
+  document.querySelector<HTMLTextAreaElement>("#composer-input")?.addEventListener("keydown", (event: KeyboardEvent) => {
+    const input = event.currentTarget as HTMLTextAreaElement;
+    if (event.key === "ArrowDown" && state.commandMenuOpen) { event.preventDefault(); return; }
+    if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); submitComposer(); }
+    if (event.key === "Escape") { state.commandMenuOpen = false; updateCommandMenu(); }
+    if (event.key === "Tab" && state.commandMenuOpen) { event.preventDefault(); const command = filteredCommands()[0]?.[0]; if (command) { input.value = command + " "; updateCommandMenu(); } }
+  });
+  document.querySelectorAll<HTMLButtonElement>(".quick-action").forEach((button) => button.addEventListener("click", () => {
+    const input = document.querySelector<HTMLTextAreaElement>("#composer-input");
+    if (input) { input.value = button.dataset.prompt || ""; input.focus(); resizeComposer(); }
+  }));
+  document.querySelector("#approval-control")?.addEventListener("click", () => {
+    const current = state.config.approval_mode || "auto-edit";
+    const next = current === "suggest" ? "auto-edit" : current === "auto-edit" ? "full-auto" : "suggest";
+    send("command", { command: `/approve ${next}` });
+    toast(`Approval mode: ${next}`, "success");
+  });
+  document.addEventListener("keydown", (event) => {
+    if (event.ctrlKey && event.key.toLowerCase() === "n") { event.preventDefault(); newSession(); }
+    if (event.ctrlKey && event.key.toLowerCase() === "r") { event.preventDefault(); openSessionPicker(); }
+    if (event.ctrlKey && event.key.toLowerCase() === "q") { event.preventDefault(); send("shutdown"); window.cagent.close(); }
+    if (event.key === "Escape" && state.settingsOpen) closeSettings();
+  });
+  document.querySelector("#transcript-wrap")?.addEventListener("scroll", () => {
+    const wrap = document.querySelector<HTMLElement>("#transcript-wrap");
+    const follow = document.querySelector<HTMLElement>("#scroll-follow");
+    if (wrap && follow) follow.classList.toggle("visible", wrap.scrollHeight - wrap.scrollTop - wrap.clientHeight > 180);
+  });
+}
+
+function resizeComposer(): void {
+  const input = document.querySelector<HTMLTextAreaElement>("#composer-input");
+  if (!input) return;
+  input.style.height = "auto";
+  input.style.height = `${Math.min(Math.max(input.scrollHeight, 27), 150)}px`;
+}
+
+function filteredCommands(): readonly (readonly [string, string, string])[] {
+  const query = state.commandQuery.toLowerCase();
+  return commands.filter(([command, description]) => !query || command.includes(query) || description.toLowerCase().includes(query));
+}
+
+function updateCommandMenu(): void {
+  const input = document.querySelector<HTMLTextAreaElement>("#composer-input");
+  const menu = document.querySelector<HTMLElement>("#command-suggestions");
+  if (!input || !menu) return;
+  const value = input.value;
+  state.commandMenuOpen = value.startsWith("/") && !value.includes("\n") && !value.includes(" ");
+  state.commandQuery = value.slice(1);
+  if (!state.commandMenuOpen) { menu.innerHTML = ""; menu.classList.remove("open"); return; }
+  menu.classList.add("open");
+  menu.innerHTML = filteredCommands().slice(0, 7).map(([command, description, lucide]) => `<button class="suggestion" data-command="${command}">${icon(lucide, 15)}<b>${command}</b><span>${description}</span></button>`).join("");
+  menu.querySelectorAll<HTMLButtonElement>(".suggestion").forEach((button) => button.addEventListener("click", () => {
+    input.value = `${button.dataset.command} `; input.focus(); state.commandMenuOpen = false; updateCommandMenu(); resizeComposer();
+  }));
+  renderIcons();
+}
+
+function submitComposer(): void {
+  const input = document.querySelector<HTMLTextAreaElement>("#composer-input");
+  if (!input || !input.value.trim()) return;
+  const text = input.value.trim();
+  input.value = ""; resizeComposer(); updateCommandMenu();
+  send("turn", { text });
+}
+
+function newSession(): void {
+  if (state.status.busy) { toast("Interrupt the current turn before starting a new session", "warning"); return; }
+  clearTranscript();
+  send("new_session");
+  document.querySelector("#session-crumb")!.textContent = "new session";
+  toast("Starting a fresh session", "neutral");
+}
+
+async function chooseWorkspace(): Promise<void> {
+  if (state.status.busy) { toast("Finish the current operation first", "warning"); return; }
+  const selected = await window.cagent.chooseWorkspace();
+  if (selected) { state.workspace = selected; toast(`Workspace changed to ${selected}`, "success"); }
+}
+
+function openSessionPicker(): void {
+  if (state.sidebarCollapsed) {
+    state.sidebarCollapsed = false;
+    document.querySelector(".window-shell")?.classList.remove("sidebar-collapsed");
+  }
+  document.querySelector(".window-shell")?.classList.add("sessions-open");
+  document.querySelector("#sessions-list")?.scrollIntoView({ behavior: "smooth" });
+}
+
+function clearTranscript(): void {
+  const transcript = document.querySelector<HTMLElement>("#transcript");
+  if (transcript) transcript.innerHTML = `<div class="welcome" id="welcome"><div class="welcome-kicker"><span class="status-dot ready"></span> New local session</div><h1>Ready for a task</h1><p class="welcome-copy">No messages in this session.</p></div>`;
+  state.assistantNode = null; state.assistantText = ""; state.toolNodes.clear(); state.pendingApproval = null; renderApproval(); renderIcons();
+}
+
+function appendBlock(className: string, html: string): HTMLElement {
+  const transcript = document.querySelector<HTMLElement>("#transcript")!;
+  document.querySelector("#welcome")?.remove();
+  const node = document.createElement("article");
+  node.className = `message-block ${className}`;
+  node.innerHTML = html;
+  transcript.appendChild(node);
+  scrollToLatest();
+  return node;
+}
+
+function scrollToLatest(): void {
+  const wrap = document.querySelector<HTMLElement>("#transcript-wrap");
+  if (wrap) requestAnimationFrame(() => { wrap.scrollTop = wrap.scrollHeight; });
+}
+
+function renderUser(text: string): void {
+  appendBlock("user-block", `<div class="message-meta"><span class="avatar user-avatar">YOU</span><span class="message-label">You</span><time>now</time></div><div class="user-content">${escapeHtml(text).replace(/\n/g, "<br>")}</div>`);
+}
+
+function ensureAssistant(): HTMLElement {
+  if (state.assistantNode) return state.assistantNode;
+  state.assistantText = "";
+  state.assistantNode = appendBlock("assistant-block", `<div class="message-meta"><span class="avatar agent-avatar">c</span><span class="message-label">cagent</span><span class="live-pill"><i></i> LIVE</span><time>now</time></div><div class="assistant-content prose"></div>`);
+  return state.assistantNode;
+}
+
+function appendThinking(text: string): void {
+  if (!state.showThinking) return;
+  const node = ensureAssistant();
+  let thinking = node.querySelector<HTMLDetailsElement>(".thinking-content");
+  if (!thinking) {
+    thinking = document.createElement("details"); thinking.className = "thinking-content"; thinking.open = false;
+    thinking.innerHTML = `<summary>${icon("brain", 14)} Reasoning trace <span>streaming</span></summary><div class="thinking-text"></div>`;
+    node.insertBefore(thinking, node.querySelector(".assistant-content")); renderIcons();
+  }
+  thinking.querySelector(".thinking-text")!.textContent += text;
+}
+
+function appendAssistant(text: string): void {
+  if (!text) return;
+  const node = ensureAssistant(); state.assistantText += text;
+  node.querySelector<HTMLElement>(".assistant-content")!.innerHTML = markdown(state.assistantText);
+  scrollToLatest();
+}
+
+function renderParts(message: AnyRecord): string {
+  if (!Array.isArray(message.parts)) return "";
+  return message.parts.map((part: AnyRecord) => part.type === "text" ? markdown(String(part.text || "")) : part.type === "thinking" ? `<details class="replayed-thinking"><summary>${icon("brain", 13)} Reasoning trace</summary><div>${escapeHtml(String(part.text || ""))}</div></details>` : "").join("");
+}
+
+function renderToolStarted(event: AnyRecord): void {
+  state.assistantNode = null;
+  state.assistantText = "";
+  const id = String(event.call?.id || event.id || crypto.randomUUID());
+  const name = String(event.call?.name || event.name || "tool");
+  const args = event.call?.arguments || event.arguments || {};
+  const node = appendBlock("tool-block", `<div class="tool-card running"><div class="tool-card-head"><span class="tool-icon">${icon(name === "run_bash" ? "terminal" : "file-code-2", 16)}</span><div class="tool-title"><b>${escapeHtml(name)}</b><span>Executing capability</span></div><span class="risk-tag ${String(event.risk || "SAFE").toLowerCase()}">${String(event.risk || "safe").toLowerCase()}</span><span class="tool-spinner">${icon("loader-circle", 15)}</span></div><div class="tool-args"><code>${escapeHtml(JSON.stringify(args, null, 2))}</code></div><div class="tool-output" id="tool-output-${CSS.escape(id)}"></div></div>`);
+  state.toolNodes.set(id, node);
+  renderIcons();
+}
+
+function renderToolFinished(event: AnyRecord): void {
+  const id = String(event.call?.id || event.id || "");
+  const node = state.toolNodes.get(id);
+  if (!node) { renderToolStarted(event); return renderToolFinished(event); }
+  const card = node.querySelector<HTMLElement>(".tool-card");
+  const output = node.querySelector<HTMLElement>(".tool-output");
+  card?.classList.remove("running"); card?.classList.add(event.outcome?.is_error || event.is_error ? "error" : "done");
+  const spinner = node.querySelector(".tool-spinner"); if (spinner) spinner.innerHTML = icon(event.outcome?.is_error || event.is_error ? "circle-x" : "circle-check", 15);
+  if (output) output.innerHTML = `<pre>${escapeHtml(String(event.outcome?.content || event.content || "No output"))}</pre><span class="tool-duration">${Number(event.duration_s || 0).toFixed(2)}s${event.truncated ? " · truncated" : ""}</span>`;
+  renderIcons(); scrollToLatest();
+}
+
+function renderApproval(): void {
+  const slot = document.querySelector<HTMLElement>("#approval-slot");
+  if (!slot) return;
+  if (!state.pendingApproval) { slot.innerHTML = ""; slot.classList.remove("open"); return; }
+  const request = state.pendingApproval.request || state.pendingApproval;
+  const risk = String(request.risk || "MUTATING").toLowerCase();
+  const canAlways = risk !== "dangerous" && !request.always_prompt;
+  slot.classList.add("open");
+  slot.innerHTML = `<div class="approval-card ${risk}"><div class="approval-heading"><span class="approval-symbol">${icon(risk === "dangerous" ? "triangle-alert" : "shield-alert", 17)}</span><div><b>Approval required</b><span>${escapeHtml(String(request.tool || "tool"))} wants to run</span></div><span class="risk-tag ${risk}">${risk}</span></div><p>${escapeHtml(String(request.summary || "This action may modify your workspace."))}</p>${request.detail ? `<details><summary>View details</summary><pre>${escapeHtml(String(request.detail))}</pre></details>` : ""}<div class="approval-actions"><button class="approval-deny" data-approval="deny">Deny</button><button class="approval-always" data-approval="always" ${canAlways ? "" : "disabled"}>${icon("check-check", 14)} Always allow</button><button class="approval-allow" data-approval="approve">${icon("check", 14)} Allow once</button></div></div>`;
+  slot.querySelectorAll<HTMLButtonElement>("[data-approval]").forEach((button) => button.addEventListener("click", () => {
+    const decision = button.dataset.approval!; send("approval", { decision }); state.pendingApproval = null; renderApproval();
+  }));
+  renderIcons(); scrollToLatest();
+}
+
+function renderSessions(): void {
+  const list = document.querySelector<HTMLElement>("#sessions-list");
+  const count = document.querySelector<HTMLElement>("#session-count");
+  if (!list || !count) return;
+  count.textContent = String(state.sessions.length);
+  if (!state.sessions.length) { list.innerHTML = `<div class="sessions-empty">No saved sessions yet.<br><span>Completed conversations appear here.</span></div>`; return; }
+  const selectedSession = state.restoredFrom || state.activeSession;
+  list.innerHTML = state.sessions.map((session) => `<button class="session-item ${session.id === selectedSession ? "active" : ""}" data-path="${escapeHtml(String(session.path))}"><span class="session-status ${session.status === "finished" ? "done" : "paused"}"></span><span class="session-info"><b>${escapeHtml(String(session.prompt || "Untitled session"))}</b><span><time>${relativeDate(session.modified)}</time><i></i>${session.steps || 0} steps</span></span><span class="session-more">${icon("ellipsis", 15)}</span></button>`).join("");
+  list.querySelectorAll<HTMLButtonElement>(".session-item").forEach((button) => button.addEventListener("click", () => {
+    if (state.status.busy) { toast("Interrupt the current turn before resuming", "warning"); return; }
+    clearTranscript(); send("resume", { path: button.dataset.path }); document.querySelector(".window-shell")?.classList.remove("sessions-open");
+  }));
+  renderIcons();
+}
+
+function renderHistory(messages: AnyRecord[], source = "resumed session"): void {
+  clearTranscript();
+  appendBlock("system-notice", `<div class="notice-icon">${icon("history", 15)}</div><div><b>Context restored</b><span>${escapeHtml(source)} · prior turns are available to the agent</span></div>`);
+  for (const message of messages || []) {
+    if (message.role === "user") appendBlock("user-block", `<div class="message-meta"><span class="avatar user-avatar">YOU</span><span class="message-label">You</span></div><div class="user-content">${escapeHtml(message.parts?.map((p: AnyRecord) => p.text || "").join("") || "").replace(/\n/g, "<br>")}</div>`);
+    else if (message.role === "assistant") appendBlock("assistant-block", `<div class="message-meta"><span class="avatar agent-avatar">c</span><span class="message-label">cagent</span></div><div class="assistant-content prose">${renderParts(message)}</div>`);
+  }
+  state.assistantNode = null; state.assistantText = ""; renderIcons();
+}
+
+function openSettings(): void {
+  state.settingsOpen = true;
+  const panel = document.querySelector<HTMLElement>("#settings-panel"); panel?.setAttribute("aria-hidden", "false"); panel?.classList.add("open");
+  renderSettings();
+}
+
+function closeSettings(): void {
+  state.settingsOpen = false;
+  const panel = document.querySelector<HTMLElement>("#settings-panel"); panel?.setAttribute("aria-hidden", "true"); panel?.classList.remove("open");
+}
+
+function renderSettings(): void {
+  const body = document.querySelector<HTMLElement>("#settings-body"); if (!body) return;
+  const config = state.config;
+  body.innerHTML = `<div class="settings-section"><span class="eyebrow">Endpoint</span><div class="setting-row"><label>Model</label><b>${escapeHtml(String(config.model || "not configured"))}</b></div><div class="setting-row"><label>Wire</label><b>${escapeHtml(String(config.wire || "openai"))}</b></div><label class="setting-field">Reasoning effort<select id="effort-select"><option value="default">provider default</option><option value="none">none</option><option value="minimal">minimal</option><option value="low">low</option><option value="medium">medium</option><option value="high">high</option><option value="xhigh">xhigh</option><option value="max">max</option></select></label><label class="toggle-field"><span><b>Reasoning trace</b><small>Show streamed thinking in transcript</small></span><input id="thinking-toggle" type="checkbox" ${state.showThinking ? "checked" : ""}><i></i></label></div><div class="settings-section"><span class="eyebrow">Safety</span><label class="setting-field">Approval mode<select id="approval-select"><option value="suggest">suggest</option><option value="auto-edit">auto-edit</option><option value="full-auto">full-auto</option></select></label><div class="setting-row"><label>Sandbox</label><b>${escapeHtml(String(config.sandbox || config.sandbox_mode || "host"))}</b></div><div class="setting-row"><label>Network</label><b>${config.sandbox_network ? "bridge enabled" : "disabled"}</b></div><label class="setting-field">Sync policy<select id="sandbox-sync"><option value="never">never</option><option value="ask">ask</option><option value="always">always</option></select></label><label class="setting-input"><span>Docker image</span><span><input id="sandbox-image" value="${escapeHtml(String(config.sandbox_image || "python:3.12-slim"))}"><button id="set-sandbox-image">Set</button></span></label><div class="sandbox-actions"><button data-sandbox="status">${icon("info", 14)} Status</button><button data-sandbox="on">${icon("container", 14)} Enable</button><button data-sandbox="apply">${icon("check-check", 14)} Apply</button><button data-sandbox="rollback">${icon("undo-2", 14)} Roll back</button><button class="danger-control" data-sandbox="off">${icon("square", 13)} Disable</button></div></div><div class="settings-section"><span class="eyebrow">Context</span><div class="setting-row"><label>Workspace</label><b class="path-value">${escapeHtml(String(state.workspace || config.workspace || "loading"))}</b></div><div class="setting-row"><label>Trace directory</label><b class="path-value">${escapeHtml(String(config.trace_dir || "off"))}</b></div><div class="setting-row"><label>Window</label><b>${Number(config.context_window || state.status.context?.window || 0).toLocaleString()} tokens</b></div></div>`;
+  const select = body.querySelector<HTMLSelectElement>("#approval-select"); if (select) { select.value = config.approval_mode || "auto-edit"; select.addEventListener("change", () => { send("command", { command: `/approve ${select.value}` }); toast(`Approval mode: ${select.value}`, "success"); }); }
+  const effort = body.querySelector<HTMLSelectElement>("#effort-select"); if (effort) { effort.value = config.reasoning_effort || "default"; effort.addEventListener("change", () => send("command", { command: `/effort ${effort.value}` })); }
+  const thinking = body.querySelector<HTMLInputElement>("#thinking-toggle"); thinking?.addEventListener("change", () => { state.showThinking = thinking.checked; localStorage.setItem("cagent.thinking", thinking.checked ? "shown" : "hidden"); });
+  const sync = body.querySelector<HTMLSelectElement>("#sandbox-sync"); if (sync) { sync.value = config.sandbox_sync || "ask"; sync.addEventListener("change", () => send("command", { command: `/sandbox sync ${sync.value}` })); }
+  body.querySelector("#set-sandbox-image")?.addEventListener("click", () => { const image = body.querySelector<HTMLInputElement>("#sandbox-image")?.value.trim(); if (image) send("command", { command: `/sandbox image ${image}` }); });
+  body.querySelectorAll<HTMLButtonElement>("[data-sandbox]").forEach((button) => button.addEventListener("click", () => send("command", { command: `/sandbox ${button.dataset.sandbox}` })));
+  renderIcons();
+}
+
+function toast(message: string, tone: "success" | "warning" | "neutral" = "neutral"): void {
+  const region = document.querySelector<HTMLElement>("#toast-region"); if (!region) return;
+  const item = document.createElement("div"); item.className = `toast ${tone}`; item.innerHTML = `${icon(tone === "warning" ? "triangle-alert" : tone === "success" ? "circle-check" : "info", 15)}<span>${escapeHtml(message)}</span>`; region.appendChild(item); renderIcons(); setTimeout(() => item.remove(), 4200);
+}
+
+function handleEvent(event: AnyRecord): void {
+  switch (event.type) {
+    case "ready": state.activeSession = String(event.session_id || ""); state.workspace = String(event.workspace || ""); state.config = { ...state.config, ...(event.config || {}) }; updateWorkspace(); updateStatusBar(); break;
+    case "backend_restarting": state.workspace = String(event.workspace || ""); updateWorkspace(); break;
+    case "sessions": state.sessions = Array.isArray(event.sessions) ? event.sessions : []; state.activeSession = String(event.active_id || state.activeSession); state.restoredFrom = String(event.restored_from || ""); renderSessions(); break;
+    case "status": state.status = { ...state.status, ...event }; state.config = { ...state.config, ...(event.config || {}) }; updateStatusBar(); updateWorkspace(); if (state.settingsOpen) renderSettings(); break;
+    case "busy_changed": setBusy(Boolean(event.busy)); break;
+    case "run_started": state.config = { ...state.config, model: event.model, endpoint: event.endpoint, tools: event.tool_names, sandbox: event.sandbox_status, shell_access: event.shell_access }; updateStatusBar(); break;
+    case "activity": updateStatusBar(); if (document.querySelector("#activity-label")) document.querySelector("#activity-label")!.textContent = String(event.message || "Working"); break;
+    case "user_message": renderUser(String(event.text || "")); state.assistantNode = null; break;
+    case "thinking_delta": appendThinking(String(event.text || "")); break;
+    case "text_delta": appendAssistant(String(event.text || "")); break;
+    case "step_started": { const node = ensureAssistant(); node.querySelector(".live-pill")?.classList.add("active"); break; }
+    case "step_finished": { const text = renderParts(event.message || {}); if (text && !state.assistantText) { const node = ensureAssistant(); node.querySelector<HTMLElement>(".assistant-content")!.innerHTML = text; } break; }
+    case "tool_started": renderToolStarted(event); break;
+    case "tool_finished": renderToolFinished(event); break;
+    case "approval_requested": state.pendingApproval = event; renderApproval(); break;
+    case "approval_decided": state.pendingApproval = null; renderApproval(); break;
+    case "warning": appendBlock("warning-block", `<span class="warning-symbol">${icon("triangle-alert", 16)}</span><div><b>${escapeHtml(String(event.message || "Warning"))}</b>${event.detail ? `<pre>${escapeHtml(String(event.detail))}</pre>` : ""}</div>`); toast(String(event.message || "Warning"), "warning"); break;
+    case "compaction_done": appendBlock("system-notice", `<div class="notice-icon">${icon("shrink", 15)}</div><div><b>Context compacted</b><span>${escapeHtml(String(event.strategy || "optimized"))} · ${Number(event.tokens_before || 0).toLocaleString()} → ${Number(event.tokens_after || 0).toLocaleString()} tokens</span></div>`); break;
+    case "turn_finished": state.assistantNode?.querySelector(".live-pill")?.remove(); state.assistantNode = null; scrollToLatest(); break;
+    case "turn_complete": state.assistantNode = null; break;
+    case "command_result": if (event.output) appendBlock("command-block", `<div class="command-head">${icon("terminal", 14)}<b>${escapeHtml(String(event.command || "command"))}</b></div><pre>${escapeHtml(String(event.output))}</pre>`); if (event.error) toast(String(event.error), "warning"); break;
+    case "history_restored": renderHistory((event.messages || []) as AnyRecord[], String(event.source || "saved session")); if (event.warning) toast(String(event.warning), "warning"); break;
+    case "history_cleared": clearTranscript(); break;
+    case "resume_error": toast(String(event.message || "Could not resume session"), "warning"); break;
+    case "protocol_error": toast(String(event.message || "Invalid command"), "warning"); break;
+    case "worker_error": toast(String(event.message || "Agent worker failed"), "warning"); appendBlock("warning-block", `<span class="warning-symbol">${icon("circle-x", 16)}</span><div><b>Worker error</b><pre>${escapeHtml(String(event.message || ""))}</pre></div>`); break;
+    case "fatal_error": setBusy(false); toast(String(event.message || "Backend configuration is incomplete"), "warning"); appendBlock("setup-block", `<div class="setup-icon">${icon("settings-2", 21)}</div><div><b>Finish local setup to start cagent</b><p>${escapeHtml(String(event.message || "Set base_url, model, and api_key in .cagent.toml."))}</p><code>Copy .cagent.example.toml to .cagent.toml, then relaunch.</code></div>`); break;
+    case "bridge_log": if (event.level === "error") toast(String(event.message || "Backend log"), "warning"); break;
+  }
+}
+
+function updateWorkspace(): void {
+  const label = document.querySelector<HTMLElement>("#workspace-label"); if (label) label.textContent = state.workspace ? state.workspace.split(/[\\/]/).at(-1) || state.workspace : "Loading...";
+  const crumb = document.querySelector<HTMLElement>("#session-crumb"); if (crumb && state.restoredFrom) crumb.textContent = state.restoredFrom;
+  const approval = document.querySelector<HTMLElement>("#approval-label"); if (approval) approval.textContent = state.config.approval_mode || "auto-edit";
+}
+
+shell();
+window.cagent.onEvent(handleEvent);
+send("status");

@@ -63,6 +63,28 @@ def test_snapshot_changes_do_not_touch_real_project(tmp_path: Path, monkeypatch)
         session.close()
 
 
+def test_nested_generated_directories_are_ignored_consistently(
+    tmp_path: Path, monkeypatch
+) -> None:
+    nested = tmp_path / "desktop"
+    (nested / "node_modules" / "pkg").mkdir(parents=True)
+    (nested / "node_modules" / "pkg" / "index.js").write_text("module", encoding="utf-8")
+    (nested / "dist" / "assets").mkdir(parents=True)
+    (nested / "dist" / "assets" / "app.js").write_text("bundle", encoding="utf-8")
+    (nested / "src").mkdir()
+    (nested / "src" / "main.ts").write_text("export {}", encoding="utf-8")
+    monkeypatch.setattr(sandbox_module, "docker_available", lambda: True)
+    session = SandboxSession.create(_config(tmp_path))
+    assert session is not None
+    try:
+        assert session.changed_paths == ()
+        assert not (session.workspace / "desktop" / "node_modules").exists()
+        assert not (session.workspace / "desktop" / "dist").exists()
+        assert (session.workspace / "desktop" / "src" / "main.ts").exists()
+    finally:
+        session.close()
+
+
 def test_snapshot_deletions_are_applied_after_review(tmp_path: Path, monkeypatch) -> None:
     (tmp_path / "remove.txt").write_text("remove\n", encoding="utf-8")
     monkeypatch.setattr(sandbox_module, "docker_available", lambda: True)

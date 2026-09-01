@@ -106,8 +106,11 @@ def _relative(path: Path, root: Path) -> str:
 
 
 def _is_ignored(relative: str) -> bool:
-    first = relative.split("/", 1)[0]
-    return first in _IGNORED_SYNC_ROOTS or _is_secret_file(first)
+    # ``copytree`` excludes these directories at every depth.  The manifest
+    # must apply the same rule, otherwise a nested desktop/node_modules or
+    # package/dist appears as a deletion when the disposable snapshot closes.
+    parts = relative.split("/")
+    return any(part in _IGNORED_SYNC_ROOTS or _is_secret_file(part) for part in parts)
 
 
 def _is_secret_file(name: str) -> bool:
