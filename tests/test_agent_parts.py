@@ -686,6 +686,183 @@ class TestRepoMap:
         assert build_repo_map(tmp_path, token_budget=0).is_empty()
 
 
+class TestChineseQueries:
+    """A Chinese task must rank an English codebase.
+
+    It cannot do so by matching: paths and symbols in a Chinese project are
+    almost always English. Before translation and bigrams were added, every
+    Chinese query scored exactly the base structural score and the agent got
+    the same map no matter what was asked.
+    """
+
+    @staticmethod
+    def _project(tmp_path: Path) -> Path:
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "orders.py").write_text(
+            '"""Order lifecycle."""\n\n'
+            "def paginate_orders(limit, cursor):\n"
+            "    return []\n",
+            encoding="utf-8",
+        )
+        (tmp_path / "src" / "billing.py").write_text(
+            "def charge(amount): pass\n", encoding="utf-8"
+        )
+        (tmp_path / "main.py").write_text(
+            "".join(f"def generic_{index}(): pass\n" for index in range(20)),
+            encoding="utf-8",
+        )
+        return tmp_path
+
+    def test_a_chinese_task_ranks_the_english_file_it_describes(
+        self, tmp_path: Path
+    ) -> None:
+        workspace = self._project(tmp_path)
+
+        result = build_repo_map(workspace, token_budget=1200, query="修复订单分页的错误")
+
+        assert result.outlines[0].path == "src/orders.py"
+
+    def test_an_unrelated_chinese_task_does_not_promote_it(self, tmp_path: Path) -> None:
+        # The translation dictionary must discriminate, not just fire.
+        workspace = self._project(tmp_path)
+
+        result = build_repo_map(workspace, token_budget=1200, query="帮我看看支付回调的签名")
+
+        assert result.outlines[0].path != "src/orders.py"
+
+    def test_chinese_comments_are_searchable(self, tmp_path: Path) -> None:
+        # The only Chinese in a Chinese codebase is in its comments, and a term
+        # with no English translation can be found nowhere else.
+        (tmp_path / "handler_a.py").write_text(
+            "# 处理海关报关单的申报流程\ndef run(): pass\n", encoding="utf-8"
+        )
+        (tmp_path / "handler_b.py").write_text(
+            "# 生成对账单\ndef run(): pass\n", encoding="utf-8"
+        )
+
+        result = build_repo_map(tmp_path, token_budget=1200, query="报关单申报有问题")
+
+        assert result.outlines[0].path == "handler_a.py"
+
+    def test_a_chinese_query_still_ranks_when_nothing_matches(
+        self, tmp_path: Path
+    ) -> None:
+        (tmp_path / "mod.py").write_text("def f(): pass\n", encoding="utf-8")
+
+        result = build_repo_map(tmp_path, token_budget=1200, query="随便写点什么")
+
+        assert result.files_included == 1
+
+
+class TestRanking:
+    def test_a_short_accidental_substring_no_longer_scores(self, tmp_path: Path) -> None:
+        # "is" appears inside "history"; substring matching used to award the
+        # full path bonus for that and outrank the file the task named.
+        (tmp_path / "history").mkdir()
+        (tmp_path / "history" / "store.py").write_text("def load(): pass\n", encoding="utf-8")
+        (tmp_path / "invoice.py").write_text("def build_invoice(): pass\n", encoding="utf-8")
+
+        result = build_repo_map(tmp_path, token_budget=1200, query="what is the invoice")
+
+        assert result.outlines[0].path == "invoice.py"
+
+    def test_a_word_matches_across_a_morphological_ending(self, tmp_path: Path) -> None:
+        (tmp_path / "paging.py").write_text("def paginate(rows): pass\n", encoding="utf-8")
+        (tmp_path / "unrelated.py").write_text("def helper(): pass\n", encoding="utf-8")
+
+        result = build_repo_map(tmp_path, token_budget=1200, query="pagination is broken")
+
+        assert result.outlines[0].path == "paging.py"
+
+    def test_a_docstring_matches_a_task_phrased_as_prose(self, tmp_path: Path) -> None:
+        # Identifiers say what a file is called; the docstring says what it is
+        # for, and a task is written the second way.
+        (tmp_path / "gw.py").write_text(
+            '"""Retry and back off failed webhook deliveries."""\n\n'
+            "def run(payload): pass\n",
+            encoding="utf-8",
+        )
+        (tmp_path / "misc.py").write_text("def run(payload): pass\n", encoding="utf-8")
+
+        result = build_repo_map(tmp_path, token_budget=1200, query="webhook delivery backoff")
+
+        assert result.outlines[0].path == "gw.py"
+
+    def test_a_term_in_every_file_does_not_decide_the_ranking(
+        self, tmp_path: Path
+    ) -> None:
+        for index in range(8):
+            (tmp_path / f"handler_{index}.py").write_text(
+                "def handle(): pass\n", encoding="utf-8"
+            )
+        (tmp_path / "handler_refund.py").write_text(
+            "def handle_refund(): pass\n", encoding="utf-8"
+        )
+
+        result = build_repo_map(tmp_path, token_budget=1200, query="handler for a refund")
+
+        assert result.outlines[0].path == "handler_refund.py"
+
+
+class TestMapLayers:
+    def test_the_index_layer_is_stable_when_no_task_is_supplied(
+        self, tmp_path: Path
+    ) -> None:
+        # This is the layer the system prompt renders, and it renders it without
+        # a query precisely so the provider's cached prefix survives the turn.
+        (tmp_path / "alpha.py").write_text("def alpha(): pass\n", encoding="utf-8")
+        (tmp_path / "beta.py").write_text("def beta(): pass\n", encoding="utf-8")
+        index = RepoMapIndex(tmp_path)
+        index.refresh()
+
+        assert index.render(token_budget=800).text == index.render(token_budget=800).text
+        assert index.render(token_budget=800).text != index.render(
+            token_budget=800, query="fix beta"
+        ).text
+
+    def test_the_details_layer_is_a_ranked_shortlist(self, tmp_path: Path) -> None:
+        for name in ("alpha", "beta", "gamma"):
+            (tmp_path / f"{name}.py").write_text(f"def {name}(): pass\n", encoding="utf-8")
+        index = RepoMapIndex(tmp_path)
+        index.refresh()
+
+        focus = index.render(token_budget=800, query="fix gamma", layers="details")
+
+        assert focus.outlines[0].path == "gamma.py"
+        assert "def gamma()" in focus.text
+
+    def test_an_already_shown_file_is_abbreviated_rather_than_dropped(
+        self, tmp_path: Path
+    ) -> None:
+        # Its rank is the new information; its declarations are not.
+        (tmp_path / "alpha.py").write_text("def alpha_handler(): pass\n", encoding="utf-8")
+        index = RepoMapIndex(tmp_path)
+        index.refresh()
+
+        focus = index.render(
+            token_budget=800,
+            query="fix alpha",
+            layers="details",
+            abbreviate=("alpha.py",),
+        )
+
+        assert "alpha.py" in focus.text
+        assert "alpha_handler" not in focus.text
+
+    def test_the_details_layer_respects_its_budget(self, tmp_path: Path) -> None:
+        for index_ in range(30):
+            (tmp_path / f"mod{index_}.py").write_text(
+                "".join(f"def fn_{index_}_{k}(argument): pass\n" for k in range(12)),
+                encoding="utf-8",
+            )
+        index = RepoMapIndex(tmp_path)
+        index.refresh()
+
+        focus = index.render(token_budget=200, query="fn argument", layers="details")
+
+        assert 0 < focus.tokens <= 200
+
+
 class TestPromptBuilder:
     def test_the_prompt_names_the_environment_and_tools(self, config: AgentConfig) -> None:
         from cagent.tools.registry import default_registry

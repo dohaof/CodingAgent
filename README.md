@@ -185,7 +185,9 @@ cached_input_per_m = 0.07
 | `bash_timeout` | `120` | shell 命令默认超时时间（秒） |
 | `approval_mode` | `auto-edit` | `suggest`、`auto-edit` 或 `full-auto` |
 | `repo_map_enabled` | `true` | 是否生成 Repo Map |
-| `repo_map_token_budget` | `1600` | Repo Map 使用的 token 预算 |
+| `repo_map_token_budget` | `1600` | 结构索引的 token 预算；放在系统提示词里，逐轮不变以便命中 provider 的前缀缓存 |
+| `repo_map_focus_token_budget` | `1200` | 任务相关文件清单的 token 预算；随每轮用户输入发送，因此重排不会作废缓存 |
+| `prompt_caching` | `true` | 为 Anthropic 请求标记缓存断点（工具 + 系统提示词、以及会话前缀）。OpenAI 兼容端点自动缓存，忽略此项 |
 | `trace_dir` | 工作区下 `.cagent/traces` | JSONL trace 目录；用 `--no-trace` 关闭 |
 
 ## 快速开始

@@ -18,7 +18,7 @@ import pytest
 
 from cagent.agent import sandbox as sandbox_module
 from cagent.agent.approval import ApprovalPolicy, Decision
-from cagent.agent.engine import Agent
+from cagent.agent.engine import _MAX_STALE_FOCUS_BLOCKS, Agent
 from cagent.agent.events import (
     Activity,
     ApprovalRequested,
@@ -34,6 +34,7 @@ from cagent.agent.events import (
     UserMessage,
     Warning,
 )
+from cagent.agent.prompt import FOCUS_HEADER
 from cagent.config import AgentConfig
 from cagent.llm.base import (
     StreamFinished,
@@ -173,7 +174,9 @@ class TestTheCycle:
         result = agent.run_turn("continue the work")
 
         assert result.completed
-        assert [message.role for message in provider.requests[0]] == [
+        assert [
+            message.role for message in provider.requests[0] if not message.synthetic
+        ] == [
             "user",
             "assistant",
             "user",
@@ -332,9 +335,11 @@ class TestTheCycle:
         assert all(system for system in provider.systems)
         assert all("read_file" in {s.name for s in specs} for specs in provider.tool_specs)
 
-    def test_the_current_task_ranks_the_repo_map_sent_to_the_provider(
+    def test_the_task_ranked_map_travels_with_the_task_not_the_system_prompt(
         self, project: Path
     ) -> None:
+        # Ranking in the system prompt would re-rank it every turn, and the
+        # system prompt is the provider's cache prefix.
         target = project / "deep" / "transport"
         target.mkdir(parents=True)
         (target / "stream_controller.py").write_text(
@@ -344,8 +349,72 @@ class TestTheCycle:
 
         agent.run_turn("repair provider stream cancellation")
 
-        system = provider.systems[0]
-        assert system.index("deep/transport/stream_controller.py") < system.index("calc.py")
+        focus = [
+            message.text
+            for message in provider.requests[0]
+            if message.text.startswith(FOCUS_HEADER)
+        ]
+        assert len(focus) == 1
+        assert focus[0].index("deep/transport/stream_controller.py") < focus[0].index("calc.py")
+
+    def test_the_system_prompt_does_not_change_between_turns(self, project: Path) -> None:
+        # The whole point of moving ranking out: an identical prefix is a
+        # cacheable prefix, and re-ranking it would take the transcript with it.
+        agent, _, provider = make_agent(
+            auto(project), [text_turn("one"), text_turn("two")]
+        )
+
+        agent.run_turn("repair provider stream cancellation")
+        agent.run_turn("rename the addition helper")
+
+        assert len(provider.systems) == 2
+        assert provider.systems[0] == provider.systems[1]
+
+    def test_superseded_focus_blocks_are_swept_once_enough_pile_up(
+        self, project: Path
+    ) -> None:
+        # Sweeping every turn would rewrite the transcript from its front and
+        # cost more cache than the stale tokens are worth, so it waits.
+        agent, _, provider = make_agent(
+            auto(project), [text_turn(str(index)) for index in range(6)]
+        )
+
+        counts = []
+        for index in range(6):
+            agent.run_turn(f"task number {index}")
+            counts.append(
+                sum(
+                    1
+                    for message in provider.requests[-1]
+                    if message.text.startswith(FOCUS_HEADER)
+                )
+            )
+
+        assert max(counts) <= _MAX_STALE_FOCUS_BLOCKS + 1
+        assert min(counts) == 1
+
+    def test_a_rebuilt_map_sweeps_them_immediately(self, project: Path) -> None:
+        # The map was rebuilt, so the system prompt already changed and the
+        # cached prefix is cold regardless — the sweep is free here.
+        agent, _, provider = make_agent(
+            auto(project),
+            [
+                tool_turn("write_file", {"path": "new.py", "content": "def x(): pass\n"})
+                + [StreamFinished("tool_calls")],
+                text_turn("wrote it"),
+                text_turn("done"),
+            ],
+        )
+
+        agent.run_turn("create something")
+        agent.run_turn("now something else")
+
+        focus = [
+            message.text
+            for message in provider.requests[-1]
+            if message.text.startswith(FOCUS_HEADER)
+        ]
+        assert len(focus) == 1
 
     def test_the_transcript_grows_by_assistant_and_tool_turns(self, project: Path) -> None:
         agent, _, provider = make_agent(
@@ -356,7 +425,7 @@ class TestTheCycle:
             ],
         )
         agent.run_turn("read it")
-        roles = [m.role for m in agent.context.history]
+        roles = [m.role for m in agent.context.history if not m.synthetic]
         assert roles == ["user", "assistant", "tool", "assistant"]
 
     def test_events_narrate_the_run_in_order(self, project: Path) -> None:
@@ -854,8 +923,11 @@ class TestTermination:
 
 
 class TestRepoMapRefresh:
-    def test_the_repo_map_is_rebuilt_after_the_agent_writes(self, project: Path) -> None:
-        # A map that still describes the tree as it was is worse than none.
+    def test_a_write_notes_the_stale_map_without_rewriting_the_system_prompt(
+        self, project: Path
+    ) -> None:
+        # Rebuilding here would be correct and ruinous: the system prompt is the
+        # cache prefix, and rewriting it mid-turn re-reads the whole transcript.
         agent, sink, provider = make_agent(
             auto(project),
             [
@@ -868,14 +940,59 @@ class TestRepoMapRefresh:
             ],
         )
         agent.run_turn("create a module")
-        assert "freshly_added" not in provider.systems[0]
-        assert "freshly_added" in provider.systems[-1]
+
+        assert provider.systems[0] == provider.systems[-1]
+        assert "freshly_added" not in provider.systems[-1]
+        notes = [
+            message.text
+            for message in provider.requests[-1]
+            if message.text.startswith("[The project map")
+        ]
+        assert len(notes) == 1
+        assert "brand_new_module.py" in notes[0]
         assert [event.message for event in sink.of_type(Activity)] == [
             "Preparing task context",
             "Waiting for agent response",
-            "Refreshing repo map",
             "Waiting for agent response",
         ]
+
+    def test_the_map_is_rebuilt_at_the_next_turn_boundary(self, project: Path) -> None:
+        agent, sink, provider = make_agent(
+            auto(project),
+            [
+                tool_turn(
+                    "write_file",
+                    {"path": "brand_new_module.py", "content": "def freshly_added(): pass\n"},
+                )
+                + [StreamFinished("tool_calls")],
+                text_turn("created it"),
+                text_turn("nothing more"),
+            ],
+        )
+        agent.run_turn("create a module")
+        agent.run_turn("now describe it")
+
+        assert "freshly_added" in provider.systems[-1]
+        assert "Refreshing repo map" in [event.message for event in sink.of_type(Activity)]
+
+    def test_a_shell_mutation_is_noted_without_a_path(self, project: Path) -> None:
+        agent, _, provider = make_agent(
+            auto(project),
+            [
+                tool_turn("run_bash", {"command": "echo hi > note.txt"})
+                + [StreamFinished("tool_calls")],
+                text_turn("ran it"),
+            ],
+        )
+        agent.run_turn("write a note")
+
+        notes = [
+            message.text
+            for message in provider.requests[-1]
+            if message.text.startswith("[The project map")
+        ]
+        assert len(notes) == 1
+        assert "unnamed files" in notes[0]
 
 
 class TestReporting:

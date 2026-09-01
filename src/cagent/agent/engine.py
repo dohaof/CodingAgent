@@ -49,7 +49,7 @@ from ..llm.base import ThinkingDelta as WireThinkingDelta
 from ..tools.base import ApprovalRequest, BaseTool, ToolContext, ToolOutcome
 from ..tools.registry import ToolRegistry, default_registry
 from ..tools.schema import parse_object
-from ..types import Message, RiskLevel, ToolCallPart, ToolResultPart, Usage
+from ..types import Message, RiskLevel, TextPart, ToolCallPart, ToolResultPart, Usage
 from .approval import ApprovalPolicy
 from .context import ContextManager
 from .events import (
@@ -72,7 +72,7 @@ from .events import (
     Warning,
 )
 from .guards import LoopGuard
-from .prompt import PromptBuilder
+from .prompt import FOCUS_HEADER, PromptBuilder
 from .sandbox import SandboxError, SandboxSession
 
 __all__ = ["Agent", "TurnResult"]
@@ -92,6 +92,20 @@ or backslashes, escape them properly."""
 _REFUSED_FEEDBACK = """\
 The user declined to run this. Do not retry it. Either continue with a different \
 approach, or explain what you need permission for and stop."""
+
+_STALE_MAP_NOTE = """\
+[The project map in the system prompt was built before this turn and is not \
+rebuilt mid-turn. Changed since: {changed}. Read a file rather than trusting \
+the map's description of it.]"""
+
+_MAX_LISTED_CHANGES = 8
+
+_MAX_STALE_FOCUS_BLOCKS = 3
+"""How many superseded task-focus blocks may accumulate before they are swept.
+
+Sweeping rewrites the transcript from the earliest one onward, so doing it every
+turn would trade a cached prefix for a few hundred tokens — the wrong way round.
+Waiting until several have piled up makes the sweep worth its own cost."""
 
 _MAX_PARALLEL_TOOLS = 4
 
@@ -121,6 +135,16 @@ class _PreparedCall:
     nudge: str | None
 
 
+def _changed_path(call: ToolCallPart) -> str | None:
+    """The file a mutating call named, when it named one.
+
+    File tools all take ``path``; ``run_bash`` names nothing, and guessing what
+    a shell command touched would be worse than admitting it is unknown.
+    """
+    value = call.arguments.get("path")
+    return value if isinstance(value, str) and value.strip() else None
+
+
 @dataclass(slots=True)
 class Agent:
     """Runs tasks against a provider using a set of tools.
@@ -146,6 +170,11 @@ class Agent:
     _system: str = ""
     _current_task: str = ""
     _files_changed: bool = False
+    _pending_changes: set[str] = field(default_factory=set)
+    """Paths mutated since the model was last told so. Drained into one note
+    per step, rather than triggering a system-prompt rebuild."""
+    _opaque_changes: bool = False
+    """Whether a mutation happened that names no path, such as a shell command."""
     _initialized: bool = field(init=False, default=False)
     sandbox: SandboxSession | None = field(init=False, default=None)
     sandbox_warning: str | None = field(init=False, default=None)
@@ -200,13 +229,16 @@ class Agent:
         self._refresh_system_prompt()
         self._initialized = True
 
-    def _refresh_system_prompt(self, *, query: str | None = None) -> None:
-        """Rebuild the system prompt and re-cost the request overhead."""
+    def _refresh_system_prompt(self) -> None:
+        """Rebuild the system prompt and re-cost the request overhead.
+
+        Only ever called between turns. The system prompt is the provider's
+        cache prefix, so rewriting it mid-turn discards the cached transcript
+        at the point that transcript is longest; :meth:`_note_stale_map` covers
+        the mid-turn case for a few tokens instead.
+        """
         specs = tuple(self.registry.specs())
-        prompt = self.prompt_builder.build(
-            tools=specs,
-            query=self._current_task if query is None else query,
-        )
+        prompt = self.prompt_builder.build(tools=specs)
         self._system = prompt.text
         self.context.set_overhead(system_tokens=prompt.tokens, tools=specs)
 
@@ -301,9 +333,10 @@ class Agent:
             self._emit(Activity(self._initialization_activity()))
             self.initialize()
         self._current_task = task
-        self._prepare_task_context(task)
+        prefix_cold = self._prepare_task_context(task)
         self.context.append(Message.user(task))
         self._emit(UserMessage(task))
+        self._attach_task_focus(task, prefix_cold=prefix_cold)
         self.guard.note_progress()
 
         turn_start_usage = self.usage
@@ -634,8 +667,14 @@ class Agent:
 
         if not outcome.is_error and prepared.risk >= RiskLevel.MUTATING:
             # The repo map described the tree as it was; a mutation makes it
-            # stale, so the next prompt rebuild rescans.
+            # stale. The rescan waits for the turn boundary so the cached
+            # prompt prefix survives; the model is told in the meantime.
             self._files_changed = True
+            changed = _changed_path(prepared.call)
+            if changed is None:
+                self._opaque_changes = True
+            else:
+                self._pending_changes.add(changed)
 
         content = outcome.content
         if prepared.nudge:
@@ -702,11 +741,7 @@ class Agent:
 
     def _compact_if_needed(self) -> None:
         """Compact history before a request that would otherwise overflow."""
-        if self._files_changed:
-            self._emit(Activity(self._refresh_activity()))
-            self.prompt_builder.invalidate_map()
-            self._refresh_system_prompt()
-            self._files_changed = False
+        self._note_stale_map()
 
         if not self.context.needs_compaction():
             return
@@ -733,20 +768,106 @@ class Agent:
         )
         raise ContextWindowTooSmall(message)
 
-    def _prepare_task_context(self, task: str) -> None:
-        """Rank cached context for ``task``, rebuilding a stale map first."""
+    def _prepare_task_context(self, task: str) -> bool:
+        """Rebuild a map the previous turn made stale.
+
+        Returns:
+            Whether the system prompt changed, and with it whether the
+            provider's cached prefix for this session is already cold.
+        """
         if self._files_changed:
             self._emit(Activity(self._refresh_activity()))
             self.prompt_builder.invalidate_map()
+            self._refresh_system_prompt()
             self._files_changed = False
-        else:
-            activity = (
-                "Preparing task context"
-                if self.config.repo_map_enabled
-                else "Preparing context"
+            self._pending_changes.clear()
+            self._opaque_changes = False
+            return True
+        activity = (
+            "Preparing task context" if self.config.repo_map_enabled else "Preparing context"
+        )
+        self._emit(Activity(activity))
+        return False
+
+    def _attach_task_focus(self, task: str, *, prefix_cold: bool) -> None:
+        """Append the task-ranked slice of the map after the user's turn.
+
+        Here rather than in the system prompt because it is the one part of the
+        map that changes every turn. Appending leaves the whole cached prefix —
+        tool schemas, system prompt, and the transcript so far — untouched,
+        which is the difference between paying for the map and paying for the
+        map plus a re-read of the entire conversation.
+        """
+        self._retire_previous_focus(forced=prefix_cold)
+        focus = self.prompt_builder.task_focus(task)
+        if focus is None:
+            return
+        self.context.append(Message(role="user", parts=[TextPart(focus)], synthetic=True))
+
+    def _retire_previous_focus(self, *, forced: bool) -> None:
+        """Drop earlier turns' focus blocks, but not at any price.
+
+        Each is derived context for a task that is over, and a session of a
+        dozen turns would otherwise carry a dozen of them. Removing one is safe
+        at any point — a standalone user message with no tool call to orphan —
+        but it is not free: the earliest surviving block sits near the front of
+        the transcript, so deleting it invalidates the cached prefix from there
+        on, which costs far more than the stale tokens it reclaims.
+
+        So they go when the prefix is cold anyway (the map was rebuilt, so the
+        system prompt already changed), or when enough have piled up that the
+        one-off re-read is finally the cheaper side of the trade. In practice
+        the first condition fires on any turn that wrote a file, which is most
+        of them.
+        """
+        stale = [
+            index
+            for index, message in enumerate(self.context.history)
+            if message.synthetic
+            and message.role == "user"
+            and message.text.startswith(FOCUS_HEADER)
+        ]
+        if not stale or (not forced and len(stale) < _MAX_STALE_FOCUS_BLOCKS):
+            return
+        drop = set(stale)
+        self.context.history = [
+            message
+            for index, message in enumerate(self.context.history)
+            if index not in drop
+        ]
+
+    def _note_stale_map(self) -> None:
+        """Tell the model the map aged, instead of rebuilding the system prompt.
+
+        A mid-turn rebuild is correct and ruinously expensive: it rewrites the
+        cached prefix at the moment the transcript is longest, so the provider
+        re-reads everything. The information the rebuild carried is small — some
+        files are no longer as described — and an appended line carries it
+        without moving the prefix. The real rebuild happens at the next turn
+        boundary, where the cache would have been cold anyway.
+        """
+        if not self._files_changed:
+            return
+        changed = sorted(self._pending_changes)
+        self._pending_changes.clear()
+        opaque = self._opaque_changes
+        self._opaque_changes = False
+        if not changed and not opaque:
+            # Already reported; the map stays flagged for the turn boundary.
+            return
+
+        listed = ", ".join(changed[:_MAX_LISTED_CHANGES])
+        if len(changed) > _MAX_LISTED_CHANGES:
+            listed += f", and {len(changed) - _MAX_LISTED_CHANGES} more"
+        if opaque:
+            listed = f"{listed}, plus other tool side effects" if listed else "unnamed files"
+        self.context.append(
+            Message(
+                role="user",
+                parts=[TextPart(_STALE_MAP_NOTE.format(changed=listed))],
+                synthetic=True,
             )
-            self._emit(Activity(activity))
-        self._refresh_system_prompt(query=task)
+        )
 
     def _initialization_activity(self) -> str:
         return "Building repo map" if self.config.repo_map_enabled else "Preparing context"

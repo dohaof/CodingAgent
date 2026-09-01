@@ -138,8 +138,11 @@ class ScriptedProvider(LLMProvider):
         abort: threading.Event | None = None,
     ) -> Iterator[StreamEvent]:
         # Snapshot, so later compaction cannot retroactively change what a test
-        # believes was sent.
-        self.requests.append([Message(m.role, list(m.parts)) for m in messages])
+        # believes was sent. ``synthetic`` rides along: several assertions turn
+        # on telling the user's own turns from engine-inserted context.
+        self.requests.append(
+            [Message(m.role, list(m.parts), synthetic=m.synthetic) for m in messages]
+        )
         self.systems.append(system)
         self.tool_specs.append(tuple(tools))
         turn = self.script.pop(0) if self.script else [TextDelta("done"), StreamFinished("stop")]

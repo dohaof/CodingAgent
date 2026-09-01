@@ -965,7 +965,13 @@ def _show_config(console: Console, config: AgentConfig) -> int:
         "token budget": str(config.token_budget or "unlimited"),
         "bash timeout": f"{config.bash_timeout:g}s",
         "fuzzy threshold": f"{config.fuzzy_threshold:.2f}",
-        "repo map": f"{config.repo_map_token_budget} tokens" if config.repo_map_enabled else "off",
+        "repo map": (
+            f"{config.repo_map_token_budget} + "
+            f"{config.repo_map_focus_token_budget} tokens (index + task focus)"
+            if config.repo_map_enabled
+            else "off"
+        ),
+        "prompt caching": "on" if config.prompt_caching else "off",
         "trace dir": str(config.trace_dir or "off"),
     }
     for key, value in rows.items():

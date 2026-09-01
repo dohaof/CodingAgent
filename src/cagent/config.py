@@ -175,6 +175,24 @@ class AgentConfig:
     repo_map_token_budget: int = 1600
     repo_map_enabled: bool = True
 
+    repo_map_focus_token_budget: int = 1200
+    """Budget for the task-ranked file list sent with each user turn.
+
+    Separate from :attr:`repo_map_token_budget` because the two are spent in
+    different places. The structural map goes in the system prompt and is paid
+    for once per session by a provider that caches prefixes; this one goes in
+    the conversation, is paid for once per turn, and is the only part that
+    knows what was asked."""
+
+    prompt_caching: bool = True
+    """Ask the Anthropic wire to cache the tool schemas, system prompt, and
+    conversation prefix.
+
+    OpenAI-compatible endpoints cache prefixes automatically and ignore this.
+    Anthropic caches nothing unless the request marks where, so leaving this off
+    means re-reading the whole prompt on every step of every turn. Disable it
+    only for a proxy that rejects the ``cache_control`` field."""
+
     # desktop client
     desktop_path: Path | None = None
     """Where the built Electron desktop client lives, for ``cagent --gui``.
@@ -297,6 +315,7 @@ class AgentConfig:
             "tool_output_max_chars",
             "max_repeated_calls",
             "repo_map_token_budget",
+            "repo_map_focus_token_budget",
         )
         for name in positive_ints:
             value_int = int(getattr(self, name))

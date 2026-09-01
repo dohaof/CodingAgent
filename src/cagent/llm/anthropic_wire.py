@@ -126,6 +126,11 @@ def _wire_messages(messages: Sequence[Message]) -> tuple[list[dict[str, object]]
     return wire, extra_system
 
 
+_CACHE_CONTROL = {"type": "ephemeral"}
+"""Marks a cache breakpoint. Everything *before* a marked block is cached, so
+placement is what matters, not how many blocks carry it."""
+
+
 def _stream_error(payload: dict[str, object]) -> ProviderError:
     """Map an in-stream ``error`` event onto the retry-deciding hierarchy."""
     error = payload.get("error")
@@ -177,7 +182,7 @@ class AnthropicProvider(LLMProvider):
         }
         system_text = "\n\n".join(part for part in (system, *extra_system) if part)
         if system_text:
-            body["system"] = system_text
+            body["system"] = [{"type": "text", "text": system_text}]
         if self.config.reasoning_effort is not None:
             body["output_config"] = {"effort": self.config.reasoning_effort}
         if tools:
@@ -189,7 +194,37 @@ class AnthropicProvider(LLMProvider):
                 }
                 for spec in tools
             ]
+        if self.config.prompt_caching:
+            self._mark_cache_breakpoints(body)
         return body
+
+    @staticmethod
+    def _mark_cache_breakpoints(body: dict[str, object]) -> None:
+        """Place the two breakpoints that matter for an agent loop.
+
+        Unlike an OpenAI-compatible endpoint, this API caches nothing unless the
+        request says where, so without this every step re-reads the entire
+        prompt at full price.
+
+        The cache prefix runs tools, then system, then messages, which means one
+        marker at the end of the system block already covers the tool schemas —
+        the largest fixed cost and the one that never changes. The second marker
+        goes on the last message so each step can reuse the transcript the
+        previous step wrote, which is where a long turn actually spends.
+        """
+        system = body.get("system")
+        tools = body.get("tools")
+        if isinstance(system, list) and system:
+            system[-1]["cache_control"] = _CACHE_CONTROL
+        elif isinstance(tools, list) and tools:
+            # No system prompt to hang it on, e.g. the summarisation call.
+            tools[-1]["cache_control"] = _CACHE_CONTROL
+
+        messages = body.get("messages")
+        if isinstance(messages, list) and messages:
+            blocks = messages[-1].get("content")
+            if isinstance(blocks, list) and blocks:
+                blocks[-1]["cache_control"] = _CACHE_CONTROL
 
     def _headers(self) -> dict[str, str]:
         headers = {"anthropic-version": ANTHROPIC_VERSION, "accept": "text/event-stream"}

@@ -409,8 +409,50 @@ class TestAnthropicWire:
     def test_system_goes_top_level_not_into_messages(self, config: AgentConfig) -> None:
         client, seen = capture(anthropic_stream())
         AnthropicProvider(config, client=client).complete([Message.user("hi")], system="rules")
-        assert seen[0]["system"] == "rules"
+        assert seen[0]["system"][0]["text"] == "rules"
         assert all(m["role"] != "system" for m in seen[0]["messages"])
+
+    def test_caching_breaks_after_the_system_prompt_and_the_last_message(
+        self, config: AgentConfig
+    ) -> None:
+        # This API caches nothing unless the request says where, so without the
+        # breakpoints every step re-reads the whole prompt at full price. Tools
+        # precede system in the cache prefix, so one marker covers both.
+        client, seen = capture(anthropic_stream())
+        tools = (ToolSpec("read_file", "read", {"type": "object"}),)
+
+        AnthropicProvider(config, client=client).complete(
+            [Message.user("hi")], system="rules", tools=tools
+        )
+
+        body = seen[0]
+        assert body["system"][-1]["cache_control"] == {"type": "ephemeral"}
+        assert "cache_control" not in body["tools"][-1]
+        assert body["messages"][-1]["content"][-1]["cache_control"] == {"type": "ephemeral"}
+
+    def test_caching_falls_back_to_the_tools_when_there_is_no_system_prompt(
+        self, config: AgentConfig
+    ) -> None:
+        client, seen = capture(anthropic_stream())
+        tools = (ToolSpec("read_file", "read", {"type": "object"}),)
+
+        AnthropicProvider(config, client=client).complete(
+            [Message.user("hi")], system="", tools=tools
+        )
+
+        assert seen[0]["tools"][-1]["cache_control"] == {"type": "ephemeral"}
+
+    def test_caching_can_be_switched_off_for_a_strict_proxy(
+        self, config: AgentConfig
+    ) -> None:
+        config.prompt_caching = False
+        client, seen = capture(anthropic_stream())
+
+        AnthropicProvider(config, client=client).complete([Message.user("hi")], system="rules")
+
+        body = seen[0]
+        assert "cache_control" not in body["system"][-1]
+        assert "cache_control" not in body["messages"][-1]["content"][-1]
 
     def test_max_tokens_is_always_sent(self, config: AgentConfig) -> None:
         # The Messages API rejects a request without it.

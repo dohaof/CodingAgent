@@ -99,8 +99,19 @@ allow_outside_workspace = false
 # sandbox_workspace_mb = 512
 
 # --- repomap ---------------------------------------------------------------
+# The map is delivered in two pieces. The structural index goes in the system
+# prompt, where it is identical from turn to turn and a provider can cache it;
+# the task-ranked shortlist ships with each user turn, where it can change
+# without invalidating that cache.
 repo_map_enabled = true
-repo_map_token_budget = 1600
+repo_map_token_budget = 1600         # structural index, in the system prompt
+# repo_map_focus_token_budget = 1200 # task-ranked shortlist, per user turn
+
+# --- caching ---------------------------------------------------------------
+# Anthropic caches nothing unless the request marks where; OpenAI-compatible
+# endpoints cache prefixes on their own and ignore this. Turn it off only for a
+# proxy that rejects the cache_control field.
+# prompt_caching = true
 
 # --- desktop client --------------------------------------------------------
 # Where the built Electron client lives, for `cagent --gui`. Its runtime is far
