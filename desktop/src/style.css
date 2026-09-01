@@ -62,16 +62,22 @@ kbd { border: 1px solid #38453f; border-bottom-color: #24302b; background: #1c25
 .sessions-list { flex: 1; overflow: auto; padding: 2px 9px; }
 .sessions-empty { color: var(--muted); text-align: center; font-size: 14px; line-height: 1.65; padding: 32px 16px; }
 .sessions-empty span { color: var(--faint); font-size: 13px; }
-.session-item { width: 100%; display: flex; align-items: flex-start; gap: 9px; text-align: left; padding: 11px 9px; margin-bottom: 2px; border-radius: 5px; background: transparent; color: var(--muted); }
-.session-item:hover { background: #1b2522; color: var(--ink); }
-.session-item.active { background: #20342d; color: var(--ink); box-shadow: inset 2px 0 var(--green); }
+/* The row is the hover and selection surface; it holds two sibling buttons,
+   because the actions control cannot be nested inside the resume button. */
+.session-row { display: flex; align-items: stretch; margin-bottom: 2px; border-radius: 5px; background: transparent; }
+.session-row:hover { background: #1b2522; }
+.session-row.active { background: #20342d; box-shadow: inset 2px 0 var(--green); }
+.session-item { min-width: 0; flex: 1; display: flex; align-items: flex-start; gap: 9px; text-align: left; padding: 11px 4px 11px 9px; border-radius: 5px 0 0 5px; background: transparent; color: var(--muted); }
+.session-row:hover .session-item, .session-row.active .session-item { color: var(--ink); }
 .session-status { width: 6px; height: 6px; border-radius: 50%; margin-top: 5px; flex: 0 0 auto; background: var(--amber); }
 .session-status.done { background: var(--green); }
 .session-info { min-width: 0; flex: 1; display: flex; flex-direction: column; gap: 6px; }
 .session-info b { font-size: 14px; line-height: 1.35; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; font-weight: 600; }
 .session-info span { display: flex; align-items: center; gap: 6px; color: var(--faint); font-size: 12px; }
 .session-info i { display: inline-block; width: 3px; height: 3px; background: var(--faint); border-radius: 50%; }
-.session-more { opacity: 0; color: var(--faint); }.session-item:hover .session-more { opacity: 1; }
+.session-more { flex: 0 0 auto; width: 30px; display: grid; place-items: center; border-radius: 0 5px 5px 0; background: transparent; color: var(--faint); opacity: 0; }
+.session-row:hover .session-more, .session-more:focus-visible, .session-more[aria-expanded="true"] { opacity: 1; }
+.session-more:hover, .session-more[aria-expanded="true"] { background: var(--surface-3); color: var(--ink); }
 .sidebar-footer { border-top: 1px solid var(--line); padding: 12px 10px 13px; }
 .workspace-button, .sidebar-settings { width: 100%; display: flex; align-items: center; gap: 9px; min-width: 0; padding: 8px; border-radius: 4px; background: transparent; color: var(--muted); text-align: left; }.workspace-button:hover, .sidebar-settings:hover { background: var(--surface-3); color: var(--ink); }
 .workspace-button .workspace-text { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 4px; }.workspace-text small { color: var(--faint); font-size: 11px; text-transform: uppercase; letter-spacing: .1em; }.workspace-text b { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; font-weight: 550; }.sidebar-settings { margin-top: 3px; padding-top: 10px; }
@@ -130,10 +136,10 @@ kbd { border: 1px solid #38453f; border-bottom-color: #24302b; background: #1c25
 .replayed-call.failed { border-color: #573b34; }
 .replayed-call-head { display: flex; align-items: center; gap: 7px; padding: 7px 10px; color: var(--faint); }
 .replayed-call-head svg:first-child { color: var(--blue); flex: 0 0 auto; }
-.replayed-call-head svg:last-child { margin-left: auto; flex: 0 0 auto; color: var(--green); }
-.replayed-call.failed .replayed-call-head svg:last-child { color: var(--coral); }
+.replayed-call-head .replayed-status { margin-left: auto; display: grid; flex: 0 0 auto; color: var(--green); }
+.replayed-call.failed .replayed-call-head .replayed-status { color: var(--coral); }
 .replayed-call-head b { color: #bfd9d0; font: 12px ui-monospace, SFMono-Regular, Consolas, monospace; flex: 0 0 auto; }
-.replayed-call-head span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 12px ui-monospace, SFMono-Regular, Consolas, monospace; }
+.replayed-call-head .replayed-args { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 12px ui-monospace, SFMono-Regular, Consolas, monospace; }
 .replayed-call pre { margin: 0; padding: 9px 10px; border-top: 1px solid var(--line); background: #0e1413; color: #a3b2ab; font: 12px/1.55 ui-monospace, SFMono-Regular, Consolas, monospace; white-space: pre-wrap; word-break: break-word; max-height: 220px; overflow: auto; }
 .replayed-call.failed pre { color: #d8a998; }
 /* The sandbox sync is the one prompt whose "deny" throws work away. Mark it as
@@ -143,6 +149,34 @@ kbd { border: 1px solid #38453f; border-bottom-color: #24302b; background: #1c25
 .approval-card.sync p { color: #c3d6e2; }
 .approval-card.sync .approval-deny { color: #dda291; border-color: #7a4a3d; }
 .approval-card.sync .approval-allow { border-color: #4f8e72; }
+/* Foldable result cards. A single read_file can run to hundreds of lines, which
+   pushes the reply that explains it off screen; the head is the handle, so the
+   body stays selectable and a drag to copy output never folds the card away. */
+.card-toggle { cursor: pointer; user-select: none; }
+.card-toggle:hover { background: rgba(255,255,255,.03); }
+.card-toggle:focus-visible { outline: 2px solid #4d7b68; outline-offset: -2px; }
+.collapse-caret { flex: 0 0 auto; display: grid; color: var(--faint); transition: transform .16s ease; }
+/* The command head has no flexible column to push the caret over. */
+.command-head .collapse-caret { margin-left: auto; }
+.card-toggle:hover .collapse-caret { color: var(--muted); }
+.collapsed .collapse-caret { transform: rotate(-90deg); }
+.tool-card.collapsed .tool-args, .tool-card.collapsed .tool-output { display: none; }
+.replayed-call.collapsed pre, .command-block.collapsed pre { display: none; }
+.command-block.collapsed .command-head { border-bottom: 0; }
+/* Anchored menus. Fixed rather than absolute so a menu opened from the scrolling
+   sessions list is not clipped by it; dismissed on scroll for the same reason. */
+.popup-menu { position: fixed; z-index: 40; min-width: 210px; max-width: 300px; padding: 5px; border: 1px solid var(--line); border-radius: 6px; background: #1b2320; box-shadow: 0 14px 32px rgba(0,0,0,.45); animation: toast-in .12s ease; }
+.popup-note { margin: 0 0 5px; padding: 8px 8px 10px; border-bottom: 1px solid var(--line); color: var(--muted); font-size: 12px; line-height: 1.55; }
+.popup-item { width: 100%; display: flex; align-items: center; gap: 9px; padding: 8px 9px; border-radius: 4px; background: transparent; color: var(--muted); text-align: left; font-size: 13px; }
+.popup-item svg { flex: 0 0 auto; color: var(--faint); }
+.popup-item:hover:not(:disabled) { background: #26332e; color: var(--ink); }
+.popup-item:hover:not(:disabled) svg { color: var(--muted); }
+.popup-item:focus-visible { outline: 1px solid #4d7b68; outline-offset: -1px; }
+.popup-item.danger { color: #d99e8c; }
+.popup-item.danger svg { color: inherit; }
+.popup-item.danger:hover:not(:disabled) { background: #35211c; color: #f0b6a2; }
+.popup-item.danger:hover:not(:disabled) svg { color: inherit; }
+.popup-separator { height: 1px; margin: 4px 2px; background: var(--line); }
 @keyframes spin { to { transform: rotate(360deg); } } @keyframes pulse { 50% { opacity: .35; } } @keyframes toast-in { from { opacity: 0; transform: translateY(6px); } }
 @media (max-width: 880px) { .sessions-sidebar { position: absolute; inset: 0 auto 0 0; transform: translateX(-100%); box-shadow: 15px 0 30px rgba(0,0,0,.3); }.sessions-open .sessions-sidebar { transform: translateX(0); }.sidebar-collapsed .sessions-sidebar { width: 300px; flex-basis: 300px; overflow: visible; border-right: 1px solid var(--line); }.sessions-open::after { content: ""; position: absolute; inset: 0; z-index: 4; background: rgba(6,10,9,.58); }.mobile-menu { display: inline-grid; }.topbar { padding: 0 145px 0 14px; }.connection-state { display: none; }.transcript { padding: 22px 14px; }.composer-area { padding: 0 12px 10px; }.approval-slot { padding: 0 12px; }.quick-grid { grid-template-columns: 1fr; max-width: 500px; }.quick-action { min-height: 70px; }.welcome h1 { font-size: 42px; }.composer-hints > span { display: none; }.settings-drawer { width: min(380px, 92%); } }
 @media (max-width: 520px) { .topbar-control { display: none; }.topbar { height: 52px; }.transcript { padding: 18px 10px 26px; }.welcome { padding-top: 14px; }.welcome h1 { font-size: 33px; }.welcome-copy { font-size: 15px; }.assistant-content, .user-content, .tool-block, .warning-block { margin-left: 0; }.message-block { margin-bottom: 22px; }.activity-divider, #model-label, .context-meter, #context-label { display: none; }.activity-row { padding: 0 3px; }.composer-tools { padding-left: 8px; }.tool-pill { padding: 5px; }.settings-drawer { padding: 18px; } }

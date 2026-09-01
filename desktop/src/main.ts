@@ -12,6 +12,7 @@ import {
   CircleX,
   Coins,
   Container,
+  Copy,
   createIcons,
   Ellipsis,
   Eraser,
@@ -106,6 +107,7 @@ const uiIcons = {
   CircleX,
   Coins,
   Container,
+  Copy,
   Ellipsis,
   Eraser,
   FileCode2,
@@ -325,7 +327,8 @@ function updateStatusBar(): void {
   if (meter) meter.style.setProperty("--value", `${ratio * 100}%`);
   if (meterLabel) meterLabel.textContent = `${Math.round(ratio * 100)}% context`;
   const steps = document.querySelector<HTMLElement>("#steps-label");
-  if (steps) steps.textContent = `${state.status.steps || 0} steps`;
+  const stepCount = Number(state.status.steps || 0);
+  if (steps) steps.textContent = `${stepCount} step${stepCount === 1 ? "" : "s"}`;
   const model = document.querySelector<HTMLElement>("#model-label");
   if (model) model.textContent = state.config.model || "Model not configured";
 }
@@ -384,7 +387,7 @@ function shell(): void {
               <div class="composer-actions"><button class="icon-button" id="clear-composer" title="Clear input" aria-label="Clear input">${icon("x", 16)}</button><button class="send-button" id="send-button" title="Send message">${icon("arrow-up", 17)}</button><button class="stop-button" id="stop-button" hidden title="Interrupt agent">${icon("square", 15)}<span>Stop</span></button></div>
             </div>
           </div>
-          <div class="activity-row"><span class="activity-icon">${icon(state.status.busy ? "loader-circle" : "sparkles", 14)}</span><span id="activity-label">Preparing workspace</span><span class="activity-divider"></span><span id="model-label">Model not configured</span><span class="activity-spacer"></span><span id="steps-label">0 steps</span><span class="context-meter" id="context-meter"><i></i></span><span id="context-label">0% context</span></div>
+          <div class="activity-row"><span class="activity-icon">${icon(state.status.busy ? "loader-circle" : "sparkles", 14)}</span><span id="activity-label">Preparing workspace</span><span class="activity-divider"></span><span id="model-label">Model not configured</span><span class="activity-spacer"></span><span id="steps-label" title="Model requests in this conversation, including any restored from a resumed session">0 steps</span><span class="context-meter" id="context-meter"><i></i></span><span id="context-label">0% context</span></div>
         </section>
       </main>
       <div class="settings-panel" id="settings-panel" aria-hidden="true"><div class="settings-backdrop" id="settings-backdrop"></div><div class="settings-drawer"><div class="drawer-header"><div><span class="eyebrow">Session controls</span><h2>Configuration</h2></div><button class="icon-button" id="close-settings" title="Close settings" aria-label="Close settings">${icon("x", 18)}</button></div><div class="settings-body" id="settings-body"></div></div></div>
@@ -454,8 +457,40 @@ function bindUI(): void {
   // transcript for a new session removes the content below without moving the
   // scroll position, so no scroll event fires and the prompt to jump to a
   // latest that no longer exists stays on screen. Watch the content box too.
-  const transcript = document.querySelector("#transcript");
+  const transcript = document.querySelector<HTMLElement>("#transcript");
   if (transcript) new ResizeObserver(updateScrollFollow).observe(transcript);
+  // Delegated, because tool and command cards are appended as events arrive and
+  // replayed cards are rebuilt wholesale on every resume.
+  transcript?.addEventListener("click", (event) => {
+    const head = (event.target as HTMLElement | null)?.closest<HTMLElement>(CARD_TOGGLE);
+    if (!head) return;
+    // A click that ends a drag is the user copying the output, not asking to
+    // fold it away.
+    if (window.getSelection()?.isCollapsed === false) return;
+    toggleCollapsed(head);
+  });
+  transcript?.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter" && event.key !== " ") return;
+    const head = (event.target as HTMLElement | null)?.closest<HTMLElement>(CARD_TOGGLE);
+    if (!head) return;
+    event.preventDefault();
+    toggleCollapsed(head);
+  });
+}
+
+/** Marks a card head that folds away everything below it when clicked. Carried
+    as its own class so a head with nothing under it — a replayed call that
+    produced no output — is left inert rather than toggling an empty card. */
+const CARD_TOGGLE = ".card-toggle";
+
+function toggleCollapsed(head: HTMLElement): void {
+  const card = head.parentElement;
+  if (!card) return;
+  const collapsed = card.classList.toggle("collapsed");
+  head.setAttribute("aria-expanded", collapsed ? "false" : "true");
+  // Folding a card shortens the transcript without scrolling it, so the
+  // jump-to-latest prompt has to be re-evaluated by hand.
+  updateScrollFollow();
 }
 
 function updateScrollFollow(): void {
@@ -636,7 +671,7 @@ function renderReplayedCalls(message: AnyRecord, results: Map<string, AnyRecord>
     const content = String(result?.content || "");
     const failed = Boolean(result?.is_error);
     const body = content.trim() ? replayDetail(content) : "";
-    return `<div class="replayed-call${failed ? " failed" : ""}"><div class="replayed-call-head">${icon(name === "run_bash" ? "terminal" : "file-code-2", 14)}<b>${escapeHtml(name)}</b>${args ? `<span>${escapeHtml(args)}</span>` : ""}${icon(result ? (failed ? "circle-x" : "circle-check") : "circle-help", 14)}</div>${body}</div>`;
+    return `<div class="replayed-call${failed ? " failed" : ""}"><div class="replayed-call-head${body ? " card-toggle" : ""}"${body ? ` role="button" tabindex="0" aria-expanded="true" title="Show or hide this result"` : ""}>${icon(name === "run_bash" ? "terminal" : "file-code-2", 14)}<b>${escapeHtml(name)}</b>${args ? `<span class="replayed-args">${escapeHtml(args)}</span>` : ""}<span class="replayed-status">${icon(result ? (failed ? "circle-x" : "circle-check") : "circle-help", 14)}</span>${body ? `<span class="collapse-caret">${icon("chevron-down", 14)}</span>` : ""}</div>${body}</div>`;
   });
   return `<div class="replayed-calls">${rows.join("")}</div>`;
 }
@@ -664,7 +699,7 @@ function renderToolStarted(event: AnyRecord): void {
   const id = String(event.call?.id || event.id || crypto.randomUUID());
   const name = String(event.call?.name || event.name || "tool");
   const args = event.call?.arguments || event.arguments || {};
-  const node = appendBlock("tool-block", `<div class="tool-card running"><div class="tool-card-head"><span class="tool-icon">${icon(name === "run_bash" ? "terminal" : "file-code-2", 16)}</span><div class="tool-title"><b>${escapeHtml(name)}</b><span>Executing capability</span></div><span class="risk-tag ${String(event.risk || "SAFE").toLowerCase()}">${String(event.risk || "safe").toLowerCase()}</span><span class="tool-spinner">${icon("loader-circle", 15)}</span></div><div class="tool-args"><code>${escapeHtml(JSON.stringify(args, null, 2))}</code></div><div class="tool-output" id="tool-output-${CSS.escape(id)}"></div></div>`);
+  const node = appendBlock("tool-block", `<div class="tool-card running"><div class="tool-card-head card-toggle" role="button" tabindex="0" aria-expanded="true" title="Show or hide this result"><span class="tool-icon">${icon(name === "run_bash" ? "terminal" : "file-code-2", 16)}</span><div class="tool-title"><b>${escapeHtml(name)}</b><span>Executing capability</span></div><span class="risk-tag ${String(event.risk || "SAFE").toLowerCase()}">${String(event.risk || "safe").toLowerCase()}</span><span class="tool-spinner">${icon("loader-circle", 15)}</span><span class="collapse-caret">${icon("chevron-down", 15)}</span></div><div class="tool-args"><code>${escapeHtml(JSON.stringify(args, null, 2))}</code></div><div class="tool-output" id="tool-output-${CSS.escape(id)}"></div></div>`);
   state.toolNodes.set(id, node);
   renderIcons();
 }
@@ -689,7 +724,11 @@ function renderToolFinished(event: AnyRecord): void {
   if (output) output.innerHTML = `${body}<span class="tool-duration">${Number(event.duration_s || 0).toFixed(2)}s${outcome.truncated ? " · truncated" : ""}</span>`;
   const head = node.querySelector(".tool-card-head");
   const subtitle = head?.querySelector(".tool-title span");
-  if (subtitle) subtitle.textContent = outcome.is_error ? "Failed" : "Completed";
+  // The size belongs in the head, not just in the body: it is what tells the
+  // user whether a folded card is worth unfolding.
+  const shown = (display || content).replace(/\n+$/, "");
+  const lines = shown ? shown.split("\n").length : 0;
+  if (subtitle) subtitle.textContent = `${outcome.is_error ? "Failed" : "Completed"}${lines ? ` · ${lines} line${lines === 1 ? "" : "s"}` : ""}`;
   head?.querySelector(".diff-stat")?.remove();
   const badge = diffBadge(outcome, display);
   if (badge) head?.querySelector(".risk-tag")?.insertAdjacentHTML("beforebegin", badge);
@@ -725,17 +764,158 @@ function renderApproval(): void {
   renderIcons(); scrollToLatest();
 }
 
+type MenuItem = "separator" | { action: string; label: string; lucide: string; danger?: boolean; disabled?: boolean; hint?: string };
+
+// One menu at a time, anchored to the control that opened it. Kept outside the
+// list it belongs to: `.sessions-list` scrolls with `overflow: auto`, which
+// clips an absolutely positioned child, so the menu is fixed-positioned against
+// the viewport and torn down whenever the anchor could have moved.
+let openMenuAnchor: HTMLElement | null = null;
+let closeOpenMenu: (() => void) | null = null;
+
+function closeMenu(): void {
+  closeOpenMenu?.();
+}
+
+function placeMenu(menu: HTMLElement, anchor: HTMLElement): void {
+  const rect = anchor.getBoundingClientRect();
+  const width = menu.offsetWidth;
+  const height = menu.offsetHeight;
+  const left = Math.max(8, Math.min(rect.right - width, window.innerWidth - width - 8));
+  const below = rect.bottom + 6;
+  // Flip above the anchor rather than run off the bottom of the window.
+  const top = below + height > window.innerHeight - 8 ? Math.max(8, rect.top - height - 6) : below;
+  menu.style.left = `${left}px`;
+  menu.style.top = `${top}px`;
+}
+
+function openMenu(anchor: HTMLElement, items: MenuItem[], onPick: (action: string) => void, note = ""): void {
+  closeMenu();
+  const shell = document.querySelector<HTMLElement>(".window-shell");
+  if (!shell) return;
+  const menu = document.createElement("div");
+  menu.className = "popup-menu";
+  menu.setAttribute("role", "menu");
+  menu.innerHTML = (note ? `<p class="popup-note">${escapeHtml(note)}</p>` : "") + items.map((item) => item === "separator"
+    ? `<div class="popup-separator"></div>`
+    : `<button class="popup-item${item.danger ? " danger" : ""}" role="menuitem" data-action="${item.action}"${item.disabled ? " disabled" : ""}${item.hint ? ` title="${escapeHtml(item.hint)}"` : ""}>${icon(item.lucide, 15)}<span>${escapeHtml(item.label)}</span></button>`).join("");
+  shell.appendChild(menu);
+  renderIcons();
+  placeMenu(menu, anchor);
+  anchor.setAttribute("aria-expanded", "true");
+  menu.querySelector<HTMLButtonElement>(".popup-item:not(:disabled)")?.focus();
+  // A press on the anchor itself is left alone so the following click can close
+  // the menu, rather than closing it here and reopening it a moment later.
+  const onPointerDown = (event: Event) => {
+    const target = event.target as Node;
+    if (menu.contains(target) || anchor.contains(target)) return;
+    closeMenu();
+  };
+  // Stop the Escape here: the shell also closes the settings drawer on Escape,
+  // and dismissing a menu should not take an unrelated panel with it.
+  const onKeyDown = (event: KeyboardEvent) => { if (event.key === "Escape") { event.stopPropagation(); closeMenu(); anchor.focus(); } };
+  document.addEventListener("mousedown", onPointerDown, true);
+  document.addEventListener("keydown", onKeyDown, true);
+  document.addEventListener("scroll", closeMenu, true);
+  window.addEventListener("resize", closeMenu);
+  openMenuAnchor = anchor;
+  closeOpenMenu = () => {
+    document.removeEventListener("mousedown", onPointerDown, true);
+    document.removeEventListener("keydown", onKeyDown, true);
+    document.removeEventListener("scroll", closeMenu, true);
+    window.removeEventListener("resize", closeMenu);
+    anchor.setAttribute("aria-expanded", "false");
+    menu.remove();
+    openMenuAnchor = null;
+    closeOpenMenu = null;
+  };
+  menu.querySelectorAll<HTMLButtonElement>(".popup-item").forEach((button) => button.addEventListener("click", (event) => {
+    event.stopPropagation();
+    if (button.disabled) return;
+    const action = button.dataset.action!;
+    closeMenu();
+    onPick(action);
+  }));
+}
+
+async function copyToClipboard(value: string, label: string): Promise<void> {
+  try {
+    await navigator.clipboard.writeText(value);
+    toast(`${label} copied`, "success");
+  } catch {
+    toast("The clipboard is not available", "warning");
+  }
+}
+
+function resumeSession(path: string): void {
+  if (!path) return;
+  if (state.status.busy) { toast("Interrupt the current turn before resuming", "warning"); return; }
+  clearTranscript();
+  send("resume", { path });
+  document.querySelector(".window-shell")?.classList.remove("sessions-open");
+}
+
+function truncate(value: string, limit: number): string {
+  return value.length > limit ? `${value.slice(0, limit - 1)}…` : value;
+}
+
+/** Second step of a delete: the trace file is not recoverable from the GUI. */
+function confirmDeleteSession(anchor: HTMLElement, path: string, label: string): void {
+  openMenu(
+    anchor,
+    [
+      { action: "cancel", label: "Keep it", lucide: "x" },
+      { action: "delete", label: "Delete permanently", lucide: "trash-2", danger: true },
+    ],
+    (action) => { if (action === "delete") send("delete_session", { path }); },
+    `Delete “${truncate(label, 64)}”? Its trace file is removed from disk and cannot be restored here.`,
+  );
+}
+
+function openSessionMenu(anchor: HTMLButtonElement): void {
+  if (openMenuAnchor === anchor) { closeMenu(); return; }
+  const path = anchor.dataset.path || "";
+  const session = state.sessions.find((item) => String(item.path) === path);
+  const label = String(session?.prompt || "this session");
+  // The live session's trace is still being appended to, so the bridge refuses
+  // to unlink it. Say so in the menu instead of failing after the click.
+  const isLive = Boolean(session) && String(session!.id) === state.activeSession;
+  openMenu(anchor, [
+    { action: "open", label: "Open session", lucide: "history" },
+    { action: "copy", label: "Copy trace path", lucide: "copy" },
+    "separator",
+    {
+      action: "delete",
+      label: "Delete session",
+      lucide: "trash-2",
+      danger: true,
+      disabled: isLive,
+      hint: isLive ? "This is the session you are in — start a new session first." : undefined,
+    },
+  ], (action) => {
+    if (action === "open") resumeSession(path);
+    else if (action === "copy") void copyToClipboard(path, "Trace path");
+    else if (action === "delete") confirmDeleteSession(anchor, path, label);
+  });
+}
+
 function renderSessions(): void {
   const list = document.querySelector<HTMLElement>("#sessions-list");
   const count = document.querySelector<HTMLElement>("#session-count");
   if (!list || !count) return;
+  // The rows about to be replaced include whichever one a menu is anchored to.
+  closeMenu();
   count.textContent = String(state.sessions.length);
   if (!state.sessions.length) { list.innerHTML = `<div class="sessions-empty">No saved sessions yet.<br><span>Completed conversations appear here.</span></div>`; return; }
   const selectedSession = state.restoredFrom || state.activeSession;
-  list.innerHTML = state.sessions.map((session) => `<button class="session-item ${session.id === selectedSession ? "active" : ""}" data-path="${escapeHtml(String(session.path))}"><span class="session-status ${session.status === "finished" ? "done" : "paused"}"></span><span class="session-info"><b>${escapeHtml(String(session.prompt || "Untitled session"))}</b><span><time>${relativeDate(session.modified)}</time><i></i>${session.steps || 0} steps</span></span><span class="session-more">${icon("ellipsis", 15)}</span></button>`).join("");
-  list.querySelectorAll<HTMLButtonElement>(".session-item").forEach((button) => button.addEventListener("click", () => {
-    if (state.status.busy) { toast("Interrupt the current turn before resuming", "warning"); return; }
-    clearTranscript(); send("resume", { path: button.dataset.path }); document.querySelector(".window-shell")?.classList.remove("sessions-open");
+  list.innerHTML = state.sessions.map((session) => {
+    const path = escapeHtml(String(session.path));
+    return `<div class="session-row ${session.id === selectedSession ? "active" : ""}"><button class="session-item" data-path="${path}"><span class="session-status ${session.status === "finished" ? "done" : "paused"}"></span><span class="session-info"><b>${escapeHtml(String(session.prompt || "Untitled session"))}</b><span><time>${relativeDate(session.modified)}</time><i></i>${Number(session.steps || 0)} step${Number(session.steps || 0) === 1 ? "" : "s"}</span></span></button><button class="session-more" data-path="${path}" title="Session actions" aria-label="Session actions" aria-haspopup="menu" aria-expanded="false">${icon("ellipsis", 15)}</button></div>`;
+  }).join("");
+  list.querySelectorAll<HTMLButtonElement>(".session-item").forEach((button) => button.addEventListener("click", () => resumeSession(button.dataset.path || "")));
+  list.querySelectorAll<HTMLButtonElement>(".session-more").forEach((button) => button.addEventListener("click", (event) => {
+    event.stopPropagation();
+    openSessionMenu(button);
   }));
   renderIcons();
 }
@@ -795,6 +975,7 @@ function handleEvent(event: AnyRecord): void {
     case "backend_restarting": state.workspace = String(event.workspace || ""); updateWorkspace(); break;
     case "backend_stopped": setBusy(false); toast("The Python backend stopped", "warning"); appendBlock("warning-block", `<span class="warning-symbol">${icon("circle-x", 16)}</span><div><b>Backend stopped</b><span>Exit code ${escapeHtml(String(event.code ?? event.signal ?? "unknown"))} - nothing you send will reach cagent until it restarts.</span></div>`); renderIcons(); break;
     case "sessions": state.sessions = Array.isArray(event.sessions) ? event.sessions : []; state.activeSession = String(event.active_id || state.activeSession); state.restoredFrom = String(event.restored_from || ""); renderSessions(); break;
+    case "session_deleted": toast("Session deleted", "success"); break;
     case "status": state.status = { ...state.status, ...event }; state.config = { ...state.config, ...(event.config || {}) }; updateStatusBar(); updateWorkspace(); if (state.settingsOpen) renderSettings(); break;
     case "busy_changed": setBusy(Boolean(event.busy)); break;
     case "run_started": state.config = { ...state.config, model: event.model, endpoint: event.endpoint, tools: event.tool_names, sandbox: event.sandbox_status, shell_access: event.shell_access }; updateStatusBar(); break;
@@ -812,7 +993,7 @@ function handleEvent(event: AnyRecord): void {
     case "compaction_done": appendBlock("system-notice", `<div class="notice-icon">${icon("shrink", 15)}</div><div><b>Context compacted</b><span>${escapeHtml(String(event.strategy || "optimized"))} · ${Number(event.tokens_before || 0).toLocaleString()} → ${Number(event.tokens_after || 0).toLocaleString()} tokens</span></div>`); break;
     case "turn_finished": state.assistantNode?.querySelector(".live-pill")?.remove(); state.assistantNode = null; scrollToLatest(); break;
     case "turn_complete": state.assistantNode = null; break;
-    case "command_result": if (event.output) appendBlock("command-block", `<div class="command-head">${icon("terminal", 14)}<b>${escapeHtml(String(event.command || "command"))}</b></div><pre>${escapeHtml(String(event.output))}</pre>`); if (event.error) toast(String(event.error), "warning"); break;
+    case "command_result": if (event.output) { appendBlock("command-block", `<div class="command-head card-toggle" role="button" tabindex="0" aria-expanded="true" title="Show or hide this output">${icon("terminal", 14)}<b>${escapeHtml(String(event.command || "command"))}</b><span class="collapse-caret">${icon("chevron-down", 14)}</span></div><pre>${escapeHtml(String(event.output))}</pre>`); renderIcons(); } if (event.error) toast(String(event.error), "warning"); break;
     case "history_restored": renderHistory((event.messages || []) as AnyRecord[], String(event.source || "saved session")); if (event.warning) toast(String(event.warning), "warning"); break;
     case "history_cleared": clearTranscript(); break;
     case "resume_error": toast(String(event.message || "Could not resume session"), "warning"); break;

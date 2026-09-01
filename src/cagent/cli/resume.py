@@ -14,6 +14,7 @@ __all__ = [
     "first_user_prompt",
     "resolve_trace_reference",
     "resume_trace_dir",
+    "trace_step_count",
 ]
 
 
@@ -45,6 +46,25 @@ def first_user_prompt(records: list[dict[str, object]]) -> str | None:
     return None
 
 
+def trace_step_count(records: list[dict[str, object]]) -> int:
+    """How many model requests a trace recorded.
+
+    Prefers the run's own closing count, falling back to counting ``step_finished``
+    records so an interrupted session — which never wrote ``run_finished`` — still
+    reports what it did instead of zero.
+
+    Shared by the session picker and the desktop status bar on purpose: they
+    describe the same conversation, so they must not be able to disagree.
+    """
+    counted = sum(1 for record in records if record.get("type") == "step_finished")
+    finished = next(
+        (record for record in reversed(records) if record.get("type") == "run_finished"),
+        {},
+    )
+    raw = finished.get("steps", counted)
+    return int(raw) if isinstance(raw, int | float) else counted
+
+
 def find_trace_choices(trace_dir: Path) -> list[TraceChoice]:
     """Scan a trace directory for conversations containing usable history."""
     if not trace_dir.is_dir():
@@ -70,9 +90,7 @@ def find_trace_choices(trace_dir: Path) -> list[TraceChoice]:
             ),
             {},
         )
-        step_records = [record for record in records if record.get("type") == "step_finished"]
-        raw_steps = finished.get("steps", len(step_records))
-        steps = int(raw_steps) if isinstance(raw_steps, int | float) else len(step_records)
+        steps = trace_step_count(records)
         raw_status = finished.get("reason")
         status = str(raw_status) if isinstance(raw_status, str) else "in progress"
         raw_session = session.get("session_id")

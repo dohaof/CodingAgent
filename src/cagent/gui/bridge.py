@@ -27,7 +27,12 @@ from ..agent.engine import Agent, TurnResult
 from ..agent.events import AgentEvent, EventSink, FanOutSink
 from ..agent.trace import TraceWriter, history_from_trace, read_trace
 from ..cli.app import _command
-from ..cli.resume import find_trace_choices, first_user_prompt, resume_trace_dir
+from ..cli.resume import (
+    find_trace_choices,
+    first_user_prompt,
+    resume_trace_dir,
+    trace_step_count,
+)
 from ..config import AgentConfig, load_config
 from ..tools.base import ApprovalRequest
 from ..tools.registry import default_registry
@@ -113,6 +118,7 @@ class DesktopSession:
         self._approval_request: ApprovalRequest | None = None
         self._approval_decision: Decision | None = None
         self._restored_from: str | None = None
+        self._restored_steps = 0
 
     # --------------------------------------------------------------- lifecycle
 
@@ -246,6 +252,7 @@ class DesktopSession:
         self.trace = None
         self.sink = None
         self._restored_from = None
+        self._restored_steps = 0
         self._initialize()
 
     # ------------------------------------------------------------------ turns
@@ -398,6 +405,58 @@ class DesktopSession:
             restored_from=self._restored_from,
         )
 
+    def delete_session(self, path: Path) -> None:
+        """Remove a saved trace so it stops appearing in the session list.
+
+        The renderer supplies the path, so the deletion is fenced twice. Only
+        ``*.jsonl`` files directly inside this workspace's trace directory can
+        go — a session list is not a reason to hand the GUI an arbitrary unlink.
+        The live session's own trace is refused as well: its writer still holds
+        the file open, and removing it mid-run would discard the record of the
+        turn currently in flight rather than an old conversation.
+
+        Runs on the reader thread rather than through :meth:`_launch`: it is one
+        filesystem call, and tidying the sidebar should not have to wait for the
+        agent to finish thinking.
+        """
+        if self.config is None:
+            self.emitter.send("protocol_error", message="The agent is still initializing.")
+            return
+        trace_dir = resume_trace_dir(self.config)
+        candidate = path.expanduser()
+        if not candidate.is_absolute():
+            candidate = trace_dir / candidate
+        try:
+            candidate = candidate.resolve()
+        except OSError as exc:
+            self.emitter.send("protocol_error", message=f"Could not resolve {candidate}: {exc}")
+            return
+        if candidate.suffix != ".jsonl" or candidate.parent != trace_dir:
+            self.emitter.send(
+                "protocol_error",
+                message=f"Only traces stored in {trace_dir} can be deleted.",
+            )
+            return
+        live = self.trace.path.expanduser().resolve() if self.trace is not None else None
+        if live is not None and candidate == live:
+            self.emitter.send(
+                "protocol_error",
+                message="That is the session you are in — start a new session first.",
+            )
+            return
+        try:
+            candidate.unlink()
+        except FileNotFoundError:
+            pass  # Already gone; the refreshed list below is the answer either way.
+        except OSError as exc:
+            self.emitter.send(
+                "protocol_error",
+                message=f"Could not delete {candidate.name}: {exc}",
+            )
+            return
+        self.emitter.send("session_deleted", path=str(candidate), session=candidate.stem)
+        self.send_sessions()
+
     def resume(self, path: Path) -> None:
         if not self._require_idle() or self.config is None or self.agent is None:
             return
@@ -448,6 +507,11 @@ class DesktopSession:
         if self.trace is not None:
             self.trace.record_history(history)
         self._restored_from = candidate.stem
+        # The rotated-in agent starts with a fresh LoopGuard, which is right for
+        # the step *budget* but wrong for the step *count* the status bar shows:
+        # the conversation on screen did not begin at zero. Carry the trace's own
+        # count so the footer agrees with the sidebar card it was restored from.
+        self._restored_steps = trace_step_count(records)
         self.emitter.send(
             "history_restored",
             messages=history,
@@ -468,7 +532,8 @@ class DesktopSession:
             session_id=self.agent.session_id,
             restored_from=self._restored_from,
             usage=self.agent.usage,
-            steps=self.agent.guard.steps,
+            # Steps in this conversation, not in this agent: see `_restored_steps`.
+            steps=self._restored_steps + self.agent.guard.steps,
             context={
                 "tokens": self.agent.context.token_count(),
                 "window": self.config.context_window,
@@ -592,6 +657,8 @@ def main(argv: list[str] | None = None) -> int:
                     session.send_sessions()
                 elif kind == "resume":
                     session.resume(Path(str(message.get("path", ""))))
+                elif kind == "delete_session":
+                    session.delete_session(Path(str(message.get("path", ""))))
                 elif kind == "new_session":
                     session.new_session()
                 elif kind == "status":
